@@ -33,7 +33,13 @@ public record AppTicketResult(
 public class SteamAuthService
 {
     // Timing constants
-    private static readonly TimeSpan ConnectionEstablishmentDelay = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan SteamConnectTimeout = TimeSpan.FromSeconds(
+        ParsePositiveIntEnv("STEAM_CLIENT_CONNECT_TIMEOUT_SECONDS", 60)
+    );
+    private static readonly int SteamConnectMaxAttempts = ParsePositiveIntEnv(
+        "STEAM_CLIENT_CONNECT_RETRIES",
+        5
+    );
     private static readonly TimeSpan TicketRequestTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan CallbackPollInterval = TimeSpan.FromMilliseconds(10);
     private static readonly TimeSpan TicketCacheMaxAge = TimeSpan.FromMinutes(10);
@@ -71,6 +77,7 @@ public class SteamAuthService
     private int _currentMaxMembers;
 
     private readonly CancellationTokenSource _cts = new();
+    private TaskCompletionSource<bool>? _connectedTcs;
     private TaskCompletionSource<bool>? _loginTcs;
     private string? _refreshToken;
     private string? _username;
@@ -90,6 +97,12 @@ public class SteamAuthService
     public bool IsLoggedIn { get; private set; }
     public string? SteamId => _steamClient.SteamID?.ConvertToUInt64().ToString();
     public ulong CurrentLobbyId => _currentLobbyId;
+
+    private static int ParsePositiveIntEnv(string name, int defaultValue)
+    {
+        var value = Environment.GetEnvironmentVariable(name);
+        return int.TryParse(value, out var parsed) && parsed > 0 ? parsed : defaultValue;
+    }
 
     public SteamAuthService(
         int accountIndex,
@@ -176,11 +189,13 @@ public class SteamAuthService
     private void OnConnected(SteamClient.ConnectedCallback cb)
     {
         Logger.Log($"{_logPrefix} Connected to Steam");
+        _connectedTcs?.TrySetResult(true);
     }
 
     private void OnDisconnected(SteamClient.DisconnectedCallback cb)
     {
         Logger.Log($"{_logPrefix} Disconnected (UserInitiated: {cb.UserInitiated})");
+        _connectedTcs?.TrySetResult(false);
         IsLoggedIn = false;
         _loginTcs?.TrySetResult(false);
         MaybeStartReconnect("disconnected", cb.UserInitiated, EResult.OK);
@@ -259,6 +274,71 @@ public class SteamAuthService
         || r == EResult.AccountDisabled
         || r == EResult.Suspended
         || r == EResult.AccountLockedDown;
+
+    private async Task ConnectAndWaitAsync()
+    {
+        if (_steamClient.IsConnected)
+        {
+            return;
+        }
+
+        Exception? lastError = null;
+
+        for (int attempt = 1; attempt <= SteamConnectMaxAttempts; attempt++)
+        {
+            var connectedTcs = new TaskCompletionSource<bool>(
+                TaskCreationOptions.RunContinuationsAsynchronously
+            );
+            _connectedTcs = connectedTcs;
+
+            Logger.Log($"{_logPrefix} Connecting... ({attempt}/{SteamConnectMaxAttempts})");
+            _steamClient.Connect();
+
+            try
+            {
+                var timeoutTask = Task.Delay(SteamConnectTimeout, _cts.Token);
+                var completedTask = await Task.WhenAny(connectedTcs.Task, timeoutTask);
+
+                if (completedTask != connectedTcs.Task)
+                {
+                    lastError = new TimeoutException(
+                        $"SteamClient did not connect within {SteamConnectTimeout.TotalSeconds}s"
+                    );
+                }
+                else if (!await connectedTcs.Task)
+                {
+                    lastError = new Exception(
+                        "SteamClient disconnected before connection was established"
+                    );
+                }
+                else
+                {
+                    return;
+                }
+            }
+            finally
+            {
+                if (ReferenceEquals(_connectedTcs, connectedTcs))
+                {
+                    _connectedTcs = null;
+                }
+            }
+
+            if (attempt < SteamConnectMaxAttempts)
+            {
+                var delay = TimeSpan.FromSeconds(Math.Min(5 * attempt, 15));
+                Logger.Log(
+                    $"{_logPrefix} Steam connection attempt failed: {lastError?.Message}. "
+                        + $"Retrying in {delay.TotalSeconds}s..."
+                );
+                await Task.Delay(delay, _cts.Token);
+            }
+        }
+
+        throw new Exception(
+            $"SteamClient did not connect after {SteamConnectMaxAttempts} attempts: {lastError?.Message}"
+        );
+    }
 
     private async Task RunReconnectLoopAsync(string trigger, EResult initialResult)
     {
@@ -682,14 +762,12 @@ public class SteamAuthService
 
         _username = username;
 
-        // Connect
-        Logger.Log($"{_logPrefix} Connecting...");
-        _steamClient.Connect();
-        await Task.Delay(ConnectionEstablishmentDelay);
-
         // Authenticate
         try
         {
+            // Connect
+            await ConnectAndWaitAsync();
+
             var authSession = await _steamClient.Authentication.BeginAuthSessionViaCredentialsAsync(
                 new AuthSessionDetails
                 {
@@ -719,12 +797,10 @@ public class SteamAuthService
     /// </summary>
     private async Task LoginWithQrCodeInsideLockAsync()
     {
-        Logger.Log($"{_logPrefix} Connecting...");
-        _steamClient.Connect();
-        await Task.Delay(ConnectionEstablishmentDelay);
-
         try
         {
+            await ConnectAndWaitAsync();
+
             var authSession = await _steamClient.Authentication.BeginAuthSessionViaQRAsync(
                 new AuthSessionDetails { IsPersistentSession = true }
             );
@@ -773,8 +849,7 @@ public class SteamAuthService
 
     private async Task ConnectAndLoginAsync(string refreshToken)
     {
-        _steamClient.Connect();
-        await Task.Delay(ConnectionEstablishmentDelay);
+        await ConnectAndWaitAsync();
         await LoginWithTokenInternalAsync(refreshToken);
     }
 
@@ -840,8 +915,7 @@ public class SteamAuthService
                 if (!_steamClient.IsConnected)
                 {
                     Logger.Log($"{_logPrefix} Reconnecting...");
-                    _steamClient.Connect();
-                    await Task.Delay(ConnectionEstablishmentDelay);
+                    await ConnectAndWaitAsync();
                 }
             }
         }
