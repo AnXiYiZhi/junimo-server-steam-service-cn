@@ -48,8 +48,11 @@ panel will later point its `steam-auth` service image to this patched image.
 ## Planned Source Change
 
 Replace fixed sleeps after `SteamClient.Connect()` with a real wait for
-`SteamClient.ConnectedCallback`, plus a small retry loop for Steam CM disconnects
-before the client reaches the connected state.
+`SteamClient.ConnectedCallback`, plus retry loops for:
+
+- Steam CM disconnects before the client reaches the connected state.
+- transient auth-session failures such as `TryAnotherCM` and
+  `SteamKit2.AsyncJobFailedException` during QR / Steam Guard / credentials auth.
 
 Current pattern to remove:
 
@@ -66,6 +69,9 @@ private static readonly TimeSpan SteamConnectTimeout =
 
 private static readonly int SteamConnectMaxAttempts =
     ParsePositiveIntEnv("STEAM_CLIENT_CONNECT_RETRIES", 5);
+
+private static readonly int AuthSessionMaxAttempts =
+    ParsePositiveIntEnv("STEAM_AUTH_SESSION_RETRIES", 3);
 
 private TaskCompletionSource<bool>? _connectedTcs;
 
@@ -125,11 +131,17 @@ ConnectAndLoginAsync
 LoginWithTokenInternalAsync reconnect branch
 ```
 
-The default timeout should be 60 seconds and 5 attempts, configurable with:
+Also wrap QR and credentials auth sessions so `PollingWaitForResultAsync()` can be
+retried when Steam asks the client to try another CM.
+
+The default connection behavior is 60 seconds and 5 attempts. Auth sessions are
+retried 3 times with a 5-second delay. They are configurable with:
 
 ```text
 STEAM_CLIENT_CONNECT_TIMEOUT_SECONDS=60
 STEAM_CLIENT_CONNECT_RETRIES=5
+STEAM_AUTH_SESSION_RETRIES=3
+STEAM_AUTH_SESSION_RETRY_DELAY_SECONDS=5
 ```
 
 Do not log Steam passwords, refresh tokens, app tickets, or session files.
@@ -162,6 +174,8 @@ docker run --rm -it `
   -e SESSION_DIR=/data/steam-session `
   -e STEAM_CLIENT_CONNECT_TIMEOUT_SECONDS=60 `
   -e STEAM_CLIENT_CONNECT_RETRIES=5 `
+  -e STEAM_AUTH_SESSION_RETRIES=3 `
+  -e STEAM_AUTH_SESSION_RETRY_DELAY_SECONDS=5 `
   -v junimo-test-game:/data/game `
   -v junimo-test-session:/data/steam-session `
   junimo-steam-service-cn:connect-wait-test setup
@@ -206,6 +220,8 @@ docker run --rm -it `
   -e STEAM_PASSWORD=your_password `
   -e STEAM_CLIENT_CONNECT_TIMEOUT_SECONDS=60 `
   -e STEAM_CLIENT_CONNECT_RETRIES=5 `
+  -e STEAM_AUTH_SESSION_RETRIES=3 `
+  -e STEAM_AUTH_SESSION_RETRY_DELAY_SECONDS=5 `
   -v junimo-test-game:/data/game `
   -v junimo-test-session:/data/steam-session `
   junimo-steam-service-cn:connect-wait-test login
@@ -282,6 +298,8 @@ steam-auth:
   environment:
     STEAM_CLIENT_CONNECT_TIMEOUT_SECONDS: "${STEAM_CLIENT_CONNECT_TIMEOUT_SECONDS:-60}"
     STEAM_CLIENT_CONNECT_RETRIES: "${STEAM_CLIENT_CONNECT_RETRIES:-5}"
+    STEAM_AUTH_SESSION_RETRIES: "${STEAM_AUTH_SESSION_RETRIES:-3}"
+    STEAM_AUTH_SESSION_RETRY_DELAY_SECONDS: "${STEAM_AUTH_SESSION_RETRY_DELAY_SECONDS:-5}"
 ```
 
 Then write these defaults into the instance `.env`:
@@ -290,6 +308,8 @@ Then write these defaults into the instance `.env`:
 STEAM_SERVICE_IMAGE=<dockerhub-namespace>/junimo-steam-service-cn:1.5.0-anxi.1
 STEAM_CLIENT_CONNECT_TIMEOUT_SECONDS=60
 STEAM_CLIENT_CONNECT_RETRIES=5
+STEAM_AUTH_SESSION_RETRIES=3
+STEAM_AUTH_SESSION_RETRY_DELAY_SECONDS=5
 ```
 
 The user-facing install flow remains:

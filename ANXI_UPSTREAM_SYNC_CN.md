@@ -28,6 +28,7 @@ SteamClient.Connect()
 默认最长等 60 秒
 默认最多重试 5 次
 connected 后再继续 QR / 账号密码 / refresh token 登录
+如果 QR / Steam Guard / 账号密码认证过程中出现 TryAnotherCM，会重连后重新发起认证会话
 ```
 
 可配置环境变量：
@@ -35,6 +36,8 @@ connected 后再继续 QR / 账号密码 / refresh token 登录
 ```text
 STEAM_CLIENT_CONNECT_TIMEOUT_SECONDS=60
 STEAM_CLIENT_CONNECT_RETRIES=5
+STEAM_AUTH_SESSION_RETRIES=3
+STEAM_AUTH_SESSION_RETRY_DELAY_SECONDS=5
 ```
 
 ## 同步上游的原则
@@ -148,6 +151,8 @@ _connectedTcs?.TrySetResult(false);
 ```text
 STEAM_CLIENT_CONNECT_TIMEOUT_SECONDS
 STEAM_CLIENT_CONNECT_RETRIES
+STEAM_AUTH_SESSION_RETRIES
+STEAM_AUTH_SESSION_RETRY_DELAY_SECONDS
 ```
 
 冲突解决后检查：
@@ -164,6 +169,8 @@ rg -n "ConnectionEstablishmentDelay|Task.Delay\\(ConnectionEstablishmentDelay\\)
 仍然有 ConnectAndWaitAsync
 仍然有 STEAM_CLIENT_CONNECT_TIMEOUT_SECONDS
 仍然有 STEAM_CLIENT_CONNECT_RETRIES
+仍然有 STEAM_AUTH_SESSION_RETRIES
+仍然有 STEAM_AUTH_SESSION_RETRY_DELAY_SECONDS
 ```
 
 ## 同步后的提交
@@ -225,7 +232,8 @@ docker buildx build `
 STEAM_SERVICE_IMAGE=<dockerhub-namespace>/junimo-steam-service-cn:1.5.0-anxi.2
 STEAM_CLIENT_CONNECT_TIMEOUT_SECONDS=60
 STEAM_CLIENT_CONNECT_RETRIES=5
+STEAM_AUTH_SESSION_RETRIES=3
+STEAM_AUTH_SESSION_RETRY_DELAY_SECONDS=5
 ```
 
 这样用户环境可复现，也方便回滚。
-

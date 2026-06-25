@@ -40,6 +40,13 @@ public class SteamAuthService
         "STEAM_CLIENT_CONNECT_RETRIES",
         5
     );
+    private static readonly int AuthSessionMaxAttempts = ParsePositiveIntEnv(
+        "STEAM_AUTH_SESSION_RETRIES",
+        3
+    );
+    private static readonly TimeSpan AuthSessionRetryDelay = TimeSpan.FromSeconds(
+        ParsePositiveIntEnv("STEAM_AUTH_SESSION_RETRY_DELAY_SECONDS", 5)
+    );
     private static readonly TimeSpan TicketRequestTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan CallbackPollInterval = TimeSpan.FromMilliseconds(10);
     private static readonly TimeSpan TicketCacheMaxAge = TimeSpan.FromMinutes(10);
@@ -338,6 +345,91 @@ public class SteamAuthService
         throw new Exception(
             $"SteamClient did not connect after {SteamConnectMaxAttempts} attempts: {lastError?.Message}"
         );
+    }
+
+    private async Task ResetSteamConnectionAsync()
+    {
+        if (_steamClient.IsConnected)
+        {
+            _steamClient.Disconnect();
+        }
+
+        await Task.Delay(250, _cts.Token);
+    }
+
+    private async Task<T> RunAuthSessionWithRetryAsync<T>(string authName, Func<Task<T>> action)
+    {
+        Exception? lastError = null;
+
+        for (int attempt = 1; attempt <= AuthSessionMaxAttempts; attempt++)
+        {
+            if (attempt > 1)
+            {
+                await ResetSteamConnectionAsync();
+            }
+
+            await ConnectAndWaitAsync();
+
+            try
+            {
+                return await action();
+            }
+            catch (Exception ex) when (IsTransientSteamAuthException(ex))
+            {
+                lastError = ex;
+
+                if (attempt >= AuthSessionMaxAttempts)
+                {
+                    break;
+                }
+
+                Logger.Log(
+                    $"{_logPrefix} {authName} attempt {attempt}/{AuthSessionMaxAttempts} "
+                        + $"failed with transient Steam error: {ex.Message}. "
+                        + $"Retrying in {AuthSessionRetryDelay.TotalSeconds}s..."
+                );
+                await Task.Delay(AuthSessionRetryDelay, _cts.Token);
+            }
+        }
+
+        throw new Exception(
+            $"{authName} failed after {AuthSessionMaxAttempts} attempts: {lastError?.Message}",
+            lastError
+        );
+    }
+
+    private static bool IsTransientSteamAuthException(Exception ex)
+    {
+        for (Exception? current = ex; current != null; current = current.InnerException)
+        {
+            var typeName = current.GetType().Name;
+            var message = current.Message;
+
+            if (typeName.Contains("AsyncJobFailedException", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            if (current is TimeoutException || current is SocketException)
+            {
+                return true;
+            }
+
+            if (
+                message.Contains("TryAnotherCM", StringComparison.OrdinalIgnoreCase)
+                || message.Contains(
+                    "SteamClient instance must be connected",
+                    StringComparison.OrdinalIgnoreCase
+                )
+                || message.Contains("disconnected", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("timed out", StringComparison.OrdinalIgnoreCase)
+            )
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private async Task RunReconnectLoopAsync(string trigger, EResult initialResult)
@@ -765,20 +857,24 @@ public class SteamAuthService
         // Authenticate
         try
         {
-            // Connect
-            await ConnectAndWaitAsync();
-
-            var authSession = await _steamClient.Authentication.BeginAuthSessionViaCredentialsAsync(
-                new AuthSessionDetails
+            var result = await RunAuthSessionWithRetryAsync(
+                "credentials authentication",
+                async () =>
                 {
-                    Username = username,
-                    Password = password,
-                    IsPersistentSession = true,
-                    Authenticator = new ConsoleAuthenticator(),
+                    var authSession =
+                        await _steamClient.Authentication.BeginAuthSessionViaCredentialsAsync(
+                            new AuthSessionDetails
+                            {
+                                Username = username,
+                                Password = password,
+                                IsPersistentSession = true,
+                                Authenticator = new ConsoleAuthenticator(),
+                            }
+                        );
+
+                    return await authSession.PollingWaitForResultAsync();
                 }
             );
-
-            var result = await authSession.PollingWaitForResultAsync();
 
             _refreshToken = result.RefreshToken;
             SaveSession(username, _refreshToken);
@@ -799,24 +895,28 @@ public class SteamAuthService
     {
         try
         {
-            await ConnectAndWaitAsync();
+            var result = await RunAuthSessionWithRetryAsync(
+                "QR authentication",
+                async () =>
+                {
+                    var authSession = await _steamClient.Authentication.BeginAuthSessionViaQRAsync(
+                        new AuthSessionDetails { IsPersistentSession = true }
+                    );
 
-            var authSession = await _steamClient.Authentication.BeginAuthSessionViaQRAsync(
-                new AuthSessionDetails { IsPersistentSession = true }
+                    PrintQrCode(authSession.ChallengeURL);
+
+                    // Steam periodically refreshes the challenge URL. Reprint QR when it changes.
+                    authSession.ChallengeURLChanged = () =>
+                    {
+                        Logger.Log($"{_logPrefix} QR code refreshed by Steam");
+                        PrintQrCode(authSession.ChallengeURL);
+                    };
+
+                    Console.WriteLine("Waiting for confirmation...");
+
+                    return await authSession.PollingWaitForResultAsync();
+                }
             );
-
-            PrintQrCode(authSession.ChallengeURL);
-
-            // Steam periodically refreshes the challenge URL. Reprint QR when it changes.
-            authSession.ChallengeURLChanged = () =>
-            {
-                Logger.Log($"{_logPrefix} QR code refreshed by Steam");
-                PrintQrCode(authSession.ChallengeURL);
-            };
-
-            Console.WriteLine("Waiting for confirmation...");
-
-            var result = await authSession.PollingWaitForResultAsync();
 
             _username = result.AccountName;
             _refreshToken = result.RefreshToken;
@@ -911,12 +1011,14 @@ public class SteamAuthService
                 Logger.Log($"{_logPrefix} Login failed, retrying in {delaySeconds} seconds...");
                 await Task.Delay(TimeSpan.FromSeconds(delaySeconds));
 
-                // Reconnect before retry (connection may have been dropped)
-                if (!_steamClient.IsConnected)
+                // Reconnect before retry. Results such as TryAnotherCM require a fresh CM.
+                if (_steamClient.IsConnected)
                 {
-                    Logger.Log($"{_logPrefix} Reconnecting...");
-                    await ConnectAndWaitAsync();
+                    _steamClient.Disconnect();
+                    await Task.Delay(250, _cts.Token);
                 }
+                Logger.Log($"{_logPrefix} Reconnecting...");
+                await ConnectAndWaitAsync();
             }
         }
 
