@@ -254,38 +254,45 @@ Use a focused commit message:
 fix(steam-service): wait for SteamClient connection before auth
 ```
 
-## Docker Hub Release
+## GitHub Tag Release
 
-Use a versioned tag first. Replace `<dockerhub-namespace>` if the Docker Hub
-namespace is not `anxiyizhi`.
+The fork publishes the patched `steam-service` image from
+`.github/workflows/publish-tag.yml`. Push an Anxi patch tag to build and publish
+the image automatically:
 
 ```powershell
-docker login
-
-docker buildx build `
-  --platform linux/amd64 `
-  -f tools/steam-service/Dockerfile `
-  -t <dockerhub-namespace>/junimo-steam-service-cn:1.5.0-anxi.1 `
-  --push `
-  .
+git tag v1.5.0-anxi.2
+git push origin v1.5.0-anxi.2
 ```
 
-After pushing:
+The workflow strips a leading `v` from the Docker tag, so the example above
+publishes:
 
-```powershell
-docker pull <dockerhub-namespace>/junimo-steam-service-cn:1.5.0-anxi.1
+```text
+anxiyizhi/junimo-steam-service-cn:1.5.0-anxi.2
+anxiyizhi/junimo-steam-service-cn:latest
+crpi-9z3bkb9g7fxeohrg.cn-hangzhou.personal.cr.aliyuncs.com/anxi-panel/junimo-steam-service-cn:1.5.0-anxi.2
+crpi-9z3bkb9g7fxeohrg.cn-hangzhou.personal.cr.aliyuncs.com/anxi-panel/junimo-steam-service-cn:latest
+ghcr.io/<github-owner>/junimo-steam-service-cn:1.5.0-anxi.2
+ghcr.io/<github-owner>/junimo-steam-service-cn:latest
 ```
 
-Only add or move a `latest` tag after the versioned image has been tested:
+Required GitHub repository secrets:
+
+```text
+DOCKERHUB_USERNAME
+DOCKERHUB_TOKEN
+ALIYUN_REGISTRY_USERNAME
+ALIYUN_REGISTRY_PASSWORD
+```
+
+After the workflow succeeds, verify the versioned Docker Hub and GHCR tags. If
+GitHub creates the package as private on first publish, open the package
+settings and switch visibility to Public before using it as a public fallback.
 
 ```powershell
-docker buildx build `
-  --platform linux/amd64 `
-  -f tools/steam-service/Dockerfile `
-  -t <dockerhub-namespace>/junimo-steam-service-cn:1.5.0-anxi.1 `
-  -t <dockerhub-namespace>/junimo-steam-service-cn:latest `
-  --push `
-  .
+docker pull anxiyizhi/junimo-steam-service-cn:1.5.0-anxi.2
+docker pull ghcr.io/<github-owner>/junimo-steam-service-cn:1.5.0-anxi.2
 ```
 
 ## Panel Integration Later
