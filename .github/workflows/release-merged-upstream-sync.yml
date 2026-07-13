@@ -106,7 +106,10 @@ jobs:
           MERGE_SHA: ${{ needs.validate.outputs.merge_sha }}
         run: |
           set -euo pipefail
-          existing_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${FORK_TAG}" --jq .object.sha 2>/dev/null || true)"
+          existing_sha=""
+          if existing_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${FORK_TAG}" 2>/dev/null)"; then
+            existing_sha="$(printf '%s' "$existing_ref" | jq -r '.object.sha')"
+          fi
           if [ -n "$existing_sha" ]; then
             if [ "$existing_sha" != "$MERGE_SHA" ]; then
               echo "::error::Tag $FORK_TAG already exists at a different commit; refusing to overwrite it."

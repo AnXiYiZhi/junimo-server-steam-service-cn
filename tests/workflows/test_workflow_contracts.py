@@ -91,6 +91,8 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("uses: ./.github/workflows/publish-steam-service.yml", workflow)
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("git merge-base --is-ancestor \"$MERGE_SHA\" origin/master", workflow)
+        self.assertIn('if existing_ref="$(gh api', workflow)
+        self.assertNotIn("--jq .object.sha 2>/dev/null || true", workflow)
         self.assertNotIn("SDVD_DOCKER_HOSTS", workflow)
         self.assertNotIn("STEAM_PASSWORD", workflow)
 
