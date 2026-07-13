@@ -45,6 +45,8 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("grep -Fxq needs-anxi-patch-review", workflow)
         self.assertIn("-f merge_method=merge", workflow)
         self.assertIn('-f sha="$VALIDATED_SHA"', workflow)
+        self.assertIn("gh workflow run release-merged-upstream-sync.yml", workflow)
+        self.assertIn('-f merge_sha="$merge_sha"', workflow)
         self.assertNotIn("merge_method=squash", workflow)
 
     def test_sync_validation_has_no_private_secret_contract(self):
@@ -53,6 +55,12 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn("secrets.", workflow)
         self.assertIn("push", workflow)  # docker build is explicitly local only
         self.assertNotIn("docker/build-push-action", workflow)
+
+    def test_general_commitlint_does_not_reject_published_upstream_history(self):
+        workflow = self.read("validate-pr.yml")
+        self.assertIn("!startsWith(github.event.pull_request.head.ref, 'sync/upstream-')", workflow)
+        self.assertIn("Accept reviewed upstream tag history", workflow)
+        self.assertIn("Upstream tag commits are accepted as published", workflow)
 
     def test_publish_is_exact_tag_only_and_has_provenance(self):
         trigger = self.read("publish-tag.yml")
@@ -81,6 +89,8 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("git/refs", workflow)
         self.assertIn("refusing to overwrite it", workflow)
         self.assertIn("uses: ./.github/workflows/publish-steam-service.yml", workflow)
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("git merge-base --is-ancestor \"$MERGE_SHA\" origin/master", workflow)
         self.assertNotIn("SDVD_DOCKER_HOSTS", workflow)
         self.assertNotIn("STEAM_PASSWORD", workflow)
 

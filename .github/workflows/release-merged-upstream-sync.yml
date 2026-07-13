@@ -4,6 +4,16 @@ on:
   pull_request_target:
     branches: [master]
     types: [closed]
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Exact upstream tag from a trusted automatic merge
+        required: true
+        type: string
+      merge_sha:
+        description: Exact merge commit to validate, tag, and publish
+        required: true
+        type: string
 
 permissions: {}
 
@@ -15,10 +25,11 @@ jobs:
   validate:
     name: Revalidate merged upstream sync
     if: >-
-      github.event.pull_request.merged == true &&
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       startsWith(github.event.pull_request.head.ref, 'sync/upstream-') &&
-      contains(github.event.pull_request.labels.*.name, 'upstream-sync')
+      contains(github.event.pull_request.labels.*.name, 'upstream-sync'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -30,18 +41,19 @@ jobs:
       - name: Checkout trusted merged commit
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.merge_sha || github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Derive and verify release metadata
         id: meta
         env:
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          HEAD_REF: ${{ github.event_name == 'workflow_dispatch' && format('sync/upstream-{0}', inputs.upstream_tag) || github.event.pull_request.head.ref }}
+          MERGE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.merge_sha || github.event.pull_request.merge_commit_sha }}
+          REQUESTED_UPSTREAM_TAG: ${{ inputs.upstream_tag }}
         run: |
           set -euo pipefail
-          upstream_tag="${HEAD_REF#sync/upstream-}"
+          upstream_tag="${REQUESTED_UPSTREAM_TAG:-${HEAD_REF#sync/upstream-}}"
           python .github/scripts/upstream_release.py metadata \
             --tag "$upstream_tag" \
             --github-output "$GITHUB_OUTPUT"
@@ -57,6 +69,11 @@ jobs:
             "+refs/tags/${upstream_tag}:refs/upstream-tags/${upstream_tag}"
           git merge-base --is-ancestor "refs/upstream-tags/${upstream_tag}" "$MERGE_SHA" || {
             echo "::error::Merged commit does not retain upstream ancestry. Use 'Create a merge commit', not squash or rebase."
+            exit 1
+          }
+          git fetch --no-tags origin master
+          git merge-base --is-ancestor "$MERGE_SHA" origin/master || {
+            echo "::error::Requested merge commit is not contained by current origin/master."
             exit 1
           }
 

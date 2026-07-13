@@ -21,6 +21,7 @@ jobs:
       github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
+      actions: write
       contents: write
       pull-requests: write
     steps:
@@ -60,9 +61,20 @@ jobs:
             exit 1
           fi
 
-          gh api --method PUT \
+          merge_response="$(gh api --method PUT \
             "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}/merge" \
             -f merge_method=merge \
-            -f sha="$VALIDATED_SHA" \
-            --jq 'if .merged == true then .message else error(.message) end'
+            -f sha="$VALIDATED_SHA")"
+          printf '%s' "$merge_response" | jq -e '.merged == true' >/dev/null || {
+            printf '%s' "$merge_response" | jq -r '.message' >&2
+            exit 1
+          }
+          merge_sha="$(printf '%s' "$merge_response" | jq -r '.sha')"
+          upstream_tag="${HEAD_BRANCH#sync/upstream-}"
+          gh workflow run release-merged-upstream-sync.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref master \
+            -f upstream_tag="$upstream_tag" \
+            -f merge_sha="$merge_sha"
           echo "Merged PR #$pr_number with a merge commit after validating $VALIDATED_SHA." >> "$GITHUB_STEP_SUMMARY"
+          echo "Dispatched trusted release validation for \`$upstream_tag\` at \`$merge_sha\`." >> "$GITHUB_STEP_SUMMARY"

@@ -39,6 +39,17 @@ creates the recommended fork tag without overwriting an existing tag, and calls
 the reusable publisher. Squash and rebase merges are rejected because they lose
 the upstream parent relationship.
 
+GitHub suppresses events recursively emitted by `GITHUB_TOKEN`. Therefore the
+automatic merge workflow explicitly dispatches the trusted post-merge release
+workflow with the exact upstream tag and returned merge SHA. The release workflow
+revalidates both values and confirms that the merge SHA is contained by current
+`origin/master` before creating a tag.
+
+The general PR commitlint job does not re-lint commits already published in an
+exact upstream tag; upstream owns those messages. The synchronization PR title,
+the fork's merge commit, dedicated validation, exact SHA, and ancestry checks
+remain enforced.
+
 The dedicated sync PR validation workflow has only `contents: read`; it receives
 no Steam account, registry, or VPS credentials. The normal secret-bearing PR
 Docker build is skipped for `sync/upstream-*` branches so newly synchronized
