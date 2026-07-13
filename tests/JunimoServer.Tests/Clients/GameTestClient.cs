@@ -226,6 +226,21 @@ public class LeaveFestivalResult
     public string? Error { get; set; }
 }
 
+public class EngageToNpcResult
+{
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+
+    [JsonPropertyName("spouse")]
+    public string? Spouse { get; set; }
+
+    [JsonPropertyName("isEngaged")]
+    public bool IsEngaged { get; set; }
+}
+
 public class PlacePotResult
 {
     [JsonPropertyName("success")]
@@ -390,6 +405,11 @@ public class GameStateResult
 
     [JsonPropertyName("error")]
     public string? Error { get; set; }
+
+    /// <summary>Wedding ceremonies this client has rendered today (one per gate). See
+    /// <see cref="StatusResponse.WeddingsRendered"/>.</summary>
+    [JsonPropertyName("weddingsRendered")]
+    public List<RenderedCeremonyInfo> WeddingsRendered { get; set; } = new();
 }
 
 /// <summary>
@@ -406,8 +426,36 @@ public class StatusResponse
     [JsonPropertyName("farmer")]
     public FarmerInfoResponse? Farmer { get; set; }
 
+    /// <summary>
+    /// Wedding ceremonies this client has played through (rendered) today, one per gate. Empty until a
+    /// ceremony actually plays on this client. The E2E wedding test asserts each client rendered BOTH
+    /// same-day ceremonies — the host-side spouse-warp can't prove a client rendered anything.
+    /// </summary>
+    [JsonPropertyName("weddingsRendered")]
+    public List<RenderedCeremonyInfo> WeddingsRendered { get; set; } = new();
+
     [JsonPropertyName("timestamp")]
     public long Timestamp { get; set; }
+}
+
+/// <summary>One wedding ceremony a client played through and rendered (mirrors the test-client's
+/// <c>RenderedCeremony</c>). Used by the E2E wedding test's per-client render proof.</summary>
+public class RenderedCeremonyInfo
+{
+    [JsonPropertyName("gate")]
+    public string Gate { get; set; } = string.Empty;
+
+    [JsonPropertyName("groomId")]
+    public long GroomId { get; set; }
+
+    [JsonPropertyName("groomName")]
+    public string GroomName { get; set; } = string.Empty;
+
+    [JsonPropertyName("spouse")]
+    public string Spouse { get; set; } = string.Empty;
+
+    [JsonPropertyName("isLocalPlayer")]
+    public bool IsLocalPlayer { get; set; }
 }
 
 public class ConnectionStatusInfo
@@ -627,6 +675,20 @@ public class ActionsClient
     public Task<LeaveFestivalResult?> LeaveFestival()
     {
         return _client.PostAsync<LeaveFestivalResult>("/actions/leave_festival", new { });
+    }
+
+    /// <summary>
+    /// Engage this client's player to an NPC (client-authoritative) so the next day-transition queues
+    /// their wedding. Must be authored on the client — the farmhand's Farmer root is client-owned, so
+    /// a host-side spouse write is overwritten by the client's nightly full-root resend before the
+    /// wedding fires. POST /actions/engage_to_npc
+    /// </summary>
+    public Task<EngageToNpcResult?> EngageToNpc(string npc, int daysUntilWedding = 1)
+    {
+        return _client.PostAsync<EngageToNpcResult>(
+            "/actions/engage_to_npc",
+            new { npc, daysUntilWedding }
+        );
     }
 
     /// <summary>
@@ -972,8 +1034,28 @@ public class GameTestClient : IDisposable
         string baseUrl = "http://localhost:5123",
         TimeSpan? defaultWaitTimeout = null
     )
+        : this(baseUrl, defaultWaitTimeout, liveBaseUrl: null, healAsync: null) { }
+
+    /// <summary>
+    /// Constructs a client that transparently heals a dropped SSH forward (re-opens it +
+    /// retries against the new port) so an in-flight request survives a transient master
+    /// keepalive blip instead of failing the test. <paramref name="liveBaseUrl"/> returns
+    /// the client container's CURRENT base URL; <paramref name="healAsync"/> re-opens the
+    /// client's forward. Both null ⇒ a plain client (unchanged behavior).
+    /// </summary>
+    public GameTestClient(
+        string baseUrl,
+        TimeSpan? defaultWaitTimeout,
+        Func<string>? liveBaseUrl,
+        Func<CancellationToken, Task<bool>>? healAsync
+    )
     {
-        var handler = new TracingHandler("test-client") { InnerHandler = new HttpClientHandler() };
+        HttpMessageHandler inner = new HttpClientHandler();
+        if (liveBaseUrl != null && healAsync != null)
+        {
+            inner = new ForwardHealingHandler(liveBaseUrl, healAsync) { InnerHandler = inner };
+        }
+        var handler = new TracingHandler("test-client") { InnerHandler = inner };
         _httpClient = new HttpClient(handler)
         {
             BaseAddress = new Uri(baseUrl),
@@ -1079,6 +1161,7 @@ public class GameTestClient : IDisposable
             IsInGame = status.Connection?.WorldReady ?? false,
             PlayerName = status.Farmer?.Name,
             UniqueId = status.Farmer?.UniqueId,
+            WeddingsRendered = status.WeddingsRendered,
         };
     }
 

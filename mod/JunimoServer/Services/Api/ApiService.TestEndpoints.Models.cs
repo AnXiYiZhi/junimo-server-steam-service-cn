@@ -209,6 +209,33 @@ public class TestStampClaimResponse
 }
 
 /// <summary>
+/// Response from POST /test/stamp_lobby_home (test-only). Reproduces the lobby-homed-spouse
+/// poisoned-save shape on a live server: ensures a shared lobby cabin exists (position-classified,
+/// so it works on a passwordless server too), synthesizes a marriage between a cabin-homed farmhand
+/// and the given NPC, then points the farmhand's homeLocation/lastSleepLocation and the NPC's
+/// DefaultMap/DefaultPosition/currentLocation at the lobby interior. Used to verify the
+/// CabinManagerService heal sweeps (DayStarted live heal + SaveLoaded migration) restore both.
+/// </summary>
+public class TestStampLobbyHomeResponse
+{
+    public bool Success { get; set; }
+    public string? Error { get; set; }
+
+    /// <summary>UniqueMultiplayerID of the farmhand whose home fields were poisoned.</summary>
+    public long StampedUid { get; set; }
+
+    /// <summary>The NPC married to the farmhand and stranded in the lobby.</summary>
+    public string Npc { get; set; } = "";
+
+    /// <summary>The lobby cabin interior's NameOrUniqueName both victims now point at.</summary>
+    public string LobbyLocation { get; set; } = "";
+
+    /// <summary>The farmhand's homeLocation before poisoning — the heal must restore exactly this
+    /// (ownership-first reassignment returns them to their own cabin).</summary>
+    public string OriginalHome { get; set; } = "";
+}
+
+/// <summary>
 /// Response from POST /test/galaxy_relogin (test-only). Triggers a Galaxy re-sign-in with no outage,
 /// so a test can verify that re-login while Galaxy is healthy and a client is connected does not
 /// disrupt the live lobby or change the invite code (the no-op safety question for the
@@ -314,6 +341,17 @@ public class TestSaveFileOpResponse
     public string TargetSaveName { get; set; } = "";
 }
 
+/// <summary>Response from POST /test/force_save (test-only). Persists the current world to disk
+/// synchronously (no day transition), so save-import source generation can skip SleepToSaveAsync.</summary>
+public class TestForceSaveResponse
+{
+    public bool Success { get; set; }
+    public string? Error { get; set; }
+
+    /// <summary>The save folder the world was written to (Constants.SaveFolderName).</summary>
+    public string SaveFolderName { get; set; } = "";
+}
+
 /// <summary>
 /// Body for POST /test/import_save (test-only). Clones a source save folder under a new name, then
 /// runs saves-import on the clone (ExecuteImport rejects importing the active save, so the clone is
@@ -334,6 +372,51 @@ public class TestImportSaveRequest
     public bool SkipClone { get; set; }
 }
 
+/// <summary>
+/// Response from GET /test/wedding_state (test-only). A direct read of the host's wedding state so an
+/// E2E test can assert a ceremony is active / has ended and observe each spouse NPC's location, without
+/// proxying through a client's location (which reads the Town "Temp" map during the ceremony).
+/// </summary>
+public class TestWeddingStateResponse
+{
+    public bool Success { get; set; }
+    public string? Error { get; set; }
+
+    /// <summary>True while a wedding event is loaded and running on the host (CurrentEvent.isWedding).</summary>
+    public bool IsWeddingActive { get; set; }
+
+    /// <summary>The host's view of the queried farmhand's spouse (NPC name), or null. Lets a test
+    /// confirm the engagement replicated client→host before the day transition.</summary>
+    public string? FarmhandSpouse { get; set; }
+
+    /// <summary>The spouse NPC's current location. The ceremony's endBehaviors ("wedding" case) warps
+    /// the spouse to the couple's Farm porch, so <c>== "Farm"</c> is a durable, ceremony-only signal
+    /// that this couple's ceremony completed (the pre-ceremony finalizer never moves currentLocation).</summary>
+    public string? SpouseCurrentLocation { get; set; }
+
+    // Post-ceremony host-stuck signals (see HandleGetTestWeddingStateAsync). All four must be clear
+    // after a wedding ends or the host is stuck in the fadeout the multi-wedding fix resolves.
+
+    /// <summary>True while any event is up on the host. Stuck-true after a wedding = event never ended.</summary>
+    public bool EventUp { get; set; }
+
+    /// <summary>True while a fade-to-black is armed. Stuck-true after a wedding = the black fadeout never cleared.</summary>
+    public bool FadeToBlack { get; set; }
+
+    /// <summary>True while a dialogue is up. Stuck-true after a wedding = the after-wedding dialogue is dangling.</summary>
+    public bool DialogueUp { get; set; }
+
+    /// <summary>True while the host is on a temporary event map (e.g. the wedding ceremony Town map).
+    /// Stuck-true after a wedding = the host never warped off the ceremony location.</summary>
+    public bool HostLocationIsTemporary { get; set; }
+
+    /// <summary>The host's current location name. After the day's last wedding the host must be returned
+    /// to its FarmHouse idle spot — not left standing on the open Farm map where the wedding exit warp
+    /// drops it (the exit targets getHomeOfFarmer(Game1.player)'s porch). Lets a test assert the host
+    /// ended at home rather than just "not on a temporary map".</summary>
+    public string? HostCurrentLocation { get; set; }
+}
+
 /// <summary>Body for POST /test/console (test-only): a console command name + args to invoke.</summary>
 public class TestConsoleCommandRequest
 {
@@ -348,6 +431,62 @@ public class TestConsoleCommandResponse
     /// <summary>True if the named command was found and its callback invoked without throwing.</summary>
     public bool Success { get; set; }
     public string? Error { get; set; }
+}
+
+/// <summary>
+/// Response from GET /test/npc_sprite_integrity (test-only). Reports the
+/// NpcSpriteIntegrityService's sweep metadata plus a live scan for sprite-less NPCs, so E2E
+/// tests can prove both the heal outcome and the SaveLoaded/DayStarted wiring (the run
+/// counters only advance when the real event handlers fire — a direct /test/heal_npc_sprites
+/// call can't satisfy them).
+/// </summary>
+public class TestNpcSpriteIntegrityResponse
+{
+    public bool Success { get; set; }
+    public string? Error { get; set; }
+
+    /// <summary>Names of NPCs currently missing a sprite (live scan; empty when healthy).</summary>
+    public List<string> SpritelessNpcs { get; set; } = new();
+
+    /// <summary>Context tag of the most recent sweep ("save_loaded", "day_started", "test"), or null.</summary>
+    public string? LastRunContext { get; set; }
+
+    /// <summary>NPCs healed by the most recent sweep.</summary>
+    public int LastRunHealedCount { get; set; }
+
+    /// <summary>Sweeps triggered by the SaveLoaded handler since mod start.</summary>
+    public int SaveLoadedRuns { get; set; }
+
+    /// <summary>Sweeps triggered by the DayStarted handler since mod start.</summary>
+    public int DayStartedRuns { get; set; }
+
+    /// <summary>NPCs healed across all sweeps since mod start.</summary>
+    public int TotalHealed { get; set; }
+}
+
+/// <summary>
+/// Response from POST /test/break_npc_sprite (test-only fault injector — see the handler doc).
+/// </summary>
+public class TestBreakNpcSpriteResponse
+{
+    public bool Success { get; set; }
+    public string? Error { get; set; }
+
+    /// <summary>The NPC whose sprite was nulled.</summary>
+    public string NpcName { get; set; } = "";
+
+    /// <summary>True if the NPC had a sprite before the break (sanity signal for the test).</summary>
+    public bool HadSprite { get; set; }
+}
+
+/// <summary>Response from POST /test/heal_npc_sprites (test-only).</summary>
+public class TestHealNpcSpritesResponse
+{
+    public bool Success { get; set; }
+    public string? Error { get; set; }
+
+    /// <summary>NPCs healed by this sweep run.</summary>
+    public int HealedCount { get; set; }
 }
 
 /// <summary>Response from POST /test/import_save.</summary>

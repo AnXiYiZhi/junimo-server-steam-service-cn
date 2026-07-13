@@ -1,5 +1,5 @@
 using System.Diagnostics;
-using System.Text.Json;
+using System.Text.RegularExpressions;
 using JunimoServer.Tests.Schema.Json;
 
 namespace JunimoServer.Tests.Helpers;
@@ -30,6 +30,19 @@ public static class DockerImageBuilder
     private const int FileLockMaxRetries = 5;
     private static readonly TimeSpan FileLockRetryDelay = TimeSpan.FromSeconds(2);
 
+    // Recent-output tail attached to build-failure messages. The tail is only the
+    // console/annotation excerpt (the full log is on disk); 50 ≈ one terminal
+    // screen, and `buildx --progress=plain` emits the failing step's output and
+    // its ERROR: block in the final lines.
+    private const int FailureTailLines = 50;
+
+    // make's "*** [target] Error N" recipe trailer — restates the exit code
+    // without adding signal; filtered out of the failure tail.
+    private static readonly Regex MakeErrorTrailer = new(
+        @"^\s*make(\[\d+\])?: \*\*\*",
+        RegexOptions.Compiled
+    );
+
     private static readonly string ImageTag =
         Environment.GetEnvironmentVariable("SDVD_IMAGE_TAG") ?? "local";
     private static readonly bool UseLocalImages = ImageTag == "local";
@@ -54,33 +67,24 @@ public static class DockerImageBuilder
     /// </summary>
     private static Dictionary<string, string> GetSteamCredentials(IBuildProgressSink progress)
     {
-        var steamAccounts = Environment.GetEnvironmentVariable("STEAM_ACCOUNTS");
-        if (string.IsNullOrEmpty(steamAccounts))
-        {
-            return new Dictionary<string, string>();
-        }
-
         try
         {
-            using var doc = JsonDocument.Parse(steamAccounts, UserConfigJson.Document);
-            var first = doc.RootElement[0];
-            var user = first.GetProperty("user").GetString() ?? "";
-            var pass = first.TryGetProperty("pass", out var p) ? p.GetString() ?? "" : "";
-            var token = first.TryGetProperty("token", out var t) ? t.GetString() ?? "" : "";
+            var accounts = SteamAccount.ParseList(
+                Environment.GetEnvironmentVariable("STEAM_ACCOUNTS")
+            );
+            if (accounts.Count == 0)
+            {
+                return new Dictionary<string, string>();
+            }
+
             return new Dictionary<string, string>
             {
-                ["STEAM_USERNAME"] = user,
-                ["STEAM_PASSWORD"] = pass,
-                ["STEAM_REFRESH_TOKEN"] = token,
+                ["STEAM_USERNAME"] = accounts[0].User,
+                ["STEAM_PASSWORD"] = accounts[0].Pass,
+                ["STEAM_REFRESH_TOKEN"] = accounts[0].Token,
             };
         }
-        catch (Exception ex)
-            when (ex
-                    is JsonException
-                        or IndexOutOfRangeException
-                        or InvalidOperationException
-                        or KeyNotFoundException
-            )
+        catch (Exception ex) when (ex is InvalidOperationException or FormatException)
         {
             progress.Step($"STEAM_ACCOUNTS JSON malformed: {ex.Message}", SetupStepStatus.Warning);
             return new Dictionary<string, string>();
@@ -361,32 +365,115 @@ public static class DockerImageBuilder
             }
         }
 
-        using var process =
-            Process.Start(startInfo)
-            ?? throw new InvalidOperationException($"Failed to start '{command} {arguments}'");
+        Process StartBuildProcess()
+        {
+            try
+            {
+                // Process.Start's own failure (Win32Exception when the executable is
+                // missing) carries no command context — rethrow with it attached.
+                return Process.Start(startInfo)
+                    ?? throw new InvalidOperationException(
+                        $"Failed to start '{command} {arguments}'"
+                    );
+            }
+            catch (Exception ex) when (ex is not InvalidOperationException)
+            {
+                throw new InvalidOperationException(
+                    $"Failed to start '{command} {arguments}': {ex.Message}"
+                );
+            }
+        }
+
+        using var process = StartBuildProcess();
+
+        // Injected credential values (Steam user / pass / refresh token) are masked
+        // out of every line before it is streamed or buffered — the raw form never
+        // exists outside the process pipe, so the log file, infrastructure*.jsonl,
+        // consoles, and both UIs all inherit masked lines. The ≥3-length guard
+        // mirrors the report redactor's (and string.Replace throws on an empty
+        // needle).
+        var secretValues =
+            environmentVars?.Values.Where(v => !string.IsNullOrEmpty(v) && v.Length >= 3).ToArray()
+            ?? Array.Empty<string>();
+
+        string MaskSecrets(string line)
+        {
+            foreach (var secret in secretValues)
+            {
+                line = line.Replace(secret, "***");
+            }
+
+            return line;
+        }
+
+        // Full masked output, buffered for the diagnostics log file; the failure
+        // tail is sliced from the same buffer. The two reader loops run concurrently.
+        var outputLines = new List<string>();
+        var outputLock = new object();
+        var logFileName = $"image-build-{description.Replace(' ', '-')}.log";
+
+        // Diagnostics must never fail a build.
+        void WriteBuildLog()
+        {
+            try
+            {
+                string[] lines;
+                lock (outputLock)
+                {
+                    lines = outputLines.ToArray();
+                }
+
+                File.WriteAllLines(
+                    Path.Combine(TestArtifacts.GetDiagnosticsDir(), logFileName),
+                    lines
+                );
+            }
+            catch
+            { /* never fail the build over a log write */
+            }
+        }
+
+        // Bounded failure excerpt for exception messages: the CI renderer shows
+        // InProgress lines only as a transient spinner label, so without this the
+        // operator sees the exit code but never the underlying error.
+        string BuildFailureTail()
+        {
+            string[] tailLines;
+            lock (outputLock)
+            {
+                tailLines = outputLines
+                    .Where(l => !string.IsNullOrWhiteSpace(l) && !MakeErrorTrailer.IsMatch(l))
+                    .TakeLast(FailureTailLines)
+                    .ToArray();
+            }
+
+            var tailBlock =
+                tailLines.Length > 0
+                    ? $" Last output:{Environment.NewLine}  "
+                        + string.Join($"{Environment.NewLine}  ", tailLines)
+                    : " (no output captured)";
+            return $"{tailBlock}{Environment.NewLine}Full log: {RunArtifactNames.DiagnosticsDir}/{logFileName}";
+        }
 
         // Read stdout / stderr in parallel via local async functions. ReadLineAsync
         // is fully async on .NET 6+; wrapping in Task.Run added thread-pool overhead
-        // without any concurrency benefit. Each line streams through the progress
-        // sink; the renderer surfaces them in real time.
-        async Task ReadStdoutAsync()
+        // without any concurrency benefit. Each masked line streams through the
+        // progress sink; the renderer surfaces them in real time.
+        async Task ReadLinesAsync(StreamReader reader)
         {
-            while (await process.StandardOutput.ReadLineAsync().ConfigureAwait(false) is { } line)
+            while (await reader.ReadLineAsync().ConfigureAwait(false) is { } line)
             {
-                progress.Step(stepName, SetupStepStatus.InProgress, line);
+                var masked = MaskSecrets(line);
+                progress.Step(stepName, SetupStepStatus.InProgress, masked);
+                lock (outputLock)
+                {
+                    outputLines.Add(masked);
+                }
             }
         }
 
-        async Task ReadStderrAsync()
-        {
-            while (await process.StandardError.ReadLineAsync().ConfigureAwait(false) is { } line)
-            {
-                progress.Step(stepName, SetupStepStatus.InProgress, line);
-            }
-        }
-
-        var stdoutTask = ReadStdoutAsync();
-        var stderrTask = ReadStderrAsync();
+        var stdoutTask = ReadLinesAsync(process.StandardOutput);
+        var stderrTask = ReadLinesAsync(process.StandardError);
 
         using var cts = new CancellationTokenSource(timeout);
         try
@@ -395,21 +482,43 @@ public static class DockerImageBuilder
         }
         catch (OperationCanceledException)
         {
-            process.Kill(entireProcessTree: true);
+            try
+            {
+                process.Kill(entireProcessTree: true);
+            }
+            catch
+            {
+                // The process (or a descendant) exited in the window between the
+                // timeout firing and the kill — the TimeoutException below is the
+                // real signal and must not be masked.
+            }
+
+            // The kill closes the pipes so reader EOF is imminent; bounded drain
+            // per drain-before-consume-disposal. Swallow drain failures for the
+            // same reason as the kill above.
+            try
+            {
+                await Task.WhenAll(stdoutTask, stderrTask).WaitAsync(TimeSpan.FromSeconds(5));
+            }
+            catch
+            { /* drain best-effort */
+            }
+
+            WriteBuildLog();
             throw new TimeoutException(
-                $"Building {description} timed out after {timeout.TotalMinutes:0} minutes"
+                $"Building {description} timed out after {timeout.TotalMinutes:0} minutes.{BuildFailureTail()}"
             );
         }
 
         await Task.WhenAll(stdoutTask, stderrTask);
 
+        // Success logs are kept too — a good/bad build diff needs both sides.
+        WriteBuildLog();
+
         if (process.ExitCode != 0)
         {
-            // Streamed InProgress events above already carried each line through the
-            // progress sink; the InvalidOperationException then surfaces as
-            // SetupStepStatus.Failed in the calling BuildAndEmitStatus.
             throw new InvalidOperationException(
-                $"Building {description} failed with exit code {process.ExitCode}."
+                $"Building {description} failed with exit code {process.ExitCode}.{BuildFailureTail()}"
             );
         }
     }
