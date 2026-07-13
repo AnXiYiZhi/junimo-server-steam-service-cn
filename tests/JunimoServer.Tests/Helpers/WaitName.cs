@@ -178,4 +178,21 @@ public enum WaitName
     Polling_Festival_EndedNoPlayers,
     Polling_Festival_NextFestivalEndedOnLeave,
     Polling_Festival_MainEventStillActive,
+
+    // WeddingTests.cs (5)
+    Polling_Wedding_EngagementReplicated,
+    Polling_Wedding_BothCeremoniesRan,
+    Polling_Wedding_BothClientsRenderedBoth,
+    Polling_Wedding_HostRecoveredAfterCeremonies,
+    Polling_Wedding_HostReturnedHomeAfterCeremonies,
+
+    // LobbyHomedSpouseTests.cs (4)
+    Polling_LobbyHome_EngagementReplicated,
+    Polling_LobbyHome_CeremoniesCompleted,
+    Polling_LobbyHome_SpousesInCabins,
+    Polling_LobbyHome_PoisonHealed,
+
+    // NpcSpriteIntegrityTests.cs (1)
+    /// <summary>Game clock crossed the daytime schedule-departure boundaries after the heal.</summary>
+    Polling_NpcSprite_DaytimeBoundariesCrossed,
 }

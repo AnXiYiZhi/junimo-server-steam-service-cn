@@ -38,6 +38,17 @@
 #     merge-coupled trigger (push / pull_request_target / merge_group) or mark any job a
 #     required check.
 #
+# PR visibility: issue_comment and dispatch+pr runs execute at github.sha (the default
+# branch's HEAD), not the PR's head SHA, so GitHub Actions' own auto-registered check for
+# this job lands on master and never appears on the PR's Checks tab. The `gate` job
+# explicitly creates an "E2E Tests" check run keyed on the PR's real head SHA via the
+# Checks API (createCheckRun in e2e-pr-sticky.js, checks: write), the `e2e` job
+# transitions it in_progress -> completed alongside the sticky comment, and the
+# `check-cleanup` job closes it as cancelled when the e2e job never ran (fork approval
+# rejected, or cancelled/replaced while queued). This is a visibility convenience ONLY
+# (continue-on-error / caught Checks API errors throughout) — it is never registered as
+# a required status check; see the invariant above.
+#
 # All secrets resolve from the `test-vps` GitHub Environment (the same per-environment
 # mechanism deploy-server.yml uses), not loose repo-level secrets. R2_BUCKET /
 # R2_PUBLIC_BASE_URL are test-vps *variables* (public by design; see the R2 step).
@@ -90,6 +101,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write   # post/update the sticky + reactions
+      checks: write          # create the PR-visible "E2E Tests" check run
       contents: read
     # NB: use github.event.sender (the actor who triggered the event), NOT
     # github.event.comment.user. On an `edited` checkbox toggle, comment.user is the
@@ -114,6 +126,7 @@ jobs:
       filter: ${{ steps.gate.outputs.filter }}
       pr_number: ${{ steps.gate.outputs.pr_number }}
       is_fork: ${{ steps.gate.outputs.is_fork }}
+      check_run_id: ${{ steps.gate.outputs.check_run_id }}
     steps:
       # Check out ONLY the shared helper script from the (trusted) default branch, so
       # the github-script step can require() it. issue_comment already runs the default-
@@ -169,12 +182,33 @@ jobs:
                 }),
               });
 
+              // This run executes at github.sha (the default branch's HEAD on issue_comment,
+              // or master on a plain dispatch+pr) — never the PR's head SHA — so the job's own
+              // auto-registered check lands on the wrong commit and never shows on the PR.
+              // Create an explicit check run keyed on the PR's real head SHA (helper header
+              // comment has the full rationale); its id threads through to the e2e job so that
+              // job can transition it in_progress -> completed instead of creating a duplicate.
+              // The sticky above already posted "queued", so a Checks API failure here (perms,
+              // rate-limit, transient error) must not fail the whole gate and strand the run —
+              // catch and proceed with an empty check_run_id (every downstream consumer already
+              // guards on it being non-empty).
+              let checkRunId = '';
+              try {
+                checkRunId = await helper.createCheckRun({
+                  github, owner, repo, head_sha: pr.head.sha, status: 'queued',
+                  detailsUrl: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+                });
+              } catch (err) {
+                core.warning(`Failed to create PR check run: ${err.message}`);
+              }
+
               core.setOutput('proceed', 'true');
               core.setOutput('head_sha', pr.head.sha);
               core.setOutput('head_ref', pr.head.ref);
               core.setOutput('filter', filter);
               core.setOutput('pr_number', String(issueNumber));
               core.setOutput('is_fork', String(isFork));
+              core.setOutput('check_run_id', String(checkRunId));
               return true;
             }
 
@@ -357,6 +391,7 @@ jobs:
     environment: test-vps
     permissions:
       pull-requests: write   # the "Update PR sticky" step posts results back to the PR
+      checks: write          # transition the "E2E Tests" check run in_progress -> completed
       contents: read
     # The runner's own per-test and broker timeouts catch real hangs; this job cap is only
     # a coarse backstop for a wedged process (e.g. a stuck SSH master) that those miss. It
@@ -451,8 +486,9 @@ jobs:
           persist-credentials: false
 
       # SECURITY: the workspace above is PR HEAD — on a fork PR it is untrusted code.
-      # The "Update PR sticky" step runs with the test-vps secrets + pull-requests:write,
-      # so it must NOT require() the sticky helper from that checkout (a fork could edit it
+      # The sticky-writing steps ("Mark PR sticky running", the run step's progress poll,
+      # "Update PR sticky") run with the test-vps secrets + pull-requests:write, so they
+      # must NOT require() the sticky helper from that checkout (a fork could edit it
       # to run arbitrary JS with secrets — CodeQL "Untrusted Checkout TOCTOU"). Pull the
       # helper from the TRUSTED default branch into a separate path and require() that copy.
       # (Building/testing the PR code itself is the intended, fork-pr-gated behaviour; this
@@ -467,11 +503,32 @@ jobs:
           persist-credentials: false
           path: trusted-helper
 
+      # Flip the PR's "E2E Tests" check run from queued -> in_progress now that the VPS
+      # job has actually started (the gate job only creates it queued). continue-on-error:
+      # a Checks API hiccup here must not fail the run — the sticky comment is the source
+      # of truth either way, this check run is a visibility convenience.
+      - name: Start PR check run
+        if: needs.gate.outputs.pr_number != '' && needs.gate.outputs.check_run_id != ''
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CHECK_RUN_ID: ${{ needs.gate.outputs.check_run_id }}
+        with:
+          script: |
+            const helper = require(`${process.env.GITHUB_WORKSPACE}/trusted-helper/.github/scripts/e2e-pr-sticky.js`);
+            const { owner, repo } = context.repo;
+            await helper.updateCheckRun({
+              github, owner, repo,
+              check_run_id: Number(process.env.CHECK_RUN_ID),
+              status: 'in_progress',
+              detailsUrl: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+            });
+
       # The coordinator is a net10.0 app that runs HERE on the runner (the mod
       # builds inside Docker; the runner does not). .NET 10 is GA, so the default
       # quality channel resolves a stable SDK — no preview pin needed.
       - name: Setup .NET 10.0
-        uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5.3.0
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
         with:
           dotnet-version: '10.0.x'
 
@@ -494,7 +551,7 @@ jobs:
       # steam-service) in-process.
       - name: Set up Docker Buildx
         id: buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       # The Dockerfile uses a BuildKit `--mount=type=cache` for /root/.nuget/packages
       # that BuildKit does not persist across runs. The cache-dance bridges that:
@@ -504,7 +561,7 @@ jobs:
       # `changes`-job gating (this job always builds).
       - name: Cache NuGet mount
         id: nuget-cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: nuget-cache-mount
           key: nuget-cache-mount-${{ hashFiles('mod/**/*.csproj', 'tools/steam-service/**/*.csproj', 'Directory.Build.props') }}
@@ -586,6 +643,42 @@ jobs:
             | { grep -v '^SDVD_EVENT ' || true; }
           exit "${PIPESTATUS[0]}"
 
+      # Flip the sticky from "queued" to "running" now that setup is done and the suite
+      # is about to start (the sibling of "Start PR check run" above, for the comment).
+      # Outputs the sticky's comment id so the run step's progress poll can PATCH the
+      # exact comment without re-finding it each tick. continue-on-error: a sticky
+      # hiccup must not fail the run — an empty comment_id just disables the poll.
+      - name: Mark PR sticky running
+        id: mark-running
+        if: needs.gate.outputs.pr_number != ''
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
+          FILTER: ${{ needs.gate.outputs.filter }}
+        with:
+          script: |
+            // Trusted (default-branch) copy — NOT the PR-HEAD checkout (see "Checkout
+            // trusted sticky helper" above).
+            const helper = require(`${process.env.GITHUB_WORKSPACE}/trusted-helper/.github/scripts/e2e-pr-sticky.js`);
+            const { owner, repo } = context.repo;
+            const issue_number = Number(process.env.PR_NUMBER);
+            const existing = await helper.findSticky({ github, owner, repo, issue_number });
+            const history = existing ? helper.readHistory(existing.body) : [];
+            // Keep the checkbox's "(requested)" suffix while the run is in flight — it
+            // is only cleared when fresh results post (the final sticky update).
+            const requested = !!existing && existing.body.includes(helper.RERUN_REQUESTED_LABEL);
+            const id = await helper.upsertSticky({
+              github, owner, repo, issue_number, existing,
+              body: helper.renderBody({
+                status: 'running', statusEmoji: '🔵',
+                headline: `Running for \`${helper.shortSha(process.env.HEAD_SHA)}\`…`,
+                filter: process.env.FILTER || '', history, requested,
+              }),
+            });
+            core.setOutput('comment_id', String(id));
+
       # The whole pipeline in one command. The runner builds all three images
       # in-process (reading STEAM_ACCOUNTS[0] for the Steam --secret login),
       # streams them + the game-data volume to the VPS, then runs the tests there.
@@ -593,6 +686,11 @@ jobs:
       # that class); with no filter the full suite runs. STEAM_ACCOUNTS is required
       # here from the very first run — without it the in-process image build fails
       # with a Steam-login error.
+      #
+      # On PR runs the suite is backgrounded through `tee` and this step's poll loop
+      # lifts CIRenderer's periodic PROGRESS line (stdout is non-TTY here) into the
+      # sticky comment every ~60s — GitHub Actions steps are strictly sequential, so
+      # live progress must come out of this one long-running step, not a sibling.
       - name: Run E2E suite
         env:
           SDVD_DOCKER_HOSTS: ${{ secrets.SDVD_DOCKER_HOSTS }}
@@ -603,12 +701,68 @@ jobs:
           # checkbox; empty (the default) runs the full suite — pass --filter only
           # when a non-whitespace value was provided.
           FILTER: ${{ needs.gate.outputs.filter }}
+          # For the progress poll loop (PR runs only): gh auth to PATCH the sticky
+          # located by "Mark PR sticky running". Empty comment id (no PR context, or
+          # that step failed) means a plain foreground run with no polling.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STICKY_COMMENT_ID: ${{ steps.mark-running.outputs.comment_id }}
+          HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
         run: |
+          args=()
           if [ -n "${FILTER//[[:space:]]/}" ]; then
-            dotnet run --project ./tests/JunimoServer.TestRunner -- --filter "$FILTER"
-          else
-            dotnet run --project ./tests/JunimoServer.TestRunner
+            args=(-- --filter "$FILTER")
           fi
+
+          if [ -z "${STICKY_COMMENT_ID:-}" ]; then
+            exec dotnet run --project ./tests/JunimoServer.TestRunner "${args[@]}"
+          fi
+
+          # The subshell records the runner's own exit code: after `wait` $? would be
+          # tee's, and PIPESTATUS does not cover a backgrounded pipeline. `set +e` in the
+          # subshell: it inherits this step's errexit, which would otherwise abort it on a
+          # runner failure before the echo runs (leaving run.exit empty).
+          : > run.exit
+          ( set +e; dotnet run --project ./tests/JunimoServer.TestRunner "${args[@]}" 2>&1; echo "$?" > run.exit ) | tee run.log &
+          TEE_PID=$!
+
+          update_sticky() {
+            # Render with the TRUSTED helper copy (never the PR-HEAD one — see the
+            # trusted-helper checkout above). Read the live body each tick so history
+            # rows appended by other runs survive the PATCH.
+            gh api "/repos/${GITHUB_REPOSITORY}/issues/comments/${STICKY_COMMENT_ID}" --jq .body > sticky-body.txt \
+              && PROGRESS_LINE="$1" node -e '
+                const fs = require("fs");
+                const helper = require(process.env.GITHUB_WORKSPACE + "/trusted-helper/.github/scripts/e2e-pr-sticky.js");
+                const body = fs.readFileSync("sticky-body.txt", "utf8");
+                const counts = process.env.PROGRESS_LINE.replace(/^PROGRESS /, "");
+                process.stdout.write(helper.renderBody({
+                  status: "running", statusEmoji: "🔵",
+                  headline: "Running for `" + helper.shortSha(process.env.HEAD_SHA) + "`… " + counts,
+                  filter: process.env.FILTER || "",
+                  history: helper.readHistory(body),
+                  requested: body.includes(helper.RERUN_REQUESTED_LABEL),
+                }));
+              ' > sticky-new.txt \
+              && gh api --method PATCH --silent \
+                   "/repos/${GITHUB_REPOSITORY}/issues/comments/${STICKY_COMMENT_ID}" \
+                   -F "body=@sticky-new.txt"
+          }
+
+          last=""
+          while kill -0 "$TEE_PID" 2>/dev/null; do
+            sleep 60
+            progress=$(grep -ao 'PROGRESS [0-9][0-9]*/[0-9][0-9]* ([^)]*)' run.log | tail -n 1 || true)
+            if [ -n "$progress" ] && [ "$progress" != "$last" ]; then
+              # A sticky/API hiccup must never fail the run — retry on the next tick.
+              if update_sticky "$progress"; then last="$progress"; else echo "PROGRESS sticky update failed (non-fatal)"; fi
+            fi
+          done
+          wait "$TEE_PID" || true
+
+          # Propagate the runner's real exit code; a missing run.exit (the subshell was
+          # killed before writing it) counts as failure.
+          RUN_EXIT=$(cat run.exit 2>/dev/null)
+          exit "${RUN_EXIT:-1}"
 
       # Render the runner's ctrf-report.json (TestRunArtifactWriter.WriteCtrfReport,
       # one per CI invocation) into the job Summary tab. summary-report = pass/fail
@@ -837,14 +991,16 @@ jobs:
           if-no-files-found: warn
 
       # Replace the PR sticky with the final result (any run that resolved a PR — comment,
-      # checkbox, or dispatch+pr; the `if:` keys on pr_number). Reads the runner's
-      # summary.json for counts/status, resets the re-run checkbox to its idle
-      # label, and APPENDS a row to the retained run-history table (older rows kept) so
-      # the PR keeps a full per-run trail for debugging. if: always() fires on pass, fail,
-      # AND cancel (a maintainer preempting the run from the Actions tab) — a sibling status
-      # check picks the headline so a cancelled run reports "⚪ aborted" instead of stranding
-      # on "🟡 queued". The GITHUB_TOKEN edit does not retrigger the workflow (recursion guard).
-      - name: Update PR sticky
+      # checkbox, or dispatch+pr; the `if:` keys on pr_number), and complete the matching
+      # "E2E Tests" check run created by the gate job. Reads the runner's summary.json for
+      # counts/status, resets the re-run checkbox to its idle label, and APPENDS a row to
+      # the retained run-history table (older rows kept) so the PR keeps a full per-run
+      # trail for debugging. if: always() fires on pass, fail, AND cancel (a maintainer
+      # preempting the run from the Actions tab) — a sibling status check picks the
+      # headline so a cancelled run reports "⚪ aborted" instead of stranding on "🟡 queued"
+      # (both the sticky AND the check run reflect that same aborted state). The
+      # GITHUB_TOKEN edit does not retrigger the workflow (recursion guard).
+      - name: Update PR sticky and check run
         if: always() && needs.gate.outputs.pr_number != ''
         continue-on-error: true
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -853,6 +1009,7 @@ jobs:
           FILTER: ${{ needs.gate.outputs.filter }}
           PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
           HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
+          CHECK_RUN_ID: ${{ needs.gate.outputs.check_run_id }}
           # job.status is success | failure | cancelled at always()-eval time.
           JOB_STATUS: ${{ job.status }}
         with:
@@ -881,6 +1038,28 @@ jobs:
             const { status, statusEmoji, resultEmoji, resultWord, headline } =
               helper.deriveResult({ summary, jobStatus, sha, reportUrl });
 
+            // Complete the check run the gate job created (queued -> in_progress in the
+            // "Start PR check run" step -> completed here). Skipped when check_run_id is
+            // empty (creation failed/was skipped) AND wrapped in try/catch, so the sticky
+            // update below runs either way — the sticky is the source of truth, the check
+            // run a convenience; an unguarded Checks API throw here would strand the
+            // sticky on its pre-run state.
+            const checkRunId = process.env.CHECK_RUN_ID;
+            if (checkRunId) {
+              try {
+                await helper.updateCheckRun({
+                  github, owner, repo,
+                  check_run_id: Number(checkRunId),
+                  status: 'completed',
+                  conclusion: helper.statusToConclusion(status),
+                  detailsUrl: reportUrl || `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+                  summary: headline,
+                });
+              } catch (err) {
+                core.warning(`Failed to complete PR check run: ${err.message}`);
+              }
+            }
+
             // Append a history row. renderBody caps the retained rows, so derive the run
             // number from the highest existing n (NOT array length, which is bounded).
             const existing = await helper.findSticky({ github, owner, repo, issue_number });
@@ -899,3 +1078,53 @@ jobs:
             // Pass `existing` so the write targets the exact comment we read history from
             // (one find per update; no lost-update race against a concurrent edit).
             await helper.upsertSticky({ github, owner, repo, issue_number, body, existing });
+
+  # ── Close an orphaned "E2E Tests" check run. The gate creates it `queued`, but on the
+  # paths where the e2e job never runs (fork-pr approval rejected, a queued run cancelled
+  # or replaced via `queue: max`) no always() step exists to complete it — the PR's Checks
+  # tab would show a pending spinner until a later run reuses the row. Fires only when the
+  # e2e job was skipped or cancelled: on success/failure its own final step completed the
+  # run (and a `cancelled` conclusion here must never overwrite a real one). The
+  # checks.get guard covers cancel-MID-run, where e2e's always() step did reach completed
+  # before this job fires. Residual: a runner that dies before e2e's final step leaves the
+  # row pending (job result `failure`, deliberately not matched here) — the next run's
+  # createCheckRun reuses it. Not in the e2e concurrency singleton: it makes one API call
+  # and must run while the replacing run occupies the group.
+  check-cleanup:
+    name: Close orphaned check run
+    needs: [gate, e2e]
+    if: >
+      always() && needs.gate.outputs.check_run_id != ''
+      && (needs.e2e.result == 'skipped' || needs.e2e.result == 'cancelled')
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
+    timeout-minutes: 5
+    steps:
+      # Same trusted default-ref helper checkout as the gate job (never the PR head).
+      - name: Checkout sticky helper
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          sparse-checkout: .github/scripts/e2e-pr-sticky.js
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Complete check run as cancelled
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CHECK_RUN_ID: ${{ needs.gate.outputs.check_run_id }}
+        with:
+          script: |
+            const helper = require('./.github/scripts/e2e-pr-sticky.js');
+            const { owner, repo } = context.repo;
+            const check_run_id = Number(process.env.CHECK_RUN_ID);
+            const { data: run } = await github.rest.checks.get({ owner, repo, check_run_id });
+            if (run.status === 'completed') return; // e2e's final step got there first
+            await helper.updateCheckRun({
+              github, owner, repo, check_run_id,
+              status: 'completed',
+              conclusion: 'cancelled',
+              detailsUrl: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+              summary: 'The E2E job never ran (cancelled while queued, or fork approval rejected).',
+            });

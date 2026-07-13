@@ -100,6 +100,8 @@ export interface TestStore {
     findGlobalStep: (stepName: string) => SetupStepSnapshot | null;
     /** Find a test by display name (for cross-linking from history). */
     findTest: (displayName: string) => TestSnapshot | null;
+    /** The freshest failed test (highest executionOrder), or null if none failed. */
+    findMostRecentFailure: () => TestSnapshot | null;
     /** Send a runtime control command to the runner. WS-first, REST fallback. */
     sendCommand: (cmd: "stop") => Promise<void>;
 }
@@ -424,6 +426,30 @@ export function useTestStore(): TestStore {
         return firstFailed ?? firstRunning ?? mostRecent;
     }
 
+    // The failure to jump to from "show failed tests" surfaces — the freshest one
+    // (highest executionOrder), matching the Overview's "most recent failure" order.
+    // Falls back to the first failed in tree order when none carry an executionOrder.
+    function findMostRecentFailure(): TestSnapshot | null {
+        let best: TestSnapshot | null = null;
+        let bestOrder = -1;
+        let firstFailed: TestSnapshot | null = null;
+        for (const col of collections.value) {
+            for (const cls of col.classes) {
+                for (const test of cls.tests) {
+                    if (test.status !== "failed") {
+                        continue;
+                    }
+                    firstFailed ??= test;
+                    if (test.executionOrder != null && test.executionOrder > bestOrder) {
+                        bestOrder = test.executionOrder;
+                        best = test;
+                    }
+                }
+            }
+        }
+        return best ?? firstFailed;
+    }
+
     function updateTitleFromState() {
         switch (state.status) {
             case "pending": {
@@ -472,6 +498,35 @@ export function useTestStore(): TestStore {
 
     function makePhaseKey(category: string, phase: string, collection?: string | null): string {
         return collection ? `${collection}:${category}:${phase}` : `${category}:${phase}`;
+    }
+
+    // Apply a terminal outcome to a test: transition counts, set status, mark the
+    // tree dirty, and reconcile auto-selection. Works from any current status
+    // (transitionStatus rebalances whatever was there) and no-ops when status
+    // already matches, so it is safe to call from both producers in either order.
+    function setTerminalOutcome(test: TestSnapshot, outcome: "passed" | "failed" | "canceled") {
+        if (test.status === outcome) {
+            return;
+        }
+        transitionStatus(test.status, outcome);
+        test.status = outcome;
+        markTreeDirty();
+        if (outcome === "failed") {
+            // A genuine failure — including one enrichment upgraded from canceled after
+            // test_failed's OCE guess already skipped selection — jumps to the headline,
+            // matching test_failed's own auto-select. The status===outcome early-return
+            // above keeps an already-failed re-apply from re-selecting.
+            autoSelect(test);
+        } else if (selectedTest.value?.displayName === test.displayName) {
+            // A failure demoted off the selected slot (e.g. failed→canceled) hands the
+            // headline back to the freshest remaining real failure; if none remain the
+            // selection stays put (a canceled test never auto-selects, but we don't
+            // proactively deselect either — matching the pre-fix test_failed behavior).
+            const next = findMostRecentFailure();
+            if (next) {
+                autoSelect(next);
+            }
+        }
     }
 
     function applyEvent(event: TestEvent) {
@@ -713,7 +768,9 @@ export function useTestStore(): TestStore {
                     event.exceptionType === "System.Threading.Tasks.TaskCanceledException";
                 if (test) {
                     const oldStatus = test.status;
-                    const newStatus = isCanceled ? "canceled" : "failed";
+                    // Enrichment (test-process verdict) may have arrived first; honor it over the
+                    // exception-type guess, mirroring the runner's SetOutcome source policy.
+                    const newStatus = test.enrichmentOutcome ?? (isCanceled ? "canceled" : "failed");
                     test.status = newStatus;
                     test.durationMs = event.durationMs;
                     test.queueDurationMs = event.queueDurationMs ?? null;
@@ -736,8 +793,8 @@ export function useTestStore(): TestStore {
                     transitionStatus(oldStatus, newStatus);
                     markTreeDirty();
                     markSelectedContentDirty(test);
-                    // Auto-select failed test (but not canceled ones)
-                    if (!isCanceled) {
+                    // Auto-select only a genuine failure (canceled never auto-selects).
+                    if (newStatus === "failed") {
                         autoSelect(test);
                     }
                 }
@@ -910,7 +967,11 @@ export function useTestStore(): TestStore {
             }
 
             case "recording": {
-                cacheScreenshot(event.recordingPath);
+                // Don't eagerly blob-cache the video — recordings are multi-MB and the <video>
+                // element streams them on demand from the /artifacts/ URL (resolved via
+                // screenshotSrc). Eager-caching every clip would pull tens of MB into memory on a
+                // full run. (Screenshots ARE eagerly cached — they're small and must survive runner
+                // shutdown for the offline view.)
                 const test = findOrCreateTest(event.testCollection, event.testClass, event.displayName);
                 if (test) {
                     test.recordings = test.recordings || [];
@@ -967,6 +1028,13 @@ export function useTestStore(): TestStore {
                         lastKeepDisposeMs: event.lastKeepDisposeMs,
                         leaseReleaseMs: event.leaseReleaseMs,
                     };
+                    // The enrichment outcome is the runner's authoritative verdict (it has
+                    // already run SetOutcome). Apply it and cache it for a possibly-later
+                    // test_failed, whose exception-type guess must defer to the cache.
+                    if (event.outcome === "passed" || event.outcome === "failed" || event.outcome === "canceled") {
+                        test.enrichmentOutcome = event.outcome;
+                        setTerminalOutcome(test, event.outcome);
+                    }
                     markSelectedContentDirty(test);
                 }
                 break;
@@ -1618,6 +1686,7 @@ export function useTestStore(): TestStore {
         findTest(displayName: string): TestSnapshot | null {
             return findTestByDisplayName(displayName);
         },
+        findMostRecentFailure,
         sendCommand,
     };
 }

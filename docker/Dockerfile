@@ -128,7 +128,7 @@ RUN --mount=type=cache,target=/root/.nuget/packages \
 FROM --platform=$BUILDPLATFORM jlesage/baseimage-gui:debian-11-v4.11.3 AS server
 
 ARG SMAPI_VERSION
-ARG TMUX_VERSION=3.6b
+ARG TMUX_VERSION=3.7b
 
 ENV APP_NAME="Stardew Dedicated Server" \
     USER_ID=0 \
@@ -156,22 +156,17 @@ RUN apt-get update && apt-get install -y \
     # Base packages
     ca-certificates \
     curl \
+    # .NET globalization (SMAPI FailFasts at startup without it)
+    libicu67 \
+    # SkiaSharp's native image decoder (Content Patcher EditImage) needs fontconfig to load
+    libfontconfig1 \
     locales \
     procps \
     unzip \
-    x11-utils \
     xz-utils \
-    # GUI packages
-    polybar \
-    rofi \
-    slop \
-    wmctrl \
-    xwallpaper \
     # Additional packages
-    exa \
     htop \
     nano \
-    scrot \
     tcpdump \
     # TigerVNC
     tigervnc-standalone-server \
@@ -185,12 +180,13 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Install ffmpeg 8.1.1. Debian 11 ships 4.3.x with x11grab timing bugs that break the
-# test-recording pipeline; pinning to a date-stamped BtbN release avoids the "latest" tag drift.
-RUN curl -fL -o /tmp/ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-11-14-22/ffmpeg-n8.1.1-12-ge0e38acd2f-linux64-gpl-8.1.tar.xz && \
+# Install ffmpeg 8.1.2 (BtbN build of the stable 8.1 branch). Debian 11 ships 4.3.x with x11grab
+# timing bugs that break the test-recording pipeline. Pin month-end autobuilds only: BtbN prunes
+# daily builds after 14 days (month-end builds live two years), and the "latest" tag drifts.
+RUN curl -fL -o /tmp/ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-30-13-34/ffmpeg-n8.1.2-21-gce3c09c101-linux64-gpl-8.1.tar.xz && \
     tar -xf /tmp/ffmpeg.tar.xz -C /tmp && \
-    install -m 0755 /tmp/ffmpeg-n8.1.1-12-ge0e38acd2f-linux64-gpl-8.1/bin/ffmpeg /usr/local/bin/ffmpeg && \
-    install -m 0755 /tmp/ffmpeg-n8.1.1-12-ge0e38acd2f-linux64-gpl-8.1/bin/ffprobe /usr/local/bin/ffprobe && \
+    install -m 0755 /tmp/ffmpeg-n8.1.2-21-gce3c09c101-linux64-gpl-8.1/bin/ffmpeg /usr/local/bin/ffmpeg && \
+    install -m 0755 /tmp/ffmpeg-n8.1.2-21-gce3c09c101-linux64-gpl-8.1/bin/ffprobe /usr/local/bin/ffprobe && \
     rm -rf /tmp/ffmpeg*
 
 # Install tmux (binary download, separate layer for cacheability)
@@ -202,16 +198,6 @@ RUN curl -L -O https://github.com/tmux/tmux-builds/releases/download/v${TMUX_VER
 # Install vsdbg for remote debugging
 # TODO: Make installation optional for local/debug builds, commented for now
 # RUN curl -sSL https://aka.ms/getvsdbgsh | bash /dev/stdin -v latest -l /root/vsdbg
-
-# Install polybar theme
-RUN add-pkg --virtual build git && \
-    git clone --depth=1 https://github.com/adi1090x/polybar-themes.git && \
-    cd ./polybar-themes && \
-    chmod +x ./setup.sh && \
-    echo "1" | ./setup.sh && \
-    cd .. && \
-    rm -rf ./polybar-themes && \
-    del-pkg build
 
 # Install WebVNC icon
 COPY docker/rootfs/data/images/junimo.png /data/images/junimo.png

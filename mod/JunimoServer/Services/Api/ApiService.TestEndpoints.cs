@@ -67,6 +67,18 @@ public partial class ApiService
                     case "/test/save_tmp_exists":
                         await WriteJsonAsync(response, HandleGetTestSaveTmpExists(request));
                         return;
+                    case "/test/wedding_state":
+                        await WriteJsonAsync(
+                            response,
+                            await HandleGetTestWeddingStateAsync(request)
+                        );
+                        return;
+                    case "/test/npc_sprite_integrity":
+                        await WriteJsonAsync(
+                            response,
+                            await HandleGetTestNpcSpriteIntegrityAsync()
+                        );
+                        return;
                 }
                 break;
             case "POST":
@@ -89,6 +101,12 @@ public partial class ApiService
                         return;
                     case "/test/stamp_claim":
                         await WriteJsonAsync(response, await HandlePostTestStampClaimAsync());
+                        return;
+                    case "/test/stamp_lobby_home":
+                        await WriteJsonAsync(
+                            response,
+                            await HandlePostTestStampLobbyHomeAsync(request)
+                        );
                         return;
                     case "/test/galaxy_relogin":
                         await WriteJsonAsync(response, await HandlePostTestGalaxyReloginAsync());
@@ -116,6 +134,18 @@ public partial class ApiService
                             response,
                             await HandlePostTestCorruptSaveAsync(request)
                         );
+                        return;
+                    case "/test/force_save":
+                        await WriteJsonAsync(response, await HandlePostTestForceSaveAsync());
+                        return;
+                    case "/test/break_npc_sprite":
+                        await WriteJsonAsync(
+                            response,
+                            await HandlePostTestBreakNpcSpriteAsync(request)
+                        );
+                        return;
+                    case "/test/heal_npc_sprites":
+                        await WriteJsonAsync(response, await HandlePostTestHealNpcSpritesAsync());
                         return;
                 }
                 break;
@@ -724,6 +754,149 @@ public partial class ApiService
 
     [ApiEndpoint(
         "POST",
+        "/test/stamp_lobby_home",
+        Summary = "Poison a farmhand + synthesized NPC spouse with lobby home fields (test-only)",
+        Tag = "Test"
+    )]
+    [ApiResponse(typeof(TestStampLobbyHomeResponse), 200)]
+    private async Task<TestStampLobbyHomeResponse> HandlePostTestStampLobbyHomeAsync(
+        HttpListenerRequest request
+    )
+    {
+        var npcName = request.QueryString["npc"] ?? "Abigail";
+
+        var result = new TestStampLobbyHomeResponse();
+        try
+        {
+            await RunOnGameThreadAsync(() =>
+            {
+                var farm = Game1.getFarm();
+                if (farm == null)
+                {
+                    result.Error = "No farm loaded";
+                    return;
+                }
+
+                var npc = Game1.getCharacterFromName(npcName);
+                if (npc == null)
+                {
+                    result.Error = $"NPC '{npcName}' not found";
+                    return;
+                }
+
+                // Reproduce the reporter's save shape: a shared lobby cabin exists (created
+                // while a password was set) even though the server now runs without one.
+                // Classification is position-based, so an ownerless cabin at the shared-lobby
+                // tile IS the lobby for every heal/filter path.
+                var lobbyBuilding = farm.buildings.FirstOrDefault(b =>
+                    b.isCabin && CabinPositions.Classify(b) == CabinRole.SharedLobby
+                );
+                if (lobbyBuilding == null)
+                {
+                    var lobbyTile = CabinPositions.SharedLobby.ToVector2();
+                    lobbyBuilding = _cabinManager.CreateCabinBuilding(lobbyTile);
+                    if (!farm.buildStructure(lobbyBuilding, lobbyTile, Game1.player, true))
+                    {
+                        result.Error = "Failed to build the lobby cabin";
+                        return;
+                    }
+
+                    // Lobby cabins are ownerless by design — drop the farmhand that
+                    // buildStructure's construction handler auto-created.
+                    var freshInterior = lobbyBuilding.GetIndoors<Cabin>();
+                    if (freshInterior?.HasOwner == true)
+                    {
+                        freshInterior.DeleteFarmhand();
+                    }
+                }
+
+                var lobbyIndoors = lobbyBuilding.GetIndoors<Cabin>();
+                if (lobbyIndoors == null)
+                {
+                    result.Error = "Lobby cabin has no interior";
+                    return;
+                }
+                var lobbyName = lobbyIndoors.NameOrUniqueName;
+
+                // Target: first farmhand entry homed at a real (non-lobby) cabin.
+                Farmer target = null;
+                foreach (var farmhandRef in Game1.netWorldState.Value.farmhandData.FieldDict.Values)
+                {
+                    var f = farmhandRef.Value;
+                    if (f == null)
+                    {
+                        continue;
+                    }
+
+                    var home = Game1.getLocationFromName(f.homeLocation.Value) as Cabin;
+                    if (
+                        home?.ParentBuilding != null
+                        && !LobbyService.IsLobbyCabin(home.ParentBuilding)
+                    )
+                    {
+                        target = f;
+                        break;
+                    }
+                }
+                if (target == null)
+                {
+                    result.Error = "No farmhand homed at a real cabin to stamp";
+                    return;
+                }
+
+                result.OriginalHome = target.homeLocation.Value ?? "";
+
+                // Synthesize the marriage (farmhand ↔ NPC) — the reporter's couple shape.
+                // Level >= 1 first: there is no level-0 marriage map (FarmHouse_marriage does
+                // not exist), so a married level-0 farmhouse crashes _newDayAfterFade.
+                if (target.HouseUpgradeLevel < 1)
+                {
+                    target.HouseUpgradeLevel = 1;
+                }
+                target.spouse = npcName;
+                if (
+                    !target.friendshipData.TryGetValue(npcName, out var friendship)
+                    || friendship == null
+                )
+                {
+                    friendship = new Friendship(2500);
+                    target.friendshipData[npcName] = friendship;
+                }
+                friendship.Status = FriendshipStatus.Married;
+                friendship.Proposer = target.UniqueMultiplayerID;
+
+                // Poison the farmhand's durable home + spawn hint — what the old lobby
+                // redirect's client echo baked into saves.
+                target.homeLocation.Value = lobbyName;
+                target.lastSleepLocation.Value = lobbyName;
+
+                // Poison the NPC exactly the way a marriageDuties run against the poisoned
+                // home does: DefaultMap = lobby, position = the level-0 spouse-bed sentinel
+                // ((-1000,-1000), the reporter's "debug where" (-999,-999)).
+                var sentinelBedSpot = lobbyIndoors.getSpouseBedSpot(npcName);
+                npc.DefaultMap = lobbyName;
+                npc.DefaultPosition = Utility.PointToVector2(sentinelBedSpot) * 64f;
+                npc.ClearSchedule();
+                Game1.warpCharacter(npc, lobbyIndoors, Utility.PointToVector2(sentinelBedSpot));
+
+                result.StampedUid = target.UniqueMultiplayerID;
+                result.Npc = npcName;
+                result.LobbyLocation = lobbyName;
+                result.Success = true;
+            });
+        }
+        catch (Exception ex)
+        {
+            // Never LogLevel.Error here (test poison per .claude/rules/debugging.md) — surface via response.
+            result.Success = false;
+            result.Error = ex.Message;
+        }
+
+        return result;
+    }
+
+    [ApiEndpoint(
+        "POST",
         "/test/galaxy_relogin",
         Summary = "Trigger a Galaxy re-sign-in on demand, no outage (test-only)",
         Tag = "Test"
@@ -826,6 +999,10 @@ public partial class ApiService
                 if (body.CaveChoice.HasValue)
                 {
                     master.caveChoice.Value = body.CaveChoice.Value;
+                    // A real played save where the cave was chosen always has event 65 seen. Seed it
+                    // so the host's cave-choice pre-seed treats the choice as already made and never
+                    // applies the server's mushroom default over the seeded value.
+                    master.eventsSeen.Add("65");
                 }
                 if (!string.IsNullOrEmpty(body.Spouse))
                 {
@@ -1377,6 +1554,63 @@ public partial class ApiService
     }
 
     [ApiEndpoint(
+        "POST",
+        "/test/force_save",
+        Summary = "Persist the current world synchronously, without a day transition (test-only)",
+        Tag = "Test"
+    )]
+    [ApiResponse(typeof(TestForceSaveResponse), 200)]
+    private async Task<TestForceSaveResponse> HandlePostTestForceSaveAsync()
+    {
+        // Flushes in-memory state (seeded Game1 mutations + a connected client's customization) to
+        // the save folder without a sleep/day-transition. Lets save-import source generation shed
+        // the ~full-in-game-day SleepToSaveAsync wait. Mirrors the day-transition save's two steps:
+        //   1. saveFarmhands() clones every connected farmhand's live root into farmhandData
+        //      (Multiplayer.cs:1018-1028 → NetWorldState.SaveFarmhand) — same call the transition
+        //      makes (Game1.cs:8238). A homed/customized connected farmhand survives intact;
+        //      ResetFarmhandState only clears userID/home for a HOMELESS farmhand.
+        //   2. getSaveEnumerator() does the actual file write. SaveGame.Save() normally offloads
+        //      this to a background Task and yields across ticks (SaveGame.cs:296-310), but the
+        //      enumerator itself is fully synchronous (SaveGame.cs:346-546 — the yields are just
+        //      progress markers). Driving it inline writes the save within this one game-thread
+        //      Action, sidestepping the background-task split and the UpdateTicked save-suppression.
+        var result = new TestForceSaveResponse();
+        try
+        {
+            // Full save under load can exceed the 5s default game-thread timeout.
+            await RunOnGameThreadAsync(
+                () =>
+                {
+                    if (Game1.gameMode != 3 || !Game1.IsMasterGame)
+                    {
+                        result.Error =
+                            $"Not in a loaded master game (gameMode={Game1.gameMode}, IsMasterGame={Game1.IsMasterGame})";
+                        return;
+                    }
+
+                    // Game1.multiplayer is protected; reach it via the established reflective accessor.
+                    Helper.GetMultiplayer().saveFarmhands();
+
+                    var save = SaveGame.getSaveEnumerator();
+                    while (save.MoveNext()) { }
+
+                    result.SaveFolderName = Constants.SaveFolderName;
+                    result.Success = true;
+                },
+                timeoutMs: 60000
+            );
+        }
+        catch (Exception ex)
+        {
+            // Never LogLevel.Error here (test poison per .claude/rules/debugging.md) — surface via response.
+            result.Success = false;
+            result.Error = ex.Message;
+        }
+
+        return result;
+    }
+
+    [ApiEndpoint(
         "GET",
         "/test/save_tmp_exists",
         Summary = "Whether a leftover .tmp exists next to a save's main file (test-only)",
@@ -1415,5 +1649,182 @@ public partial class ApiService
         {
             return new TestSaveFileOpResponse { Success = false, Error = ex.Message };
         }
+    }
+
+    [ApiEndpoint(
+        "GET",
+        "/test/wedding_state",
+        Summary = "Read the host's wedding ceremony state + wait-gate ready counts (test-only)",
+        Tag = "Test"
+    )]
+    [ApiResponse(typeof(TestWeddingStateResponse), 200)]
+    private async Task<TestWeddingStateResponse> HandleGetTestWeddingStateAsync(
+        HttpListenerRequest request
+    )
+    {
+        // ?farmhandId=<id>&npc=<name>: optional, to report whether that farmhand is now married to
+        // the NPC (the post-ceremony assertion). Wedding/gate fields are reported regardless.
+        long.TryParse(request.QueryString["farmhandId"], out var farmhandId);
+        var npc = request.QueryString["npc"];
+
+        var result = new TestWeddingStateResponse();
+        try
+        {
+            await RunOnGameThreadAsync(() =>
+            {
+                var ev = Game1.CurrentEvent;
+                result.IsWeddingActive = ev?.isWedding == true;
+
+                // Post-ceremony host-stuck signals: after a wedding the host must not be left mid-event,
+                // faded to black, holding a dialogue, or stranded on a temporary ceremony map. A test
+                // asserts all four are clear to gate the multi-wedding stuck-fadeout regression.
+                result.EventUp = Game1.eventUp;
+                result.FadeToBlack = Game1.fadeToBlack;
+                result.DialogueUp = Game1.dialogueUp;
+                result.HostLocationIsTemporary = Game1.currentLocation?.IsTemporary == true;
+                result.HostCurrentLocation = Game1.currentLocation?.NameOrUniqueName;
+
+                if (farmhandId != 0)
+                {
+                    // The host's view of the farmhand's spouse — used by the test to confirm the
+                    // engagement replicated client→host before the day transition.
+                    var farmhand = Game1.GetPlayer(farmhandId, onlyOnline: true);
+                    if (farmhand != null)
+                    {
+                        result.FarmhandSpouse = farmhand.spouse;
+                    }
+
+                    // The spouse NPC's current location. The ceremony's endBehaviors warps the spouse
+                    // to the couple's Farm porch, so == "Farm" proves that ceremony completed.
+                    if (!string.IsNullOrEmpty(npc))
+                    {
+                        var spouseNpc = Game1.getCharacterFromName(npc);
+                        if (spouseNpc != null)
+                        {
+                            result.SpouseCurrentLocation = spouseNpc
+                                .currentLocation
+                                ?.NameOrUniqueName;
+                        }
+                    }
+                }
+
+                result.Success = true;
+            });
+        }
+        catch (Exception ex)
+        {
+            // Never LogLevel.Error here (test poison per .claude/rules/debugging.md) — surface via response.
+            result.Success = false;
+            result.Error = ex.Message;
+        }
+
+        return result;
+    }
+
+    [ApiEndpoint(
+        "GET",
+        "/test/npc_sprite_integrity",
+        Summary = "NPC sprite-integrity sweep status + live scan for sprite-less NPCs (test-only)",
+        Tag = "Test"
+    )]
+    [ApiResponse(typeof(TestNpcSpriteIntegrityResponse), 200)]
+    private async Task<TestNpcSpriteIntegrityResponse> HandleGetTestNpcSpriteIntegrityAsync()
+    {
+        var result = new TestNpcSpriteIntegrityResponse();
+        try
+        {
+            await RunOnGameThreadAsync(() =>
+            {
+                result.SpritelessNpcs = _npcSpriteIntegrity.FindSpritelessNpcs();
+                result.LastRunContext = _npcSpriteIntegrity.LastRunContext;
+                result.LastRunHealedCount = _npcSpriteIntegrity.LastRunHealedCount;
+                result.SaveLoadedRuns = _npcSpriteIntegrity.SaveLoadedRuns;
+                result.DayStartedRuns = _npcSpriteIntegrity.DayStartedRuns;
+                result.TotalHealed = _npcSpriteIntegrity.TotalHealed;
+                result.Success = true;
+            });
+        }
+        catch (Exception ex)
+        {
+            // Never LogLevel.Error here (test poison per .claude/rules/debugging.md) — surface via response.
+            result.Success = false;
+            result.Error = ex.Message;
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Fault injector: reproduces the exact field state a failed load-time sprite rebuild
+    /// leaves behind (NPC.TryLoadSprites swallows a throwing asset load and the NPC survives
+    /// with Sprite == null). The state is hazardous — the engine NREs at the NPC's next
+    /// scheduled departure — so callers heal promptly (/test/heal_npc_sprites) within the
+    /// same quiet in-game window.
+    /// </summary>
+    [ApiEndpoint(
+        "POST",
+        "/test/break_npc_sprite",
+        Summary = "Null an NPC's Sprite, reproducing a failed load-time sprite rebuild (test-only)",
+        Tag = "Test"
+    )]
+    [ApiResponse(typeof(TestBreakNpcSpriteResponse), 200)]
+    private async Task<TestBreakNpcSpriteResponse> HandlePostTestBreakNpcSpriteAsync(
+        HttpListenerRequest request
+    )
+    {
+        var npcName = request.QueryString["npc"] ?? "Abigail";
+        var result = new TestBreakNpcSpriteResponse { NpcName = npcName };
+        try
+        {
+            await RunOnGameThreadAsync(() =>
+            {
+                var npc = Game1.getCharacterFromName(npcName);
+                if (npc == null)
+                {
+                    result.Error = $"NPC '{npcName}' not found";
+                    return;
+                }
+
+                result.HadSprite = npc.Sprite != null;
+                npc.Sprite = null;
+                result.Success = true;
+            });
+        }
+        catch (Exception ex)
+        {
+            // Never LogLevel.Error here (test poison per .claude/rules/debugging.md) — surface via response.
+            result.Success = false;
+            result.Error = ex.Message;
+        }
+
+        return result;
+    }
+
+    [ApiEndpoint(
+        "POST",
+        "/test/heal_npc_sprites",
+        Summary = "Run the NPC sprite-integrity heal sweep immediately (test-only)",
+        Tag = "Test"
+    )]
+    [ApiResponse(typeof(TestHealNpcSpritesResponse), 200)]
+    private async Task<TestHealNpcSpritesResponse> HandlePostTestHealNpcSpritesAsync()
+    {
+        var result = new TestHealNpcSpritesResponse();
+        try
+        {
+            await RunOnGameThreadAsync(() =>
+            {
+                result.HealedCount = _npcSpriteIntegrity.HealSpritelessNpcs("test");
+                result.Success = true;
+            });
+        }
+        catch (Exception ex)
+        {
+            // Never LogLevel.Error here (test poison per .claude/rules/debugging.md) — surface via response.
+            result.Success = false;
+            result.Error = ex.Message;
+        }
+
+        return result;
     }
 }

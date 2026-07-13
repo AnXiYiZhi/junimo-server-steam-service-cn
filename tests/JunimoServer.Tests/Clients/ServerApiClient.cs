@@ -38,6 +38,11 @@ public class ServerStatus
     [JsonPropertyName("isReady")]
     public bool IsReady { get; set; }
 
+    // Day-transition machinery done (newDaySync + save + map load), ignoring post-transition
+    // festival/wedding — see ApiService.ComputeDayTransitionComplete. Equals IsReady on an ordinary day.
+    [JsonPropertyName("dayTransitionComplete")]
+    public bool DayTransitionComplete { get; set; }
+
     [JsonPropertyName("lastUpdated")]
     public string LastUpdated { get; set; } = string.Empty;
 
@@ -562,6 +567,49 @@ public class TestFestivalStateResponse
 }
 
 /// <summary>
+/// Response from /test/wedding_state GET endpoint (test-only). Mirrors the server-side
+/// TestWeddingStateResponse DTO — a direct read of the host's wedding ceremony state, used to assert
+/// ceremony-active / ceremony-ended and each spouse's location after, without proxying through a
+/// client's location (which reads the Town "Temp" map during the ceremony).
+/// </summary>
+public class TestWeddingStateResponse
+{
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+
+    [JsonPropertyName("isWeddingActive")]
+    public bool IsWeddingActive { get; set; }
+
+    [JsonPropertyName("farmhandSpouse")]
+    public string? FarmhandSpouse { get; set; }
+
+    [JsonPropertyName("spouseCurrentLocation")]
+    public string? SpouseCurrentLocation { get; set; }
+
+    // Post-ceremony host-stuck signals — all four must be clear after a wedding ends (see
+    // TwoFarmhandNpcWeddings_SameDay_BothCompleteWithoutHangingHost).
+    [JsonPropertyName("eventUp")]
+    public bool EventUp { get; set; }
+
+    [JsonPropertyName("fadeToBlack")]
+    public bool FadeToBlack { get; set; }
+
+    [JsonPropertyName("dialogueUp")]
+    public bool DialogueUp { get; set; }
+
+    [JsonPropertyName("hostLocationIsTemporary")]
+    public bool HostLocationIsTemporary { get; set; }
+
+    // The host's current location name. After the last wedding the host must be back in its FarmHouse,
+    // not left on the open Farm map where the wedding exit warp drops it.
+    [JsonPropertyName("hostCurrentLocation")]
+    public string? HostCurrentLocation { get; set; }
+}
+
+/// <summary>
 /// Response from /test/set_date POST endpoint.
 /// </summary>
 public class TestSetDateResponse
@@ -634,6 +682,97 @@ public class TestStampClaimResponse
 
     [JsonPropertyName("homeLocation")]
     public string HomeLocation { get; set; } = "";
+}
+
+/// <summary>
+/// Response from /test/stamp_lobby_home POST endpoint (test-only). Mirrors the server-side
+/// TestStampLobbyHomeResponse DTO. Reproduces the lobby-homed-spouse poisoned-save shape: a
+/// farmhand married (synthesized) to an NPC with both their home fields pointing at the shared
+/// lobby cabin interior, so the heal sweeps can be exercised live and across a reload.
+/// </summary>
+public class TestStampLobbyHomeResponse
+{
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+
+    [JsonPropertyName("stampedUid")]
+    public long StampedUid { get; set; }
+
+    [JsonPropertyName("npc")]
+    public string Npc { get; set; } = "";
+
+    [JsonPropertyName("lobbyLocation")]
+    public string LobbyLocation { get; set; } = "";
+
+    [JsonPropertyName("originalHome")]
+    public string OriginalHome { get; set; } = "";
+}
+
+/// <summary>
+/// Test-side mirror of the server's TestNpcSpriteIntegrityResponse DTO: the sprite-integrity
+/// sweep's run metadata plus a live scan for sprite-less NPCs.
+/// </summary>
+public class TestNpcSpriteIntegrityResponse
+{
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+
+    [JsonPropertyName("spritelessNpcs")]
+    public List<string> SpritelessNpcs { get; set; } = new();
+
+    [JsonPropertyName("lastRunContext")]
+    public string? LastRunContext { get; set; }
+
+    [JsonPropertyName("lastRunHealedCount")]
+    public int LastRunHealedCount { get; set; }
+
+    [JsonPropertyName("saveLoadedRuns")]
+    public int SaveLoadedRuns { get; set; }
+
+    [JsonPropertyName("dayStartedRuns")]
+    public int DayStartedRuns { get; set; }
+
+    [JsonPropertyName("totalHealed")]
+    public int TotalHealed { get; set; }
+}
+
+/// <summary>
+/// Test-side mirror of the server's TestBreakNpcSpriteResponse DTO (sprite fault injector).
+/// </summary>
+public class TestBreakNpcSpriteResponse
+{
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+
+    [JsonPropertyName("npcName")]
+    public string NpcName { get; set; } = "";
+
+    [JsonPropertyName("hadSprite")]
+    public bool HadSprite { get; set; }
+}
+
+/// <summary>
+/// Test-side mirror of the server's TestHealNpcSpritesResponse DTO.
+/// </summary>
+public class TestHealNpcSpritesResponse
+{
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+
+    [JsonPropertyName("healedCount")]
+    public int HealedCount { get; set; }
 }
 
 /// <summary>Body for /test/seed_import_source (test-only). Mirrors the server-side DTO.</summary>
@@ -743,6 +882,19 @@ public class TestSaveFileOpResponse
 
     [JsonPropertyName("targetSaveName")]
     public string TargetSaveName { get; set; } = "";
+}
+
+/// <summary>Response from /test/force_save (test-only).</summary>
+public class TestForceSaveResponse
+{
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+
+    [JsonPropertyName("saveFolderName")]
+    public string SaveFolderName { get; set; } = "";
 }
 
 /// <summary>Body for /test/import_save (test-only). Mirrors the server-side DTO.</summary>
@@ -1031,9 +1183,28 @@ public class ServerApiClient : IDisposable
     private readonly string _baseUrl;
 
     public ServerApiClient(string baseUrl)
+        : this(baseUrl, liveBaseUrl: null, healAsync: null) { }
+
+    /// <summary>
+    /// Constructs a client that transparently heals a dropped SSH forward.
+    /// <paramref name="liveBaseUrl"/> returns the server's CURRENT base URL (it changes
+    /// when a forward is re-opened on a new port); <paramref name="healAsync"/> re-opens
+    /// the forward on a forward-scoped fault. Both null ⇒ a plain client (local hosts /
+    /// tests that pass a bare URL) — behaves exactly as before.
+    /// </summary>
+    public ServerApiClient(
+        string baseUrl,
+        Func<string>? liveBaseUrl,
+        Func<CancellationToken, Task<bool>>? healAsync
+    )
     {
         _baseUrl = baseUrl;
-        var handler = new TracingHandler("server") { InnerHandler = new HttpClientHandler() };
+        HttpMessageHandler inner = new HttpClientHandler();
+        if (liveBaseUrl != null && healAsync != null)
+        {
+            inner = new ForwardHealingHandler(liveBaseUrl, healAsync) { InnerHandler = inner };
+        }
+        var handler = new TracingHandler("server") { InnerHandler = inner };
         _httpClient = new HttpClient(handler)
         {
             BaseAddress = new Uri(baseUrl),
@@ -1127,6 +1298,7 @@ public class ServerApiClient : IDisposable
     public async Task<ServerStatus?> WaitForStatusAsync(
         long since,
         bool? isReady = null,
+        bool? dayTransitionComplete = null,
         bool? isPaused = null,
         int? day = null,
         int? playerCount = null,
@@ -1138,6 +1310,11 @@ public class ServerApiClient : IDisposable
         if (isReady is bool b)
         {
             query.Add($"isReady={b.ToString().ToLowerInvariant()}");
+        }
+
+        if (dayTransitionComplete is bool dtc)
+        {
+            query.Add($"dayTransitionComplete={dtc.ToString().ToLowerInvariant()}");
         }
 
         if (isPaused is bool ip)
@@ -1580,6 +1757,28 @@ public class ServerApiClient : IDisposable
     }
 
     /// <summary>
+    /// Test-only: read the host's wedding ceremony state + wait-gate ready counts, and (when
+    /// <paramref name="farmhandId"/>/<paramref name="npc"/> are given) whether that farmhand is now
+    /// married to the NPC. Used by WeddingTests to assert ceremony-ended + married without proxying
+    /// through the client location (which reads "Temp" during the ceremony). GET /test/wedding_state
+    /// </summary>
+    public async Task<TestWeddingStateResponse?> GetWeddingState(
+        long? farmhandId = null,
+        string? npc = null,
+        CancellationToken ct = default
+    )
+    {
+        var query = "/test/wedding_state";
+        if (farmhandId.HasValue && !string.IsNullOrEmpty(npc))
+        {
+            query += $"?farmhandId={farmhandId.Value}&npc={Uri.EscapeDataString(npc)}";
+        }
+        var response = await _httpClient.GetAsync(query, ct);
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<TestWeddingStateResponse>(ct);
+    }
+
+    /// <summary>
     /// Test-only: poll until farmer <paramref name="farmerId"/> appears at the exact tile
     /// (<paramref name="tileX"/>,<paramref name="tileY"/>) in the Farm's farmer collection —
     /// the location-filtered <c>getFarm().farmers</c> that CabinPlacementValidator iterates.
@@ -1714,6 +1913,71 @@ public class ServerApiClient : IDisposable
     }
 
     /// <summary>
+    /// Test-only: reproduce the lobby-homed-spouse poisoned-save shape — a farmhand married
+    /// (synthesized) to <paramref name="npc"/> with the farmhand's homeLocation/lastSleepLocation
+    /// and the NPC's DefaultMap/position pointing at the shared lobby cabin interior. Used to
+    /// verify the CabinManagerService heal sweeps restore both live (DayStarted) and across a
+    /// reload (SaveLoaded). POST /test/stamp_lobby_home
+    /// </summary>
+    public async Task<TestStampLobbyHomeResponse?> StampLobbyHome(
+        string npc,
+        CancellationToken ct = default
+    )
+    {
+        var response = await SendWithRetryAsync(
+            HttpMethod.Post,
+            $"/test/stamp_lobby_home?npc={Uri.EscapeDataString(npc)}",
+            ct
+        );
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<TestStampLobbyHomeResponse>(ct);
+    }
+
+    /// <summary>
+    /// Test-only: sprite-integrity sweep metadata + live scan for sprite-less NPCs.
+    /// GET /test/npc_sprite_integrity
+    /// </summary>
+    public async Task<TestNpcSpriteIntegrityResponse?> GetNpcSpriteIntegrity(
+        CancellationToken ct = default
+    )
+    {
+        var response = await SendWithRetryAsync(HttpMethod.Get, "/test/npc_sprite_integrity", ct);
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<TestNpcSpriteIntegrityResponse>(ct);
+    }
+
+    /// <summary>
+    /// Test-only: null an NPC's Sprite, reproducing a failed load-time sprite rebuild.
+    /// Hazardous state — heal promptly via <see cref="HealNpcSprites"/>.
+    /// POST /test/break_npc_sprite?npc=Name
+    /// </summary>
+    public async Task<TestBreakNpcSpriteResponse?> BreakNpcSprite(
+        string npc,
+        CancellationToken ct = default
+    )
+    {
+        var response = await SendWithRetryAsync(
+            HttpMethod.Post,
+            $"/test/break_npc_sprite?npc={Uri.EscapeDataString(npc)}",
+            ct
+        );
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<TestBreakNpcSpriteResponse>(ct);
+    }
+
+    /// <summary>
+    /// Test-only: run the NPC sprite-integrity heal sweep immediately (same sweep the
+    /// SaveLoaded/DayStarted handlers run).
+    /// POST /test/heal_npc_sprites
+    /// </summary>
+    public async Task<TestHealNpcSpritesResponse?> HealNpcSprites(CancellationToken ct = default)
+    {
+        var response = await SendWithRetryAsync(HttpMethod.Post, "/test/heal_npc_sprites", ct);
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<TestHealNpcSpritesResponse>(ct);
+    }
+
+    /// <summary>
     /// Test-only: trigger a Galaxy re-sign-in with no outage, to verify re-login while healthy
     /// doesn't disrupt the live lobby / invite code.
     /// POST /test/galaxy_relogin
@@ -1808,6 +2072,19 @@ public class ServerApiClient : IDisposable
         );
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<TestSaveFileOpResponse>(ct);
+    }
+
+    /// <summary>
+    /// Test-only: persist the current world to disk synchronously, without a day transition — flushes
+    /// in-memory seeded state + a connected client's customization the way SleepToSaveAsync does, but
+    /// in one game-thread call instead of a full in-game day.
+    /// POST /test/force_save
+    /// </summary>
+    public async Task<TestForceSaveResponse?> ForceSave(CancellationToken ct = default)
+    {
+        var response = await SendWithRetryAsync(HttpMethod.Post, "/test/force_save", ct);
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<TestForceSaveResponse>(ct);
     }
 
     /// <summary>
