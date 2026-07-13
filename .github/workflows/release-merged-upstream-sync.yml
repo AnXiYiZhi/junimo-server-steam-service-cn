@@ -1,0 +1,115 @@
+name: Release Merged Upstream Sync
+
+on:
+  pull_request_target:
+    branches: [master]
+    types: [closed]
+
+permissions: {}
+
+concurrency:
+  group: release-merged-upstream-sync-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Revalidate merged upstream sync
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'sync/upstream-') &&
+      contains(github.event.pull_request.labels.*.name, 'upstream-sync')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      fork_tag: ${{ steps.meta.outputs.recommended_fork_tag }}
+      upstream_tag: ${{ steps.meta.outputs.upstream_tag }}
+      merge_sha: ${{ steps.meta.outputs.merge_sha }}
+    steps:
+      - name: Checkout trusted merged commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Derive and verify release metadata
+        id: meta
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          set -euo pipefail
+          upstream_tag="${HEAD_REF#sync/upstream-}"
+          python .github/scripts/upstream_release.py metadata \
+            --tag "$upstream_tag" \
+            --github-output "$GITHUB_OUTPUT"
+          expected_branch="$(grep '^branch=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2-)"
+          if [ "$HEAD_REF" != "$expected_branch" ]; then
+            echo "::error::Merged branch does not exactly match deterministic upstream tag metadata."
+            exit 1
+          fi
+          echo "upstream_tag=$upstream_tag" >> "$GITHUB_OUTPUT"
+          echo "merge_sha=$MERGE_SHA" >> "$GITHUB_OUTPUT"
+
+          git fetch --no-tags "https://github.com/stardew-valley-dedicated-server/server.git" \
+            "+refs/tags/${upstream_tag}:refs/upstream-tags/${upstream_tag}"
+          git merge-base --is-ancestor "refs/upstream-tags/${upstream_tag}" "$MERGE_SHA" || {
+            echo "::error::Merged commit does not retain upstream ancestry. Use 'Create a merge commit', not squash or rebase."
+            exit 1
+          }
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5.3.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Re-run credential-free validation
+        run: |
+          dotnet restore tools/steam-service.Tests/SteamService.Tests.csproj
+          dotnet test tools/steam-service.Tests/SteamService.Tests.csproj -c Release --no-restore
+          python .github/scripts/check_anxi_patch.py
+          python -m unittest discover -s tests/workflows -p "test_*.py" -v
+          docker build --file tools/steam-service/Dockerfile --tag steam-service-cn:merged-validation .
+
+  tag:
+    name: Create exact fork tag
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      fork_tag: ${{ needs.validate.outputs.fork_tag }}
+    steps:
+      - name: Create tag idempotently
+        env:
+          FORK_TAG: ${{ needs.validate.outputs.fork_tag }}
+          GH_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ needs.validate.outputs.merge_sha }}
+        run: |
+          set -euo pipefail
+          existing_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${FORK_TAG}" --jq .object.sha 2>/dev/null || true)"
+          if [ -n "$existing_sha" ]; then
+            if [ "$existing_sha" != "$MERGE_SHA" ]; then
+              echo "::error::Tag $FORK_TAG already exists at a different commit; refusing to overwrite it."
+              exit 1
+            fi
+            echo "Tag $FORK_TAG already points to the merged commit; continuing idempotently." >> "$GITHUB_STEP_SUMMARY"
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${FORK_TAG}" \
+              -f sha="$MERGE_SHA" >/dev/null
+            echo "Created exact fork tag \`$FORK_TAG\` at \`$MERGE_SHA\`." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  publish:
+    name: Publish automatically-created fork tag
+    needs: [validate, tag]
+    permissions:
+      contents: write
+      packages: write
+    uses: ./.github/workflows/publish-steam-service.yml
+    with:
+      fork_tag: ${{ needs.validate.outputs.fork_tag }}
+    secrets: inherit

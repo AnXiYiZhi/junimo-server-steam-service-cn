@@ -160,14 +160,14 @@ jobs:
 
     steps:
       - name: Checkout code
-        if: needs.changes.outputs.docker == 'true'
+        if: needs.changes.outputs.docker == 'true' && !startsWith(github.event.pull_request.head.ref, 'sync/upstream-')
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Set up Docker Buildx
         id: buildx
-        if: needs.changes.outputs.docker == 'true'
+        if: needs.changes.outputs.docker == 'true' && !startsWith(github.event.pull_request.head.ref, 'sync/upstream-')
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
       # type=gha does not persist BuildKit `--mount=type=cache` directories (the Dockerfile uses
@@ -177,14 +177,14 @@ jobs:
       # step (after the build) writes the updated mount back for actions/cache to save.
       - name: Cache NuGet mount
         id: nuget-cache
-        if: needs.changes.outputs.docker == 'true'
+        if: needs.changes.outputs.docker == 'true' && !startsWith(github.event.pull_request.head.ref, 'sync/upstream-')
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: nuget-cache-mount
           key: nuget-cache-mount-${{ hashFiles('mod/**/*.csproj', 'tools/steam-service/**/*.csproj', 'Directory.Build.props') }}
 
       - name: Inject NuGet mount
-        if: needs.changes.outputs.docker == 'true'
+        if: needs.changes.outputs.docker == 'true' && !startsWith(github.event.pull_request.head.ref, 'sync/upstream-')
         uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723 # v3.4.0
         with:
           builder: ${{ steps.buildx.outputs.name }}
@@ -196,7 +196,7 @@ jobs:
           skip-extraction: ${{ steps.nuget-cache.outputs.cache-hit }}
 
       - name: Build Docker image (validation only)
-        if: needs.changes.outputs.docker == 'true'
+        if: needs.changes.outputs.docker == 'true' && !startsWith(github.event.pull_request.head.ref, 'sync/upstream-')
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
@@ -212,7 +212,7 @@ jobs:
           cache-from: type=gha,scope=server
 
       - name: Extract NuGet mount
-        if: needs.changes.outputs.docker == 'true' && steps.nuget-cache.outputs.cache-hit != 'true'
+        if: needs.changes.outputs.docker == 'true' && !startsWith(github.event.pull_request.head.ref, 'sync/upstream-') && steps.nuget-cache.outputs.cache-hit != 'true'
         uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723 # v3.4.0
         with:
           builder: ${{ steps.buildx.outputs.name }}
@@ -224,13 +224,21 @@ jobs:
           extract: true
 
       - name: Build summary
+        env:
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_BASE_REF: ${{ github.base_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
-          if [ "${{ needs.changes.outputs.docker }}" = "true" ]; then
+          if [[ "$PR_HEAD_REF" == sync/upstream-* ]]; then
+            echo "### Secret-bearing build skipped" >> $GITHUB_STEP_SUMMARY
+            echo "Upstream sync PRs are validated by Validate Upstream Sync without Steam or registry secrets." >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.changes.outputs.docker }}" = "true" ]; then
             echo "### Build Validation Passed" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**PR:** #${{ github.event.pull_request.number }}" >> $GITHUB_STEP_SUMMARY
-            echo "**Branch:** \`${{ github.head_ref }}\` → \`${{ github.base_ref }}\`" >> $GITHUB_STEP_SUMMARY
-            echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "**PR:** #$PR_NUMBER" >> $GITHUB_STEP_SUMMARY
+            echo "**Branch:** \`$PR_HEAD_REF\` → \`$PR_BASE_REF\`" >> $GITHUB_STEP_SUMMARY
+            echo "**Commit:** \`$COMMIT_SHA\`" >> $GITHUB_STEP_SUMMARY
           else
             echo "### Build Skipped" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY

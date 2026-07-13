@@ -52,6 +52,7 @@ public class SteamAuthService
     private static readonly TimeSpan TicketCacheMaxAge = TimeSpan.FromMinutes(10);
 
     private readonly string _sessionDir;
+    private readonly SteamSessionStore _sessionStore;
     private readonly string _gameDir;
     private readonly string _logPrefix;
 
@@ -121,13 +122,11 @@ public class SteamAuthService
     {
         AccountIndex = accountIndex;
         Username = username;
-        _sessionDir = Path.Combine(sessionDir, username);
         _gameDir = gameDir;
         _logPrefix = $"[SteamAuth:A{accountIndex}]";
+        _sessionStore = new SteamSessionStore(sessionDir, username, _logPrefix);
+        _sessionDir = _sessionStore.AccountDirectory;
         _skipPatterns = BuildSkipPatterns(keepLanguages ?? []);
-
-        Directory.CreateDirectory(_sessionDir);
-        MigrateOldSession(sessionDir);
 
         _steamClient = new SteamClient();
         _callbackManager = new CallbackManager(_steamClient);
@@ -539,12 +538,11 @@ public class SteamAuthService
     // Session Management
     // ========================================================================
 
-    private string SessionFilePath => Path.Combine(_sessionDir, "session.json");
     private string TicketCachePath => Path.Combine(_sessionDir, "app-ticket.json");
 
     public bool HasSavedSession()
     {
-        return File.Exists(SessionFilePath);
+        return _sessionStore.Exists();
     }
 
     /// <summary>
@@ -554,67 +552,13 @@ public class SteamAuthService
 
     private void SaveSession(string username, string refreshToken)
     {
-        Directory.CreateDirectory(_sessionDir);
-        var path = SessionFilePath;
-        var tempPath = path + ".tmp";
-        var json = JsonSerializer.Serialize(new { username, refreshToken });
-
-        // Write to temp file first, then atomically rename to avoid corruption
-        File.WriteAllText(tempPath, json);
-        File.Move(tempPath, path, overwrite: true);
-        Logger.Log($"{_logPrefix} Session saved for {username}");
+        _sessionStore.Save(username, refreshToken);
     }
 
     private (string username, string refreshToken)? LoadSession()
     {
-        var path = SessionFilePath;
-        if (!File.Exists(path))
-        {
-            return null;
-        }
-
-        try
-        {
-            var json = File.ReadAllText(path);
-            var doc = JsonDocument.Parse(json);
-            var username = doc.RootElement.GetProperty("username").GetString()!;
-            var token = doc.RootElement.GetProperty("refreshToken").GetString()!;
-            return (username, token);
-        }
-        catch (Exception ex) when (ex is IOException or JsonException or KeyNotFoundException)
-        {
-            Logger.Log($"{_logPrefix} Failed to load session: {ex.Message}");
-            return null;
-        }
-    }
-
-    /// <summary>
-    /// Migrates session files from the old flat format (session-{username}.json in the
-    /// shared session dir) to the new per-account directory format ({sessionDir}/{username}/session.json).
-    /// Added 2026-04 -- can be removed once all deployments have upgraded past this version.
-    /// </summary>
-    private void MigrateOldSession(string parentSessionDir)
-    {
-        if (File.Exists(SessionFilePath))
-        {
-            return;
-        }
-
-        var oldPath = Path.Combine(parentSessionDir, $"session-{Username}.json");
-        if (!File.Exists(oldPath))
-        {
-            return;
-        }
-
-        try
-        {
-            File.Move(oldPath, SessionFilePath);
-            Logger.Log($"{_logPrefix} Migrated session from old format");
-        }
-        catch (IOException ex)
-        {
-            Logger.Log($"{_logPrefix} Session migration failed: {ex.Message}");
-        }
+        var session = _sessionStore.Load();
+        return session == null ? null : (session.Username, session.RefreshToken);
     }
 
     private void SaveTicketCache(string ticketBase64, string? steamId)

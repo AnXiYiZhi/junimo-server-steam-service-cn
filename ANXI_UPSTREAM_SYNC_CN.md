@@ -40,6 +40,32 @@ STEAM_AUTH_SESSION_RETRIES=3
 STEAM_AUTH_SESSION_RETRY_DELAY_SECONDS=5
 ```
 
+## 2026-07 自动同步与发布契约
+
+- `.github/workflows/sync-upstream-tag.yml` 每 6 小时分别按数字版本选择最新
+  stable（`sdvd-server-vX.Y.Z`）和 preview（`preview-X.Y.Z.N`）；手动运行只接受
+  已存在的精确 tag。
+- 上游 tag 只 fetch 到 `refs/upstream-tags/<tag>`。同步分支固定为
+  `sync/upstream-<normalized-tag>`，从 `origin/master` 创建并以 `--no-ff` merge
+  保留上游祖先关系。冲突直接失败，不自动选择 ours/theirs，也不自动合并 PR。
+- PR 会列出上游范围、fork 专有提交和文件、重叠文件、推荐 fork tag 与验证命令。
+  上游若同时修改 fork 涉及的 `tools/steam-service/**`，添加
+  `needs-anxi-patch-review`；重复运行更新已有 PR。
+- 同步 PR 使用只读权限验证：编译与测试 steam-service、检查格式和 Anxi 补丁、
+  本地构建 Docker 镜像但不推送。此流程不取得 Steam、VPS 或 registry secrets。
+- 上游 VPS E2E 所需的 `SDVD_DOCKER_HOSTS` 不属于 fork。secret 不存在或格式无效时，
+  workflow 在 checkout/keyscan 前明确跳过，不运行测试，也不上传空 artifact。
+- 没有补丁重叠时，PR 会添加 `auto-upstream-sync`；无凭据验证通过后，受信任
+  workflow 会再次核对相同 head SHA、同仓库来源和标签，然后自动用 merge commit 合并。
+- 带 `needs-anxi-patch-review` 的 PR 永不自动合并；人工检查后必须使用
+  **Create a merge commit**。不要使用 squash 或 rebase，否则会丢失上游祖先关系。
+- 合并后 workflow 会在 `master` 上重新执行无凭据测试和 Docker build；通过后自动、
+  幂等地创建 `sdvd-server-v1.5.0-preview.125-anxi.1`，并直接调用受信任发布流程，
+  发布 Docker tag `1.5.0-preview.125-anxi.1` 到 Docker Hub、ACR 和 GHCR，再创建
+  GitHub Release。已有 tag 指向不同提交时拒绝覆盖。
+- 真实 Steam 账号和私有 VPS E2E 在本 fork 中为可选验收，不阻止自动 tag 和发布。
+- 本阶段不自动修改 Panel 仓库的推荐版本对；跨仓库联动保留给后续阶段。
+
 ## 同步上游的原则
 
 同步上游时，目标是：

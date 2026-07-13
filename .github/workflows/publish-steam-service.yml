@@ -1,0 +1,132 @@
+name: Publish Steam Service CN
+
+on:
+  workflow_call:
+    inputs:
+      fork_tag:
+        description: Exact reviewed fork tag to publish
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-steam-service-cn-${{ inputs.fork_tag }}
+  cancel-in-progress: false
+
+env:
+  DOCKERHUB_IMAGE: anxiyizhi/junimo-steam-service-cn
+  ACR_REGISTRY: crpi-9z3bkb9g7fxeohrg.cn-hangzhou.personal.cr.aliyuncs.com
+  ACR_IMAGE: crpi-9z3bkb9g7fxeohrg.cn-hangzhou.personal.cr.aliyuncs.com/anxi-panel/junimo-steam-service-cn
+
+jobs:
+  release:
+    name: Validate, build and publish steam-service-cn
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout exact fork tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: refs/tags/${{ inputs.fork_tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Parse strict release tag
+        id: meta
+        env:
+          FORK_TAG: ${{ inputs.fork_tag }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          python .github/scripts/upstream_release.py release \
+            --tag "$FORK_TAG" \
+            --github-output "$GITHUB_OUTPUT"
+          ghcr_owner="$(printf '%s' "$REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "ghcr_image=ghcr.io/${ghcr_owner}/junimo-steam-service-cn" >> "$GITHUB_OUTPUT"
+          echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the tag contains its exact upstream release
+        env:
+          RELEASE_SHA: ${{ steps.meta.outputs.release_sha }}
+          UPSTREAM_TAG: ${{ steps.meta.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags "https://github.com/stardew-valley-dedicated-server/server.git" \
+            "+refs/tags/${UPSTREAM_TAG}:refs/upstream-tags/${UPSTREAM_TAG}"
+          git merge-base --is-ancestor "refs/upstream-tags/${UPSTREAM_TAG}" "$RELEASE_SHA" || {
+            echo "::error::Fork tag does not contain exact upstream tag ${UPSTREAM_TAG}."
+            exit 1
+          }
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5.3.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Validate without Steam credentials
+        run: |
+          dotnet restore tools/steam-service.Tests/SteamService.Tests.csproj
+          dotnet test tools/steam-service.Tests/SteamService.Tests.csproj -c Release --no-restore
+          python .github/scripts/check_anxi_patch.py
+          python -m unittest discover -s tests/workflows -p "test_*.py" -v
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@6500066a06b4f8358918cf3c244d3e4c23cfb4c6 # v4.0.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to Alibaba Cloud ACR
+        uses: docker/login-action@6500066a06b4f8358918cf3c244d3e4c23cfb4c6 # v4.0.0
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ALIYUN_REGISTRY_USERNAME }}
+          password: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@6500066a06b4f8358918cf3c244d3e4c23cfb4c6 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push exact and trial tags
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: ./tools/steam-service/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.DOCKERHUB_IMAGE }}:${{ steps.meta.outputs.version }}
+            ${{ env.DOCKERHUB_IMAGE }}:latest
+            ${{ env.ACR_IMAGE }}:${{ steps.meta.outputs.version }}
+            ${{ env.ACR_IMAGE }}:latest
+            ${{ steps.meta.outputs.ghcr_image }}:${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.ghcr_image }}:latest
+          labels: |
+            org.opencontainers.image.title=junimo-steam-service-cn
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.meta.outputs.release_sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.created }}
+            io.anxi.upstream.tag=${{ steps.meta.outputs.upstream_tag }}
+            io.anxi.upstream.ref=refs/upstream-tags/${{ steps.meta.outputs.upstream_tag }}
+          cache-from: type=gha,scope=steam-service-cn
+          cache-to: type=gha,mode=max,scope=steam-service-cn
+
+      - name: Create or update GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ inputs.fork_tag }}
+          name: Junimo Steam Service CN ${{ steps.meta.outputs.version }}
+          generate_release_notes: true
+          body: |
+            Upstream: `${{ steps.meta.outputs.upstream_tag }}`
+            Image tag: `${{ steps.meta.outputs.version }}`

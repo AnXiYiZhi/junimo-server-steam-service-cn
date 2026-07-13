@@ -476,6 +476,14 @@ async Task RunHttpServerAsync(
         return svc;
     }
 
+    ISteamReadinessProbe GetReadinessProbe(SteamAuthService svc)
+    {
+        var cfg = configs.TryGetValue(svc.AccountIndex, out var c)
+            ? new SteamAuthService.LoginConfig(c.user, c.pass, c.token)
+            : null;
+        return new SteamAuthReadinessProbe(svc, cfg, StardewValleyAppId);
+    }
+
     // /health is a pure status probe: returns 200 whenever the HTTP server is up so
     // Docker healthchecks and Testcontainers wait strategies work. It does NOT trigger
     // logins -- that used to race with real callers hitting /steam/ready. Consumers
@@ -492,25 +500,8 @@ async Task RunHttpServerAsync(
                     ? new[] { single }
                     : accts.Values.ToArray();
 
-            var loggedIn = accountsToCheck.All(s => s.IsLoggedIn);
-            var accountList = accountsToCheck
-                .OrderBy(s => s.AccountIndex)
-                .Select(s => new
-                {
-                    index = s.AccountIndex,
-                    username = s.Username,
-                    logged_in = s.IsLoggedIn,
-                    steam_id = s.SteamId,
-                });
-
             return Results.Json(
-                new
-                {
-                    status = "ok",
-                    logged_in = loggedIn,
-                    timestamp = DateTime.UtcNow.ToString("o"),
-                    accounts = accountList,
-                }
+                SteamReadinessContracts.Health(accountsToCheck.Select(GetReadinessProbe))
             );
         }
     );
@@ -521,26 +512,19 @@ async Task RunHttpServerAsync(
         {
             try
             {
-                var svc = await EnsureAccountReadyAsync(ctx);
-
-                // Try fetching a ticket to prove full readiness
-                var ticket = await svc.GetAppTicketAsync(StardewValleyAppId);
-
-                return Results.Json(
-                    new
-                    {
-                        ready = true,
-                        account = svc.AccountIndex,
-                        username = svc.Username,
-                        steam_id = svc.SteamId,
-                        has_ticket = !string.IsNullOrEmpty(ticket.TicketBase64),
-                    }
+                var svc = GetAccount(ctx);
+                var result = await SteamReadinessContracts.ReadyAsync(
+                    GetReadinessProbe(svc),
+                    ctx.RequestAborted
                 );
+                return Results.Json(result.Body, statusCode: result.StatusCode);
             }
-            catch (Exception ex)
+            catch (KeyNotFoundException)
             {
-                Logger.Log($"[HTTP] Ready check failed: {ex.Message}");
-                return Results.Json(new { ready = false, error = ex.Message }, statusCode: 503);
+                return Results.Json(
+                    new SteamReadyResponse(false, Error: "Steam account is not ready"),
+                    statusCode: 503
+                );
             }
         }
     );

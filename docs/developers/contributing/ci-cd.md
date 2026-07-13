@@ -16,6 +16,40 @@ We use GitHub Actions for automated building, testing, and deployment.
 | [Deploy Docs](#deploy-docs-pipeline) | After build / manual | Deploys documentation to GitHub Pages |
 | [Cleanup Preview Tags](#cleanup-preview-tags) | Weekly schedule / manual | Deletes old preview tags from DockerHub |
 | [Cleanup Caches](#cleanup-caches) | Weekly schedule / manual | Removes stale GitHub Actions caches |
+| Upstream Tag Sync | Every 6 hours / manual exact tag | Opens or updates a non-auto-merged stable/preview synchronization PR |
+| Validate Upstream Sync | `sync/upstream-*` pull requests | Builds/tests steam-service and its Docker image without private secrets or push |
+| Auto Merge Safe Upstream Sync | Successful sync validation | Atomically merge-commits a same-repo sync PR only when no Anxi patch overlap exists |
+| Merged Upstream Sync Release | Merge-commit of a labeled `sync/upstream-*` PR | Revalidates, creates the exact fork tag, publishes all registries, then creates a GitHub Release |
+| Manual Steam Service CN Tag Release | Exact `sdvd-server-vX.Y.Z[-preview.N]-anxi.N` tag | Recovery path that invokes the same reusable publisher |
+
+## Fork upstream synchronization and secret boundary
+
+This fork tracks stable and preview upstream tags independently. Tags are
+fetched into `refs/upstream-tags/` and merged with a merge commit; conflicts and
+overlap with fork-owned `tools/steam-service/**` files require human review.
+The synchronization workflow adds `auto-upstream-sync` when no fork-owned
+`tools/steam-service/**` file overlaps upstream changes. After credential-free
+validation succeeds, a separate trusted workflow verifies the exact head SHA,
+same-repository source, labels, and absence of `needs-anxi-patch-review`, then
+atomically merges with `merge_method=merge`. A patch-overlap PR is never
+auto-merged; a maintainer merging it with **Create a merge commit** is the release
+approval. In both cases, the post-merge workflow
+then re-runs credential-free validation, verifies exact upstream ancestry,
+creates the recommended fork tag without overwriting an existing tag, and calls
+the reusable publisher. Squash and rebase merges are rejected because they lose
+the upstream parent relationship.
+
+The dedicated sync PR validation workflow has only `contents: read`; it receives
+no Steam account, registry, or VPS credentials. The normal secret-bearing PR
+Docker build is skipped for `sync/upstream-*` branches so newly synchronized
+upstream code cannot gain those secrets through the same-repository PR path.
+
+`e2e-tests.yml` is an upstream private-fleet suite. `SDVD_DOCKER_HOSTS` contains
+real SSH endpoints and private keys and is not inherited by forks. The workflow
+first probes only whether a valid fleet array exists, without checking out repo
+code or printing the value. If absent, the VPS job is intentionally skipped
+before keyscan, test execution, and artifact upload. Private VPS and real Steam
+acceptance tests are optional for this fork and do not gate automatic tagging.
 
 ## Build Release Pipeline
 

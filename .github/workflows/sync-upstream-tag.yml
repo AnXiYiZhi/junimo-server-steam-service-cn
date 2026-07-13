@@ -1,0 +1,227 @@
+name: Create Upstream Release Sync PR
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Exact preview-X.Y.Z.N or sdvd-server-vX.Y.Z tag (blank discovers both channels)"
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: sync-upstream-tag
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    name: Discover stable and preview tags
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      targets: ${{ steps.tags.outputs.targets }}
+    steps:
+      - name: Checkout trusted workflow helpers
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: master
+          sparse-checkout: .github/scripts
+
+      - name: Read exact upstream tag namespace
+        env:
+          UPSTREAM_REPOSITORY: stardew-valley-dedicated-server/server
+        run: |
+          set -euo pipefail
+          git ls-remote --tags --refs "https://github.com/${UPSTREAM_REPOSITORY}.git" \
+            | awk '{sub("refs/tags/", "", $2); print $2}' \
+            > "$RUNNER_TEMP/upstream-tags.txt"
+
+      - name: Select numeric latest tag per channel
+        id: tags
+        env:
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          python3 .github/scripts/upstream_release.py discover \
+            --tags-file "$RUNNER_TEMP/upstream-tags.txt" \
+            --requested "$REQUESTED_TAG" \
+            --github-output "$GITHUB_OUTPUT"
+
+  sync:
+    name: Sync ${{ matrix.target.tag }}
+    needs: discover
+    if: needs.discover.outputs.targets != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.discover.outputs.targets) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      TAG: ${{ matrix.target.tag }}
+      UPSTREAM_REPOSITORY: stardew-valley-dedicated-server/server
+
+    steps:
+      - name: Checkout fork master
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Derive deterministic metadata
+        id: meta
+        run: |
+          python3 .github/scripts/upstream_release.py metadata \
+            --tag "$TAG" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Fetch exact upstream tag into isolated ref namespace
+        id: upstream
+        env:
+          BRANCH: ${{ steps.meta.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          if ! git ls-remote --exit-code --tags --refs upstream "refs/tags/$TAG" >/dev/null; then
+            echo "::error::Exact upstream tag '$TAG' no longer exists."
+            exit 1
+          fi
+          git fetch --no-tags upstream "+refs/tags/$TAG:refs/upstream-tags/$TAG"
+          git fetch --no-tags origin master
+          if git merge-base --is-ancestor "refs/upstream-tags/$TAG" origin/master; then
+            echo "needs_sync=false" >> "$GITHUB_OUTPUT"
+            echo "### $TAG" >> "$GITHUB_STEP_SUMMARY"
+            echo "Already contained by origin/master; no branch or duplicate PR created." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "needs_sync=true" >> "$GITHUB_OUTPUT"
+
+      - name: Analyze fork patch coverage and upstream overlap
+        id: risk
+        if: steps.upstream.outputs.needs_sync == 'true'
+        run: |
+          set -euo pipefail
+          upstream_ref="refs/upstream-tags/$TAG"
+          merge_base="$(git merge-base origin/master "$upstream_ref")"
+          if [ -z "$merge_base" ]; then
+            echo "::error::No common ancestor between origin/master and $TAG."
+            exit 1
+          fi
+
+          git log --right-only --cherry-pick --no-merges --format='- %h %s' \
+            "$upstream_ref...origin/master" > "$RUNNER_TEMP/fork-commits.txt"
+          git diff --name-only "$merge_base..origin/master" | sort -u \
+            > "$RUNNER_TEMP/fork-files.txt"
+          git diff --name-only "$merge_base..$upstream_ref" | sort -u \
+            > "$RUNNER_TEMP/upstream-files.txt"
+          git log --oneline "$merge_base..$upstream_ref" \
+            > "$RUNNER_TEMP/upstream-changes.txt"
+          comm -12 "$RUNNER_TEMP/fork-files.txt" "$RUNNER_TEMP/upstream-files.txt" \
+            > "$RUNNER_TEMP/overlap-files.txt"
+          grep '^tools/steam-service/' "$RUNNER_TEMP/overlap-files.txt" \
+            > "$RUNNER_TEMP/steam-overlap-files.txt" || true
+
+          if [ -s "$RUNNER_TEMP/steam-overlap-files.txt" ]; then
+            echo "needs_patch_review=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_patch_review=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "merge_base=$merge_base" >> "$GITHUB_OUTPUT"
+
+      - name: Merge upstream tag without automatic conflict resolution
+        if: steps.upstream.outputs.needs_sync == 'true'
+        env:
+          BRANCH: ${{ steps.meta.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" || true
+          git switch -C "$BRANCH" origin/master
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git merge --no-ff --no-edit "refs/upstream-tags/$TAG"; then
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            {
+              echo "### Merge conflict: $TAG"
+              echo
+              echo "The bot did not choose ours/theirs and did not force a merge."
+              echo
+              echo '```text'
+              printf '%s\n' "$conflicts"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            git merge --abort || true
+            echo "::error::Upstream $TAG conflicts with origin/master; manual resolution is required."
+            exit 1
+          fi
+          git push --force-with-lease origin "HEAD:refs/heads/$BRANCH"
+
+      - name: Create or update synchronization pull request
+        if: steps.upstream.outputs.needs_sync == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.meta.outputs.branch }}
+          CHANNEL: ${{ steps.meta.outputs.channel }}
+          RECOMMENDED_FORK_TAG: ${{ steps.meta.outputs.recommended_fork_tag }}
+          NEEDS_PATCH_REVIEW: ${{ steps.risk.outputs.needs_patch_review }}
+          MERGE_BASE: ${{ steps.risk.outputs.merge_base }}
+        run: |
+          set -euo pipefail
+          body="$RUNNER_TEMP/pr-body.md"
+          {
+            echo "## Upstream synchronization"
+            echo
+            echo "- Upstream tag: \`$TAG\`"
+            echo "- Channel: \`$CHANNEL\`"
+            echo "- Upstream range: \`$MERGE_BASE..refs/upstream-tags/$TAG\`"
+            echo "- Recommended fork release tag after human review: \`$RECOMMENDED_FORK_TAG\`"
+            echo
+            echo "### Upstream changes"
+            echo '```text'
+            cat "$RUNNER_TEMP/upstream-changes.txt"
+            echo '```'
+            echo "### Fork-only commits relative to the target"
+            echo '```text'
+            cat "$RUNNER_TEMP/fork-commits.txt"
+            echo '```'
+            echo "### Fork patch files"
+            echo '```text'
+            cat "$RUNNER_TEMP/fork-files.txt"
+            echo '```'
+            echo "### Overlapping files"
+            echo '```text'
+            if [ -s "$RUNNER_TEMP/overlap-files.txt" ]; then cat "$RUNNER_TEMP/overlap-files.txt"; else echo "(none)"; fi
+            echo '```'
+            echo "### Validation"
+            echo '```text'
+            echo "dotnet build tools/steam-service/SteamService.csproj -c Release"
+            echo "dotnet test tools/steam-service.Tests/SteamService.Tests.csproj -c Release"
+            echo "dotnet csharpier check tools/steam-service tools/steam-service.Tests"
+            echo "docker build -f tools/steam-service/Dockerfile -t junimo-steam-service-cn:sync-validation ."
+            echo '```'
+            echo
+            echo "If no Anxi patch overlap is detected, this PR is auto-merged with a merge commit after credential-free validation. A \`needs-anxi-patch-review\` PR remains manual."
+          } > "$body"
+
+          gh label create upstream-sync --color 1d76db --description "Automated upstream tag synchronization" --force
+          gh label create needs-anxi-patch-review --color d93f0b --description "Upstream overlaps Anxi steam-service patch files" --force
+          gh label create auto-upstream-sync --color 0e8a16 --description "Safe to merge automatically after validation" --force
+          pr_number="$(gh pr list --state open --base master --head "$BRANCH" --json number --jq '.[0].number // empty')"
+          if [ -n "$pr_number" ]; then
+            gh pr edit "$pr_number" --title "chore: sync upstream $TAG" --body-file "$body" --add-label upstream-sync
+          else
+            pr_url="$(gh pr create --base master --head "$BRANCH" --title "chore: sync upstream $TAG" --body-file "$body" --label upstream-sync)"
+            pr_number="$(gh pr view "$pr_url" --json number --jq .number)"
+          fi
+          if [ "$NEEDS_PATCH_REVIEW" = "true" ]; then
+            gh pr edit "$pr_number" --add-label needs-anxi-patch-review
+            gh pr edit "$pr_number" --remove-label auto-upstream-sync 2>/dev/null || true
+          else
+            gh pr edit "$pr_number" --remove-label needs-anxi-patch-review 2>/dev/null || true
+            gh pr edit "$pr_number" --add-label auto-upstream-sync
+          fi
+          echo "Created or updated PR #$pr_number for $TAG." >> "$GITHUB_STEP_SUMMARY"

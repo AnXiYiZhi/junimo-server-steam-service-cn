@@ -1,0 +1,68 @@
+name: Auto Merge Safe Upstream Sync
+
+on:
+  workflow_run:
+    workflows: ["Validate Upstream Sync"]
+    types: [completed]
+    branches:
+      - "sync/upstream-*"
+
+permissions: {}
+
+concurrency:
+  group: auto-merge-upstream-sync-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    name: Merge validated sync without patch overlap
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Verify exact PR state and merge atomically
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          VALIDATED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          pr_json="$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --state open \
+            --base master \
+            --head "$HEAD_BRANCH" \
+            --json number,headRefName,headRefOid,isCrossRepository,labels \
+            --limit 2)"
+          pr_count="$(printf '%s' "$pr_json" | jq 'length')"
+          if [ "$pr_count" != "1" ]; then
+            echo "::error::Expected exactly one open sync PR for $HEAD_BRANCH, found $pr_count."
+            exit 1
+          fi
+
+          pr_number="$(printf '%s' "$pr_json" | jq -r '.[0].number')"
+          pr_head="$(printf '%s' "$pr_json" | jq -r '.[0].headRefName')"
+          current_sha="$(printf '%s' "$pr_json" | jq -r '.[0].headRefOid')"
+          is_cross_repository="$(printf '%s' "$pr_json" | jq -r '.[0].isCrossRepository')"
+          labels="$(printf '%s' "$pr_json" | jq -r '.[0].labels[].name')"
+
+          [ "$pr_head" = "$HEAD_BRANCH" ] || { echo "::error::PR head branch changed."; exit 1; }
+          [ "$current_sha" = "$VALIDATED_SHA" ] || { echo "::error::PR head changed after validation."; exit 1; }
+          [ "$is_cross_repository" = "false" ] || { echo "::error::PR is not from this repository."; exit 1; }
+          printf '%s\n' "$labels" | grep -Fxq upstream-sync || { echo "::error::Missing upstream-sync label."; exit 1; }
+          printf '%s\n' "$labels" | grep -Fxq auto-upstream-sync || { echo "::error::Missing auto-upstream-sync approval label."; exit 1; }
+          if printf '%s\n' "$labels" | grep -Fxq needs-anxi-patch-review; then
+            echo "::error::Anxi patch review is required; refusing automatic merge."
+            exit 1
+          fi
+
+          gh api --method PUT \
+            "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}/merge" \
+            -f merge_method=merge \
+            -f sha="$VALIDATED_SHA" \
+            --jq 'if .merged == true then .message else error(.message) end'
+          echo "Merged PR #$pr_number with a merge commit after validating $VALIDATED_SHA." >> "$GITHUB_STEP_SUMMARY"

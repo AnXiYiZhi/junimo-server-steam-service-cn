@@ -1,0 +1,48 @@
+name: Validate Upstream Sync
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate upstream code without private secrets
+    if: startsWith(github.head_ref, 'sync/upstream-')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout proposed merge
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5.3.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore tools and dependencies
+        run: |
+          dotnet tool restore
+          dotnet restore tools/steam-service/SteamService.csproj
+          dotnet restore tools/steam-service.Tests/SteamService.Tests.csproj
+
+      - name: Check steam-service formatting
+        run: dotnet csharpier check tools/steam-service tools/steam-service.Tests
+
+      - name: Build steam-service
+        run: dotnet build tools/steam-service/SteamService.csproj -c Release --no-restore
+
+      - name: Run game-independent steam-service tests
+        run: dotnet test tools/steam-service.Tests/SteamService.Tests.csproj -c Release --no-restore
+
+      - name: Verify anxi network patch invariants
+        run: python .github/scripts/check_anxi_patch.py
+
+      - name: Test sync and release automation
+        run: python -m unittest discover -s tests/workflows -p "test_*.py" -v
+
+      - name: Build steam-service image without pushing
+        run: docker build --file tools/steam-service/Dockerfile --tag steam-service-cn:validation .

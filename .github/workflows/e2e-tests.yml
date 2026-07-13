@@ -306,18 +306,52 @@ jobs:
     steps:
       - run: echo "Authorized — fork=${{ needs.gate.outputs.is_fork }}."
 
-  e2e:
-    name: E2E (VPS)
+  # Forks do not inherit the upstream maintainer's private VPS fleet secret. Probe
+  # only its shape, without checking out or executing repository code, so an
+  # unconfigured fork cleanly skips the private-fleet suite instead of failing at
+  # ssh-keyscan and producing a chain of empty-artifact warnings.
+  fleet:
+    name: Detect private E2E fleet
     needs: [gate, authorize]
     if: needs.gate.outputs.proceed == 'true'
     runs-on: ubuntu-latest
+    environment: test-vps
+    outputs:
+      configured: ${{ steps.probe.outputs.configured }}
+    steps:
+      - name: Check SDVD_DOCKER_HOSTS without exposing it
+        id: probe
+        shell: bash
+        env:
+          SDVD_DOCKER_HOSTS: ${{ secrets.SDVD_DOCKER_HOSTS }}
+        run: |
+          set -euo pipefail
+          configured=false
+          if [ -n "$SDVD_DOCKER_HOSTS" ] && \
+             printf '%s' "$SDVD_DOCKER_HOSTS" | jq -e \
+               'type == "array" and length > 0 and all(.[]; (.endpoint | type == "string") and startswith("ssh://"))' \
+               >/dev/null; then
+            configured=true
+          fi
+          echo "configured=$configured" >> "$GITHUB_OUTPUT"
+          if [ "$configured" = true ]; then
+            echo "Private VPS E2E fleet is configured." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## Private VPS E2E skipped" >> "$GITHUB_STEP_SUMMARY"
+            echo "This fork has no valid \`SDVD_DOCKER_HOSTS\` fleet secret. That secret belongs to upstream maintainers; no keyscan, test run, or artifact upload was attempted." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  e2e:
+    name: E2E (VPS)
+    needs: [gate, authorize, fleet]
+    if: needs.gate.outputs.proceed == 'true' && needs.fleet.outputs.configured == 'true'
+    runs-on: ubuntu-latest
     # Singleton against the one physical VPS runner. cancel-in-progress: false — a maintainer
     # preempts via the Actions tab, never a comment. queue: max FIFO-queues runs instead of
-    # the default `single`, which cancels the waiting run when a newer one queues.
+    # the default behavior; GitHub serializes runs in this concurrency group.
     concurrency:
       group: e2e-tests-singleton
       cancel-in-progress: false
-      queue: max
     # Holds the Steam + SSH secrets. Mirrors deploy-server.yml's per-environment
     # secret scoping.
     environment: test-vps
@@ -388,7 +422,9 @@ jobs:
             || echo '{"features": {"containerd-snapshotter": true}}')
           printf '%s\n' "$merged" | sudo tee /etc/docker/daemon.json
           sudo systemctl restart docker
-          for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break || sleep 1; done
+          for _ in $(seq 1 30); do
+            if docker info >/dev/null 2>&1; then break; else sleep 1; fi
+          done
           # Distinguish "daemon never came back" from "store didn't flip" — else the
           # driver check below reports a misleading Driver= empty.
           docker info >/dev/null 2>&1 \

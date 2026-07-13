@@ -254,26 +254,38 @@ Use a focused commit message:
 fix(steam-service): wait for SteamClient connection before auth
 ```
 
-## GitHub Tag Release
+## Automated sync validation and GitHub tag release
 
-The fork publishes the patched `steam-service` image from
-`.github/workflows/publish-tag.yml`. Push an Anxi patch tag to build and publish
-the image automatically:
+Upstream sync PRs run game-independent session migration tests and a static
+invariant check for the Anxi connection timeout/retry patch. These checks use
+no real Steam account and do not claim to validate the Steam network. Real
+Steam-account and private-VPS tests are optional acceptance tests for this fork;
+they do not block the automated fork tag or image release.
+
+When no Anxi patch overlap exists, successful credential-free PR validation
+automatically merge-commits the labeled `sync/upstream-*` PR. If
+`needs-anxi-patch-review` is present, merging it manually with **Create a merge
+commit** is the release approval. The closed-PR workflow revalidates the merged commit,
+creates the exact recommended fork tag idempotently, and calls the reusable
+publisher. Do not squash or rebase the PR: either method loses the upstream
+ancestor relationship and the release workflow will reject it.
+
+Manual exact tags remain a recovery path through `.github/workflows/publish-tag.yml`:
 
 ```powershell
-git tag v1.5.0-anxi.2
-git push origin v1.5.0-anxi.2
+git tag sdvd-server-v1.5.0-preview.125-anxi.1
+git push origin sdvd-server-v1.5.0-preview.125-anxi.1
 ```
 
-The workflow strips a leading `v` from the Docker tag, so the example above
+The workflow strictly parses the fork tag and publishes its normalized Docker tag, so the example above
 publishes:
 
 ```text
-anxiyizhi/junimo-steam-service-cn:1.5.0-anxi.2
+anxiyizhi/junimo-steam-service-cn:1.5.0-preview.125-anxi.1
 anxiyizhi/junimo-steam-service-cn:latest
-crpi-9z3bkb9g7fxeohrg.cn-hangzhou.personal.cr.aliyuncs.com/anxi-panel/junimo-steam-service-cn:1.5.0-anxi.2
+crpi-9z3bkb9g7fxeohrg.cn-hangzhou.personal.cr.aliyuncs.com/anxi-panel/junimo-steam-service-cn:1.5.0-preview.125-anxi.1
 crpi-9z3bkb9g7fxeohrg.cn-hangzhou.personal.cr.aliyuncs.com/anxi-panel/junimo-steam-service-cn:latest
-ghcr.io/<github-owner>/junimo-steam-service-cn:1.5.0-anxi.2
+ghcr.io/<github-owner>/junimo-steam-service-cn:1.5.0-preview.125-anxi.1
 ghcr.io/<github-owner>/junimo-steam-service-cn:latest
 ```
 
@@ -291,8 +303,8 @@ GitHub creates the package as private on first publish, open the package
 settings and switch visibility to Public before using it as a public fallback.
 
 ```powershell
-docker pull anxiyizhi/junimo-steam-service-cn:1.5.0-anxi.2
-docker pull ghcr.io/<github-owner>/junimo-steam-service-cn:1.5.0-anxi.2
+docker pull anxiyizhi/junimo-steam-service-cn:1.5.0-preview.125-anxi.1
+docker pull ghcr.io/<github-owner>/junimo-steam-service-cn:1.5.0-preview.125-anxi.1
 ```
 
 ## Panel Integration Later
