@@ -69,6 +69,8 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn('"v*-anxi.*"', trigger)
         self.assertIn("uses: ./.github/workflows/publish-steam-service.yml", trigger)
         self.assertIn("merge-base --is-ancestor", workflow)
+        self.assertNotIn("6500066a06b4f8358918cf3c244d3e4c23cfb4c6", workflow)
+        self.assertIn("docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0", workflow)
         for label in (
             "org.opencontainers.image.source",
             "org.opencontainers.image.revision",
