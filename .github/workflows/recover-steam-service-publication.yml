@@ -1,0 +1,162 @@
+name: Recover Auth Registry Publication
+
+on:
+  workflow_dispatch:
+    inputs:
+      fork_tag:
+        description: Existing annotated Auth release tag
+        required: true
+        type: string
+      platform_digest:
+        description: Already built linux/amd64 image manifest digest
+        required: true
+        type: string
+      failed_index_digest:
+        description: Expected failed publication index digest, never a new build
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-steam-service-cn-${{ inputs.fork_tag }}
+  cancel-in-progress: false
+
+env:
+  DOCKERHUB_IMAGE: anxiyizhi/junimo-steam-service-cn
+  ACR_REGISTRY: crpi-9z3bkb9g7fxeohrg.cn-hangzhou.personal.cr.aliyuncs.com
+  ACR_IMAGE: crpi-9z3bkb9g7fxeohrg.cn-hangzhou.personal.cr.aliyuncs.com/anxi-panel/junimo-steam-service-cn
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout recovery tools
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Checkout unchanged release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: refs/tags/${{ inputs.fork_tag }}
+          path: release-source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c
+      - name: Log in to Docker Hub
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Log in to Alibaba Cloud ACR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ALIYUN_REGISTRY_USERNAME }}
+          password: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify existing image and pure HTTP contracts
+        id: verify
+        env:
+          FORK_TAG: ${{ inputs.fork_tag }}
+          PLATFORM_DIGEST: ${{ inputs.platform_digest }}
+          FAILED_INDEX_DIGEST: ${{ inputs.failed_index_digest }}
+        run: |
+          set -euo pipefail
+          for command_name in docker python3 curl jq gh; do command -v "$command_name"; done
+          docker buildx version
+          [[ "$PLATFORM_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$FAILED_INDEX_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker buildx imagetools inspect --raw "${DOCKERHUB_IMAGE}@${FAILED_INDEX_DIGEST}" > original-index.json
+          jq --exit-status --arg digest "$PLATFORM_DIGEST" \
+            'any(.manifests[]; .digest == $digest and .platform.os == "linux" and .platform.architecture == "amd64")' original-index.json
+          source_image="${DOCKERHUB_IMAGE}@${PLATFORM_DIGEST}"
+          docker pull "$source_image"
+          docker image inspect "$source_image" > image-inspect.json
+          python3 .github/scripts/verify_auth_publication.py --source release-source \
+            --tag "$FORK_TAG" --inspect image-inspect.json --output publication.json
+          version="$(jq -r .version publication.json)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          probe="auth-release-probe-${GITHUB_RUN_ID}"
+          trap 'docker rm -fv "$probe" >/dev/null 2>&1 || true' EXIT
+          docker run -d --name "$probe" --memory 256m -p 127.0.0.1::3001 \
+            --tmpfs /data:rw,exec,size=64m --env AUTO_DOWNLOAD_ON_BOOT=false \
+            --env VALIDATE_ON_BOOT=false "$source_image"
+          port="$(docker inspect "$probe" | jq -r '.[0].NetworkSettings.Ports["3001/tcp"][0].HostPort')"
+          for attempt in $(seq 1 60); do
+            echo "HTTP readiness probe ${attempt}/60"
+            if curl --fail --silent --max-time 2 "http://127.0.0.1:${port}/health" >/dev/null; then break; fi
+            sleep 1
+          done
+          test "$(curl --silent --max-time 5 --output health.json --write-out '%{http_code}' "http://127.0.0.1:${port}/health")" = 200
+          test "$(curl --silent --max-time 5 --output ready.json --write-out '%{http_code}' "http://127.0.0.1:${port}/steam/ready")" = 503
+          test "$(curl --silent --max-time 5 --output validate.json --write-out '%{http_code}' "http://127.0.0.1:${port}/game/validate-status")" = 200
+      - name: Copy the verified platform manifest without rebuilding
+        env:
+          PLATFORM_DIGEST: ${{ inputs.platform_digest }}
+          FAILED_INDEX_DIGEST: ${{ inputs.failed_index_digest }}
+          VERSION: ${{ steps.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          refs=("${ACR_IMAGE}:${VERSION}" "ghcr.io/${owner}/junimo-steam-service-cn:${VERSION}" "${DOCKERHUB_IMAGE}:${VERSION}")
+          for reference in "${refs[@]}"; do
+            current=""
+            observed=false
+            for attempt in 1 2 3; do
+              if docker buildx imagetools inspect --format '{{json .Manifest}}' "$reference" > descriptor.json 2> inspect-error.txt; then
+                current="$(jq -r .digest descriptor.json)"
+                observed=true
+                break
+              fi
+              if grep -Eqi 'not found|manifest unknown|name_unknown' inspect-error.txt; then observed=true; break; fi
+              if [ "$attempt" -eq 3 ]; then cat inspect-error.txt >&2; exit 1; fi
+            done
+            test "$observed" = true
+            if [ -n "$current" ] && [ "$current" != "$PLATFORM_DIGEST" ] && [ "$current" != "$FAILED_INDEX_DIGEST" ]; then
+              echo 'Refusing to replace an unrelated image reference' >&2; exit 1
+            fi
+            if [ "$current" != "$PLATFORM_DIGEST" ]; then
+              docker buildx imagetools create --prefer-index=false \
+                --tag "$reference" "${DOCKERHUB_IMAGE}@${PLATFORM_DIGEST}"
+            fi
+            docker buildx imagetools inspect --format '{{json .Manifest}}' "$reference" > descriptor.json
+            test "$(jq -r .digest descriptor.json)" = "$PLATFORM_DIGEST"
+          done
+          jq --arg digest "$PLATFORM_DIGEST" --arg index "$FAILED_INDEX_DIGEST" \
+            --argjson run "$GITHUB_RUN_ID" --arg acr "${ACR_IMAGE}:${VERSION}" \
+            --arg ghcr "ghcr.io/${owner}/junimo-steam-service-cn:${VERSION}" \
+            --arg hub "${DOCKERHUB_IMAGE}:${VERSION}" \
+            '. + {digest:$digest,originalFailedIndex:$index,recoveryRun:$run,references:[$acr,$ghcr,$hub],rebuilt:false,httpSmokePassed:true}' \
+            publication.json > publication-complete.json
+      - name: Create the verified release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORK_TAG: ${{ inputs.fork_tag }}
+        run: |
+          set -euo pipefail
+          version="$(jq -r .version publication-complete.json)"
+          digest="$(jq -r .digest publication-complete.json)"
+          revision="$(jq -r .sourceRevision publication-complete.json)"
+          printf '%s\n' \
+            '配套上游 .140 的 Auth，保留国内连接与登录重试、会话迁移和独立健康检查。' \
+            '旧 .125 实例继续使用其原有固定版本；本版用于 .140 实例迁移。' \
+            "Image tag: ${version}" "Digest: ${digest}" "Source commit: ${revision}" \
+            '已复用首次构建的同一 linux/amd64 镜像，完成 HTTP 冒烟和三仓内容核对；没有重新构建。' > release-notes.md
+          gh release create "$FORK_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "Junimo Steam Service CN ${version}" --notes-file release-notes.md
+      - name: Save immutable publication evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: auth-publication-${{ steps.verify.outputs.version }}
+          path: publication-complete.json
+          if-no-files-found: error

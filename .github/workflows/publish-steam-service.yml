@@ -109,6 +109,8 @@ jobs:
           file: ./tools/steam-service/Dockerfile
           platforms: linux/amd64
           push: true
+          provenance: false
+          sbom: false
           build-args: |
             AUTH_VERSION=${{ steps.meta.outputs.version }}
             SOURCE_REVISION=${{ steps.meta.outputs.release_sha }}
