@@ -51,8 +51,8 @@ public class SteamAuthService
     private static readonly TimeSpan CallbackPollInterval = TimeSpan.FromMilliseconds(10);
     private static readonly TimeSpan TicketCacheMaxAge = TimeSpan.FromMinutes(10);
 
-    private readonly string _sessionDir;
-    private readonly SteamSessionStore _sessionStore;
+    private readonly string _baseSessionDir;
+    private string _sessionDir;
     private readonly string _gameDir;
     private readonly string _logPrefix;
 
@@ -99,11 +99,52 @@ public class SteamAuthService
     /// <summary>Account index (0-based). Used for ?account=N routing.</summary>
     public int AccountIndex { get; }
 
-    /// <summary>Configured username for this account.</summary>
-    public string Username { get; }
+    /// <summary>Steam account name. Empty until an interactive login reveals it (see BindIdentity).</summary>
+    public string Username { get; private set; } = "";
 
     public bool IsLoggedIn { get; private set; }
     public string? SteamId => _steamClient.SteamID?.ConvertToUInt64().ToString();
+
+    /// <summary>Expiry of the refresh token last used to log in, from its JWT `exp` claim.</summary>
+    public DateTimeOffset? TokenExpiresAt { get; private set; }
+
+    /// <summary>
+    /// True when the refresh token came from STEAM_REFRESH_TOKEN / STEAM_ACCOUNTS rather than the
+    /// saved session. Renewal is refused for these: Steam invalidates the old token on renewal,
+    /// which would silently break the env copy.
+    /// </summary>
+    public bool TokenFromEnv { get; private set; }
+
+    /// <summary>
+    /// Steam's answer to a renewal request: a new token, a refusal (OK with no token, the normal
+    /// answer far from expiry), or an authentication failure (the token can no longer be renewed
+    /// but still logs in until <c>exp</c>).
+    /// </summary>
+    public enum TokenRenewalOutcome
+    {
+        Renewed,
+        Refused,
+        Failed,
+    }
+
+    /// <summary>Result of <see cref="RenewRefreshTokenAsync"/>; <c>Error</c> is the <see cref="EResult"/> name when <see cref="TokenRenewalOutcome.Failed"/>.</summary>
+    public record TokenRenewalResult(
+        TokenRenewalOutcome Outcome,
+        DateTimeOffset? PreviousExpiry,
+        DateTimeOffset? NewExpiry,
+        string? Error
+    )
+    {
+        public bool Renewed => Outcome == TokenRenewalOutcome.Renewed;
+    }
+
+    /// <summary>When <see cref="RenewRefreshTokenAsync"/> last asked Steam and what Steam answered.</summary>
+    public DateTimeOffset? LastRenewalAttemptAt { get; private set; }
+    public TokenRenewalOutcome? LastRenewalOutcome { get; private set; }
+    public string? LastRenewalError { get; private set; }
+
+    private const string SetupHint =
+        "Re-authenticate with: docker compose run --rm -it steam-auth setup";
     public ulong CurrentLobbyId => _currentLobbyId;
 
     private static int ParsePositiveIntEnv(string name, int defaultValue)
@@ -121,12 +162,18 @@ public class SteamAuthService
     )
     {
         AccountIndex = accountIndex;
-        Username = username;
+        _baseSessionDir = sessionDir;
+        _sessionDir = sessionDir; // rebased onto {baseSessionDir}/{username} once the account name is known
         _gameDir = gameDir;
         _logPrefix = $"[SteamAuth:A{accountIndex}]";
-        _sessionStore = new SteamSessionStore(sessionDir, username, _logPrefix);
-        _sessionDir = _sessionStore.AccountDirectory;
         _skipPatterns = BuildSkipPatterns(keepLanguages ?? []);
+
+        // Interactive setup/login construct without a name; the account is bound once the login
+        // reveals it (see BindIdentity).
+        if (!string.IsNullOrEmpty(username))
+        {
+            BindIdentity(username);
+        }
 
         _steamClient = new SteamClient();
         _callbackManager = new CallbackManager(_steamClient);
@@ -265,6 +312,12 @@ public class SteamAuthService
         if (IsTerminalLogoff(result))
         {
             return; // banned/disabled
+        }
+
+        if (TokenExpiresAt is { } expiry && expiry <= DateTimeOffset.UtcNow)
+        {
+            Logger.Log($"{_logPrefix} Not reconnecting: refresh token expired. {SetupHint}");
+            return;
         }
 
         if (Interlocked.CompareExchange(ref _reconnectInProgress, 1, 0) != 0)
@@ -538,11 +591,17 @@ public class SteamAuthService
     // Session Management
     // ========================================================================
 
+    private string SessionFilePath => Path.Combine(_sessionDir, "session.json");
+
     private string TicketCachePath => Path.Combine(_sessionDir, "app-ticket.json");
 
+    /// <summary>
+    /// True when a usable saved session exists. A file that is missing, unreadable or lacks a
+    /// refresh token is not a session, so callers fall through to their next auth method.
+    /// </summary>
     public bool HasSavedSession()
     {
-        return _sessionStore.Exists();
+        return LoadSession() != null;
     }
 
     /// <summary>
@@ -550,15 +609,251 @@ public class SteamAuthService
     /// </summary>
     public (string username, string refreshToken)? GetSavedSession() => LoadSession();
 
+    /// <summary>
+    /// Points this service at a Steam account: sets <see cref="Username"/> and the session folder
+    /// {baseSessionDir}/{username}.
+    /// </summary>
+    private void BindIdentity(string username)
+    {
+        Username = username;
+        _sessionDir = Path.Combine(_baseSessionDir, username);
+        Directory.CreateDirectory(_sessionDir);
+        MigrateOldSession(_baseSessionDir);
+    }
+
     private void SaveSession(string username, string refreshToken)
     {
-        _sessionStore.Save(username, refreshToken);
+        // Interactive logins start unbound; bind to the account Steam returned so the file lands
+        // in {baseSessionDir}/{username}.
+        if (Username != username)
+        {
+            BindIdentity(username);
+        }
+
+        Directory.CreateDirectory(_sessionDir);
+        var path = SessionFilePath;
+        var tempPath = path + ".tmp";
+        var json = JsonSerializer.Serialize(new { username, refreshToken });
+
+        // Write to temp file first, then atomically rename to avoid corruption
+        File.WriteAllText(tempPath, json);
+        File.Move(tempPath, path, overwrite: true);
+        Logger.Log($"{_logPrefix} Session saved for {username}");
     }
 
     private (string username, string refreshToken)? LoadSession()
     {
-        var session = _sessionStore.Load();
-        return session == null ? null : (session.Username, session.RefreshToken);
+        var path = SessionFilePath;
+        var session = TryLoadSession(path);
+        if (session == null && File.Exists(path))
+        {
+            Logger.Log($"{_logPrefix} Failed to load session at {path}");
+        }
+        return session;
+    }
+
+    /// <summary>
+    /// Parses a session.json at <paramref name="path"/> into (username, refreshToken). This is the
+    /// one canonical reader for the session-file contract — every consumer goes through it. Returns
+    /// null if the file is missing, unreadable, or lacks either field (a session without a
+    /// refresh token cannot be logged in, so it is not a usable session).
+    /// </summary>
+    public static (string username, string refreshToken)? TryLoadSession(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(path));
+            var username = doc.RootElement.GetProperty("username").GetString();
+            var token = doc.RootElement.GetProperty("refreshToken").GetString();
+            if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(token))
+            {
+                return null;
+            }
+            return (username, token);
+        }
+        // A wrong-shaped file (root not an object, non-string fields) throws InvalidOperationException
+        // from GetProperty/GetString, and a permission failure throws UnauthorizedAccessException.
+        // Both mean "not a usable session" -- swallow them so one bad candidate can't abort discovery.
+        catch (Exception ex)
+            when (ex
+                    is IOException
+                        or UnauthorizedAccessException
+                        or JsonException
+                        or KeyNotFoundException
+                        or InvalidOperationException
+            )
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Lists the usable sessions under {baseSessionDir}/{username}/session.json, newest-first by
+    /// file write time. Malformed and token-less files are skipped; an absent directory yields an
+    /// empty list.
+    /// </summary>
+    public static List<(string username, string path, DateTime writtenUtc)> FindSessions(
+        string baseSessionDir
+    )
+    {
+        var sessions = new List<(string username, string path, DateTime writtenUtc)>();
+        if (!Directory.Exists(baseSessionDir))
+        {
+            return sessions;
+        }
+
+        foreach (var dir in Directory.EnumerateDirectories(baseSessionDir))
+        {
+            var path = Path.Combine(dir, "session.json");
+            var session = TryLoadSession(path);
+            if (session != null)
+            {
+                sessions.Add((session.Value.username, path, File.GetLastWriteTimeUtc(path)));
+            }
+        }
+
+        return sessions.OrderByDescending(s => s.writtenUtc).ToList();
+    }
+
+    /// <summary>
+    /// Resolves one line of picker input against a newest-first session list. Enter picks the
+    /// newest (same as headless newest-wins), "n" picks a fresh login (null), a 1-based number
+    /// picks that session; with a single session anything but "n" accepts it. Returns false when
+    /// the input fits none of these so the caller can re-prompt.
+    /// </summary>
+    public static bool TryResolveSessionChoice(
+        IReadOnlyList<(string username, string path, DateTime writtenUtc)> sessions,
+        string? input,
+        out string? username
+    )
+    {
+        username = null;
+        if (sessions.Count == 0)
+        {
+            return true;
+        }
+
+        var answer = input?.Trim().ToLowerInvariant() ?? "";
+        if (answer is "n" or "no")
+        {
+            return true;
+        }
+
+        if (sessions.Count == 1)
+        {
+            username = sessions[0].username;
+            return true;
+        }
+
+        if (answer == "")
+        {
+            username = sessions[0].username;
+            return true;
+        }
+
+        if (int.TryParse(answer, out var number) && number >= 1 && number <= sessions.Count)
+        {
+            username = sessions[number - 1].username;
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Interactive picker over the stored sessions: returns the account to reuse, or null for a
+    /// fresh login (also when there is nothing to pick from).
+    /// </summary>
+    private static string? ChooseStoredSession(
+        IReadOnlyList<(string username, string path, DateTime writtenUtc)> sessions
+    )
+    {
+        if (sessions.Count == 0)
+        {
+            return null;
+        }
+
+        var nowUtc = DateTime.UtcNow;
+        if (sessions.Count == 1)
+        {
+            Console.Write($"Use saved login for {sessions[0].username}? [Y/n]: ");
+        }
+        else
+        {
+            Console.WriteLine("Saved logins:");
+            for (var i = 0; i < sessions.Count; i++)
+            {
+                var (username, _, writtenUtc) = sessions[i];
+                var recent = i == 0 ? ", most recent" : "";
+                Console.WriteLine(
+                    $"  [{i + 1}] {username} (last used {FormatAge(nowUtc - writtenUtc)}{recent})"
+                );
+            }
+            Console.Write("Enter = most recent, number = that account, n = new login: ");
+        }
+
+        while (true)
+        {
+            // EOF on stdin reads as null; treat it like Enter so a closed pipe can't spin here.
+            var input = Console.ReadLine() ?? "";
+            if (TryResolveSessionChoice(sessions, input, out var chosen))
+            {
+                Console.WriteLine();
+                return chosen;
+            }
+            Console.Write($"Enter a number 1-{sessions.Count}, n for a new login, or Enter: ");
+        }
+    }
+
+    private static string FormatAge(TimeSpan age)
+    {
+        if (age < TimeSpan.FromMinutes(1))
+        {
+            return "just now";
+        }
+        if (age < TimeSpan.FromHours(1))
+        {
+            return $"{(int)age.TotalMinutes} min ago";
+        }
+        if (age < TimeSpan.FromDays(1))
+        {
+            return $"{(int)age.TotalHours} h ago";
+        }
+        return $"{(int)age.TotalDays} d ago";
+    }
+
+    /// <summary>
+    /// Migrates session files from the old flat format (session-{username}.json in the
+    /// shared session dir) to the new per-account directory format ({sessionDir}/{username}/session.json).
+    /// Added 2026-04 -- can be removed once all deployments have upgraded past this version.
+    /// </summary>
+    private void MigrateOldSession(string parentSessionDir)
+    {
+        if (File.Exists(SessionFilePath))
+        {
+            return;
+        }
+
+        var oldPath = Path.Combine(parentSessionDir, $"session-{Username}.json");
+        if (!File.Exists(oldPath))
+        {
+            return;
+        }
+
+        try
+        {
+            File.Move(oldPath, SessionFilePath);
+            Logger.Log($"{_logPrefix} Migrated session from old format");
+        }
+        catch (IOException ex)
+        {
+            Logger.Log($"{_logPrefix} Session migration failed: {ex.Message}");
+        }
     }
 
     private void SaveTicketCache(string ticketBase64, string? steamId)
@@ -665,7 +960,8 @@ public class SteamAuthService
             else
             {
                 throw new InvalidOperationException(
-                    $"Account {AccountIndex}: no auth method (no token, saved session, or password)"
+                    $"Account {AccountIndex} ({Username}): no saved session and no password or token. "
+                        + "Run 'setup' to log in, or set STEAM_PASSWORD."
                 );
             }
         }
@@ -689,6 +985,7 @@ public class SteamAuthService
 
         _username = session.Value.username;
         _refreshToken = session.Value.refreshToken;
+        TokenFromEnv = false;
 
         await ConnectAndLoginAsync(_refreshToken);
     }
@@ -701,6 +998,7 @@ public class SteamAuthService
     {
         _username = username;
         _refreshToken = refreshToken;
+        TokenFromEnv = true;
 
         Logger.Log($"{_logPrefix} Logging in with provided token for {username}...");
         await ConnectAndLoginAsync(refreshToken);
@@ -717,25 +1015,33 @@ public class SteamAuthService
             Console.WriteLine("*****************************************************************");
             Console.WriteLine();
 
-            // Check for existing session
-            var existingSession = LoadSession();
-            if (existingSession != null)
+            // Env pinned the username but gave no usable session or credentials: prompt for the
+            // password only. No QR here, since QR logs in whichever account scans it.
+            if (!string.IsNullOrEmpty(Username))
             {
-                Console.WriteLine($"Found existing session for: {existingSession.Value.username}");
-                Console.Write("Use existing session? [Y/n]: ");
-                var useExisting = Console.ReadLine()?.Trim().ToLower();
-                if (useExisting != "n" && useExisting != "no")
+                Console.WriteLine($"Steam account: {Username} (from STEAM_USERNAME)");
+                await LoginWithCredentialsInsideLockAsync(Username);
+                return;
+            }
+
+            // Unbound: nothing pins the account, so offer the stored sessions before a fresh login.
+            var chosen = ChooseStoredSession(FindSessions(_baseSessionDir));
+            if (chosen != null)
+            {
+                Console.WriteLine($"Signing in to Steam as {chosen}...");
+                // Bind before loading so the saved-session read targets the right folder.
+                BindIdentity(chosen);
+                try
                 {
-                    try
-                    {
-                        await LoginWithSavedSessionInsideLockAsync();
-                        Logger.Log($"{_logPrefix} Logged in with saved session");
-                        return;
-                    }
-                    catch
-                    {
-                        Logger.Log($"{_logPrefix} Saved session invalid, need fresh login");
-                    }
+                    await LoginWithSavedSessionInsideLockAsync();
+                    Logger.Log($"{_logPrefix} Logged in with saved session for {chosen}");
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    Logger.Log(
+                        $"{_logPrefix} Saved session for {chosen} is invalid ({ex.Message}), need fresh login"
+                    );
                 }
             }
 
@@ -763,28 +1069,24 @@ public class SteamAuthService
     }
 
     /// <summary>
-    /// Login with username/password. If usernameParam/passwordParam are null, prompts
-    /// the user on stdin (used by interactive CLI). Must be called with _loginSemaphore held.
+    /// Login with username/password. Whichever of usernameParam/passwordParam is null is
+    /// prompted for on stdin (used by interactive CLI). Must be called with _loginSemaphore held.
     /// </summary>
     private async Task LoginWithCredentialsInsideLockAsync(
         string? usernameParam = null,
         string? passwordParam = null
     )
     {
-        string username;
-        string password;
-
-        // Use provided params or prompt
-        if (!string.IsNullOrEmpty(usernameParam) && !string.IsNullOrEmpty(passwordParam))
-        {
-            username = usernameParam;
-            password = passwordParam;
-        }
-        else
+        var username = usernameParam;
+        if (string.IsNullOrEmpty(username))
         {
             Console.Write("Steam Username: ");
             username = Console.ReadLine()?.Trim() ?? "";
+        }
 
+        var password = passwordParam;
+        if (string.IsNullOrEmpty(password))
+        {
             Console.Write("Steam Password: ");
             password = ReadPassword();
             Console.WriteLine();
@@ -903,6 +1205,20 @@ public class SteamAuthService
         const int baseDelaySeconds = 5;
         var loginTimeout = TimeSpan.FromSeconds(30);
 
+        TokenExpiresAt = GetTokenExpiry(refreshToken);
+        if (TokenExpiresAt is { } expired && expired <= DateTimeOffset.UtcNow)
+        {
+            // Steam would reject it anyway; fail fast with the fix instead of five retries.
+            Logger.Log(
+                $"{_logPrefix} Refresh token expired on {expired:yyyy-MM-dd HH:mm:ss} UTC. {SetupHint}"
+            );
+            Logger.LogEvent(
+                "account_token_expired",
+                new { prefix = _logPrefix, expiresAt = expired.ToString("o") }
+            );
+            throw new Exception($"Refresh token expired on {expired:yyyy-MM-dd}. {SetupHint}");
+        }
+
         for (int attempt = 1; attempt <= maxRetries; attempt++)
         {
             var tcs = new TaskCompletionSource<bool>();
@@ -913,7 +1229,13 @@ public class SteamAuthService
                 Logger.Log(
                     $"{_logPrefix} Logging in as {_username} with token ({refreshToken.Length} chars)..."
                 );
-                PrintTokenExpiry(refreshToken);
+                if (TokenExpiresAt is { } expiry)
+                {
+                    var remaining = expiry - DateTimeOffset.UtcNow;
+                    Logger.Log(
+                        $"{_logPrefix} Token expires: {expiry:yyyy-MM-dd HH:mm:ss} UTC ({remaining.Days} days remaining)"
+                    );
+                }
             }
             else
             {
@@ -966,53 +1288,175 @@ public class SteamAuthService
             }
         }
 
-        throw new Exception($"Login failed after {maxRetries} attempts");
+        throw new Exception(
+            $"Login failed after {maxRetries} attempts. If Steam rejected the token, {SetupHint}"
+        );
     }
 
-    private void PrintTokenExpiry(string token)
+    /// <summary>
+    /// Expiry from the token's JWT <c>exp</c> claim, or null when the token is not a parseable JWT
+    /// or carries no <c>exp</c>. Steam never published the signing key, so the claim is read
+    /// unverified.
+    /// </summary>
+    internal static DateTimeOffset? GetTokenExpiry(string token)
     {
         try
         {
-            // JWT format: header.payload.signature
             var parts = token.Split('.');
             if (parts.Length != 3)
             {
-                return;
+                return null;
             }
 
-            // Decode payload (base64url)
-            var payload = parts[1];
-            // Add padding if needed
-            payload = payload.Replace('-', '+').Replace('_', '/');
-            switch (payload.Length % 4)
+            var payload = parts[1].Replace('-', '+').Replace('_', '/');
+            payload += (payload.Length % 4) switch
             {
-                case 2:
-                    payload += "==";
-                    break;
-                case 3:
-                    payload += "=";
-                    break;
-            }
+                2 => "==",
+                3 => "=",
+                _ => "",
+            };
 
-            var json = Encoding.UTF8.GetString(Convert.FromBase64String(payload));
-            var doc = JsonDocument.Parse(json);
-
-            if (doc.RootElement.TryGetProperty("exp", out var expProp))
-            {
-                var exp = expProp.GetInt64();
-                var expiryDate = DateTimeOffset.FromUnixTimeSeconds(exp);
-                var remaining = expiryDate - DateTimeOffset.UtcNow;
-
-                Logger.Log(
-                    $"{_logPrefix} Token expires: {expiryDate:yyyy-MM-dd HH:mm:ss} UTC ({remaining.Days} days remaining)"
-                );
-            }
+            using var doc = JsonDocument.Parse(Convert.FromBase64String(payload));
+            return
+                doc.RootElement.TryGetProperty("exp", out var exp)
+                && exp.ValueKind == JsonValueKind.Number
+                && exp.TryGetInt64(out var seconds)
+                && seconds >= DateTimeOffset.MinValue.ToUnixTimeSeconds()
+                && seconds <= DateTimeOffset.MaxValue.ToUnixTimeSeconds()
+                ? DateTimeOffset.FromUnixTimeSeconds(seconds)
+                : null;
         }
-        catch (Exception ex) when (ex is JsonException or FormatException or KeyNotFoundException)
+        catch (Exception ex) when (ex is JsonException or FormatException)
         {
-            // Token expiry parsing is non-critical, just skip it
+            return null;
         }
     }
+
+    /// <summary>
+    /// Asks Steam for a renewed refresh token over the logged-in session. Steam decides whether
+    /// to issue one; the result reports whether it did. A renewed token replaces the saved
+    /// session before returning because Steam invalidates the previous token on renewal.
+    /// Holds the login semaphore so the reconnect loop never reads the token mid-swap. An
+    /// <see cref="AuthenticationException"/> is reported as <see cref="TokenRenewalOutcome.Failed"/>
+    /// rather than thrown: the session stays up and the token keeps logging in until it expires.
+    /// </summary>
+    public async Task<TokenRenewalResult> RenewRefreshTokenAsync()
+    {
+        if (!IsLoggedIn)
+        {
+            throw new InvalidOperationException("Not logged in");
+        }
+
+        if (TokenFromEnv)
+        {
+            throw new InvalidOperationException(
+                "Token was supplied via environment; renewing it here would invalidate that copy. "
+                    + "Renew where the token is minted and update the environment value."
+            );
+        }
+
+        await _loginSemaphore.WaitAsync();
+        try
+        {
+            if (!IsLoggedIn || _refreshToken == null || _username == null)
+            {
+                throw new InvalidOperationException("Not logged in");
+            }
+
+            var steamId =
+                _steamClient.SteamID
+                ?? throw new InvalidOperationException("No SteamID on session");
+            var previousExpiry = TokenExpiresAt;
+            var attemptedAt = DateTimeOffset.UtcNow;
+            TokenRenewalOutcome outcome;
+            string? error = null;
+
+            try
+            {
+                var response = await _steamClient.Authentication.GenerateAccessTokenForAppAsync(
+                    steamId,
+                    _refreshToken,
+                    allowRenewal: true
+                );
+
+                if (string.IsNullOrEmpty(response.RefreshToken))
+                {
+                    outcome = TokenRenewalOutcome.Refused;
+                }
+                else
+                {
+                    // Steam has already invalidated the old token, so the new one is adopted
+                    // even if persisting it fails; that failure is reported, not hidden.
+                    _refreshToken = response.RefreshToken;
+                    TokenExpiresAt = GetTokenExpiry(_refreshToken);
+                    outcome = TokenRenewalOutcome.Renewed;
+                    try
+                    {
+                        SaveSession(_username, _refreshToken);
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        error = $"renewed but not saved: {ex.Message}";
+                        Logger.Log(
+                            $"{_logPrefix} Refresh token renewed but saving the session failed ({ex.Message}). "
+                                + "The new token exists only in this process; if the sidecar restarts before "
+                                + $"a successful save, {SetupHint}"
+                        );
+                    }
+                }
+            }
+            catch (AuthenticationException ex)
+            {
+                outcome = TokenRenewalOutcome.Failed;
+                error = ex.Result.ToString();
+            }
+            catch (Exception ex)
+            {
+                LastRenewalAttemptAt = attemptedAt;
+                LastRenewalOutcome = TokenRenewalOutcome.Failed;
+                LastRenewalError = ex.Message;
+                throw;
+            }
+
+            LastRenewalAttemptAt = attemptedAt;
+            LastRenewalOutcome = outcome;
+            LastRenewalError = error;
+
+            Logger.Log(
+                outcome switch
+                {
+                    TokenRenewalOutcome.Renewed =>
+                        $"{_logPrefix} Refresh token renewed; new expiry {TokenExpiresAt:yyyy-MM-dd HH:mm:ss} UTC",
+                    TokenRenewalOutcome.Failed =>
+                        $"{_logPrefix} Refresh token renewal failed with {error} (current expiry {previousExpiry:yyyy-MM-dd HH:mm:ss} UTC)",
+                    _ =>
+                        $"{_logPrefix} Steam did not issue a new refresh token (current expiry {previousExpiry:yyyy-MM-dd HH:mm:ss} UTC)",
+                }
+            );
+            Logger.LogEvent(
+                "account_token_renewal",
+                new
+                {
+                    prefix = _logPrefix,
+                    outcome = OutcomeName(outcome),
+                    renewed = outcome == TokenRenewalOutcome.Renewed,
+                    error,
+                    previousExpiry = previousExpiry?.ToString("o"),
+                    newExpiry = TokenExpiresAt?.ToString("o"),
+                }
+            );
+
+            return new TokenRenewalResult(outcome, previousExpiry, TokenExpiresAt, error);
+        }
+        finally
+        {
+            _loginSemaphore.Release();
+        }
+    }
+
+    /// <summary>Wire form of an outcome in log events and HTTP JSON (lower-case).</summary>
+    public static string? OutcomeName(TokenRenewalOutcome? outcome) =>
+        outcome?.ToString().ToLowerInvariant();
 
     // ========================================================================
     // App Ticket (Encrypted App Ticket for Galaxy cross-platform auth)
@@ -1147,33 +1591,28 @@ public class SteamAuthService
     // ========================================================================
 
     /// <summary>
-    /// Checks if the app is already downloaded with the specified manifest.
+    /// Manifest id recorded by the completion marker of a finished download, or null when there
+    /// is no marker or it is unreadable.
     /// </summary>
-    private bool IsAlreadyDownloaded(string downloadDir, uint appId, ulong manifestId)
+    public static ulong? ReadInstalledManifestId(string downloadDir, uint appId)
     {
         var markerPath = Path.Combine(downloadDir, $".download-manifest-{appId}");
         if (!File.Exists(markerPath))
         {
-            return false;
+            return null;
         }
 
         try
         {
-            var content = File.ReadAllText(markerPath);
-            var doc = JsonDocument.Parse(content);
-
-            if (doc.RootElement.TryGetProperty("manifestId", out var savedManifest))
-            {
-                var savedManifestId = savedManifest.GetUInt64();
-                return savedManifestId == manifestId;
-            }
+            using var doc = JsonDocument.Parse(File.ReadAllText(markerPath));
+            return doc.RootElement.TryGetProperty("manifestId", out var saved)
+                ? saved.GetUInt64()
+                : null;
         }
         catch
         {
-            // Marker file corrupted or invalid, proceed with download
+            return null;
         }
-
-        return false;
     }
 
     /// <summary>
@@ -1222,6 +1661,49 @@ public class SteamAuthService
     /// aren't reclaimed on reconfigure (a size concern, not a correctness one).
     /// </para>
     /// </summary>
+    private const string ContentManifestDepotPath = "Content/ContentHashes.json";
+
+    private static bool IsContentManifest(string depotFileName) =>
+        depotFileName.Replace('\\', '/') == ContentManifestDepotPath;
+
+    /// <summary>
+    /// Depot files a later step rewrites on purpose, so a repair pass must not restore the depot
+    /// copy: the SMAPI installer replaces the <c>StardewValley</c> launcher with its own (keeping
+    /// <c>StardewValley-original</c>), and the game container's entrypoint writes
+    /// <c>steam_appid.txt</c> on every boot. Neither is content the game loads from the depot.
+    /// </summary>
+    internal static bool IsPostInstallOwned(string depotFileName) =>
+        depotFileName.Replace('\\', '/') is "StardewValley" or "steam_appid.txt";
+
+    /// <summary>
+    /// True when <paramref name="manifestPath"/> is in the state <see cref="PruneContentManifest"/>
+    /// leaves: parseable, non-empty, and every listed asset present on disk. Anything else
+    /// (truncation, garbage, an entry for a missing file) is treated as corrupt.
+    /// </summary>
+    internal static bool IsPrunedContentManifest(string manifestPath)
+    {
+        Dictionary<string, JsonElement>? entries;
+        try
+        {
+            entries = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(
+                File.ReadAllText(manifestPath)
+            );
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+        if (entries == null || entries.Count == 0)
+        {
+            return false;
+        }
+
+        var contentDir = Path.GetDirectoryName(manifestPath)!;
+        return entries.Keys.All(key =>
+            File.Exists(Path.Combine(contentDir, key.Replace('/', Path.DirectorySeparatorChar)))
+        );
+    }
+
     private void PruneContentManifest(string downloadDir)
     {
         var contentDir = Path.Combine(downloadDir, "Content");
@@ -1562,7 +2044,31 @@ public class SteamAuthService
         return false;
     }
 
-    public async Task DownloadGameAsync(uint appId, string? targetDir = null)
+    /// <summary>
+    /// Per-file outcome counts of one <see cref="DownloadGameAsync"/> pass.
+    /// </summary>
+    /// <param name="FilesRepaired">Existed at the right size but had corrupt chunks re-fetched.</param>
+    /// <param name="FilesDownloaded">Missing or wrong-sized, fetched in full.</param>
+    /// <param name="FilesUnchanged">Present and every chunk hash matched.</param>
+    public sealed record DownloadSummary(int FilesRepaired, int FilesDownloaded, int FilesUnchanged)
+    {
+        public override string ToString() =>
+            $"{FilesRepaired} repaired, {FilesDownloaded} downloaded, {FilesUnchanged} unchanged";
+    }
+
+    /// <summary>
+    /// Downloads or repairs an app depot. Every existing file is chunk-hash validated and only
+    /// invalid chunks are fetched, so this is also the repair path for corrupt content.
+    /// </summary>
+    /// <param name="pinnedManifestId">
+    /// Depot manifest to install. Null fetches the current public manifest (install or update);
+    /// a pinned id repairs the installed version without upgrading it.
+    /// </param>
+    public async Task<DownloadSummary> DownloadGameAsync(
+        uint appId,
+        string? targetDir = null,
+        ulong? pinnedManifestId = null
+    )
     {
         // Reconnect if disconnected (can happen during long downloads). Passing null
         // config means saved-session-only; throws InvalidOperationException if no
@@ -1647,32 +2153,13 @@ public class SteamAuthService
                 throw new Exception($"Could not find depot for OS: {targetOs}");
             }
 
-            var depotInfo = depots[depotId.ToString()];
-
-            // Get manifest ID - structure is: manifests/public/gid
-            var publicManifest = depotInfo["manifests"]["public"];
-            string? manifestIdStr = null;
-
-            // Try gid first (newer structure)
-            if (publicManifest["gid"].Value != null)
-            {
-                manifestIdStr = publicManifest["gid"].Value;
-            }
-            // Fallback to direct value (older structure)
-            else if (publicManifest.Value != null)
-            {
-                manifestIdStr = publicManifest.Value;
-            }
-
-            if (string.IsNullOrEmpty(manifestIdStr))
-            {
-                Logger.Log($"{_logPrefix} Could not find manifest. Public manifest structure:");
-                PrintKeyValue(publicManifest, "  ", 5);
-                throw new Exception("Could not find public manifest gid");
-            }
-
-            var manifestId = ulong.Parse(manifestIdStr);
-            Logger.Log($"{_logPrefix} Manifest ID: {manifestId}");
+            var manifestId =
+                pinnedManifestId ?? ResolvePublicManifestId(depots[depotId.ToString()]);
+            Logger.Log(
+                pinnedManifestId.HasValue
+                    ? $"{_logPrefix} Manifest ID: {manifestId} (pinned to the installed version)"
+                    : $"{_logPrefix} Manifest ID: {manifestId}"
+            );
 
             // Always validate files to detect corruption/deletion
             var forceRedownload = Environment.GetEnvironmentVariable("FORCE_REDOWNLOAD") == "1";
@@ -1758,6 +2245,8 @@ public class SteamAuthService
             var processedFiles = 0;
             var processedBytes = 0L;
             var skippedExisting = 0;
+            var repairedFiles = 0;
+            var downloadedFiles = 0;
 
             foreach (var file in manifest.Files)
             {
@@ -1784,11 +2273,34 @@ public class SteamAuthService
 
                 // Check if file already exists and validate its chunks
                 List<DepotManifest.ChunkData> chunksToDownload = file.Chunks;
+                var isRepair = false;
 
                 if (!forceRedownload && File.Exists(filePath))
                 {
+                    // The content manifest is rewritten after every pass (PruneContentManifest),
+                    // so neither its size nor its hash can match the depot; accept it when it is
+                    // in the state the prune leaves, else re-fetch and re-prune it. Files a later
+                    // installer owns are left alone on a repair pass: restoring the depot copy
+                    // would undo that install on every boot.
+                    if (
+                        (IsContentManifest(file.FileName) && IsPrunedContentManifest(filePath))
+                        || (pinnedManifestId.HasValue && IsPostInstallOwned(file.FileName))
+                    )
+                    {
+                        processedFiles++;
+                        processedBytes += (long)file.TotalSize;
+                        skippedExisting++;
+                        continue;
+                    }
+
                     var existingSize = new FileInfo(filePath).Length;
-                    if (existingSize == (long)file.TotalSize)
+                    if (existingSize != (long)file.TotalSize)
+                    {
+                        Logger.Log(
+                            $"{_logPrefix} {file.FileName}: size {existingSize} != {file.TotalSize}, downloading"
+                        );
+                    }
+                    else
                     {
                         // Size matches - validate chunk checksums
                         await using var existingFs = new FileStream(
@@ -1797,7 +2309,33 @@ public class SteamAuthService
                             FileAccess.Read,
                             FileShare.Read
                         );
-                        var invalidChunks = ValidateFileChunks(existingFs, file.Chunks);
+                        // The Galaxy libs are rewritten after download (execstack flag); hash
+                        // them as shipped or the patch re-downloads their chunk every pass.
+                        Stream validationView = existingFs;
+                        if (ExecstackPatcher.IsGalaxyLib(file.FileName))
+                        {
+                            try
+                            {
+                                if (
+                                    ExecstackPatcher.TryFindExecstackFlagOffset(existingFs) is
+                                    { } flagOffset
+                                )
+                                {
+                                    validationView = ExecstackPatcher.AsShippedView(
+                                        existingFs,
+                                        flagOffset
+                                    );
+                                }
+                            }
+                            catch (InvalidDataException)
+                            {
+                                // Header is damaged: hash the raw bytes and let the chunk fail.
+                            }
+                        }
+                        var invalidChunks = ChunkValidator.ValidateFileChunks(
+                            validationView,
+                            file.Chunks
+                        );
 
                         if (invalidChunks.Count == 0)
                         {
@@ -1810,10 +2348,16 @@ public class SteamAuthService
 
                         // Some chunks invalid - only download those
                         chunksToDownload = invalidChunks;
+                        isRepair = true;
                         Logger.Log(
                             $"{_logPrefix} {file.FileName}: {invalidChunks.Count}/{file.Chunks.Count} chunks need repair"
                         );
                     }
+                }
+                else if (!forceRedownload && pinnedManifestId.HasValue)
+                {
+                    // Only worth a line on a repair pass; a fresh install is all missing files.
+                    Logger.Log($"{_logPrefix} {file.FileName}: missing, downloading");
                 }
 
                 // Download file chunks - must write at correct offsets
@@ -1877,7 +2421,7 @@ public class SteamAuthService
                     await fs.FlushAsync();
 
                     // Verify downloaded chunks by re-reading and checking checksums
-                    var failedChunks = ValidateFileChunks(fs, chunksToDownload);
+                    var failedChunks = ChunkValidator.ValidateFileChunks(fs, chunksToDownload);
                     if (failedChunks.Count > 0)
                     {
                         throw new Exception(
@@ -1906,6 +2450,14 @@ public class SteamAuthService
 
                 processedBytes += fileBytes;
                 processedFiles++;
+                if (isRepair)
+                {
+                    repairedFiles++;
+                }
+                else
+                {
+                    downloadedFiles++;
+                }
 
                 // Progress update every 100 files
                 if (processedFiles % 100 == 0 || processedFiles == totalFiles)
@@ -1935,6 +2487,10 @@ public class SteamAuthService
             // work instead of crashing.
             PruneContentManifest(downloadDir);
 
+            // glibc >= 2.41 refuses to dlopen the Galaxy libs unless their vestigial
+            // executable-stack flag is cleared (see ExecstackPatcher).
+            ExecstackPatcher.ClearGalaxyLibs(downloadDir, _logPrefix);
+
             // Save download marker to skip re-download next time
             SaveDownloadMarker(
                 downloadDir,
@@ -1946,7 +2502,8 @@ public class SteamAuthService
                 totalFiles
             );
 
-            Logger.LogTotal();
+            Logger.LogTotal($"{_logPrefix} Total time:");
+            return new DownloadSummary(repairedFiles, downloadedFiles, skippedExisting);
         }
         catch (Exception ex)
         {
@@ -1955,51 +2512,27 @@ public class SteamAuthService
         }
     }
 
+    /// <summary>
+    /// Reads the public branch's manifest id from a depot's product info
+    /// (<c>manifests/public/gid</c>, or the bare <c>manifests/public</c> value in the older layout).
+    /// </summary>
+    private ulong ResolvePublicManifestId(KeyValue depotInfo)
+    {
+        var publicManifest = depotInfo["manifests"]["public"];
+        var manifestIdStr = publicManifest["gid"].Value ?? publicManifest.Value;
+        if (string.IsNullOrEmpty(manifestIdStr))
+        {
+            Logger.Log($"{_logPrefix} Could not find manifest. Public manifest structure:");
+            PrintKeyValue(publicManifest, "  ", 5);
+            throw new Exception("Could not find public manifest gid");
+        }
+
+        return ulong.Parse(manifestIdStr);
+    }
+
     // ========================================================================
     // Helpers
     // ========================================================================
-
-    /// <summary>
-    /// Calculates Adler-32 checksum for a portion of a stream.
-    /// This is the same algorithm Steam uses for chunk validation.
-    /// </summary>
-    private static uint AdlerHash(Stream stream, int length)
-    {
-        uint a = 0,
-            b = 0;
-        for (var i = 0; i < length; i++)
-        {
-            var c = (uint)stream.ReadByte();
-            a = (a + c) % 65521;
-            b = (b + a) % 65521;
-        }
-        return a | (b << 16);
-    }
-
-    /// <summary>
-    /// Validates all chunks in a file against their expected checksums.
-    /// Returns list of chunks that need to be (re)downloaded.
-    /// </summary>
-    private static List<DepotManifest.ChunkData> ValidateFileChunks(
-        FileStream fs,
-        IEnumerable<DepotManifest.ChunkData> chunks
-    )
-    {
-        var invalidChunks = new List<DepotManifest.ChunkData>();
-
-        foreach (var chunk in chunks.OrderBy(c => c.Offset))
-        {
-            fs.Seek((long)chunk.Offset, SeekOrigin.Begin);
-            var actualChecksum = AdlerHash(fs, (int)chunk.UncompressedLength);
-
-            if (actualChecksum != chunk.Checksum)
-            {
-                invalidChunks.Add(chunk);
-            }
-        }
-
-        return invalidChunks;
-    }
 
     private static string FormatSize(long bytes)
     {

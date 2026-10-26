@@ -71,6 +71,9 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("merge-base --is-ancestor", workflow)
         self.assertNotIn("6500066a06b4f8358918cf3c244d3e4c23cfb4c6", workflow)
         self.assertIn("docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0", workflow)
+        for build_arg in ("AUTH_VERSION", "SOURCE_REVISION", "SOURCE_TREE_SHA256", "UPSTREAM_REVISION", "BUILD_DATE"):
+            self.assertIn(f"{build_arg}=${{{{ steps.", workflow)
+        self.assertIn("git archive HEAD tools/steam-service Directory.Build.props CodeStyle.props .editorconfig", workflow)
         for label in (
             "org.opencontainers.image.source",
             "org.opencontainers.image.revision",
@@ -80,6 +83,22 @@ class WorkflowContractTests(unittest.TestCase):
             "io.anxi.upstream.ref",
         ):
             self.assertIn(label, workflow)
+
+        self.assertIn("id: build", workflow)
+        self.assertNotIn("${{ env.DOCKERHUB_IMAGE }}:latest", workflow)
+        self.assertNotIn("${{ env.ACR_IMAGE }}:latest", workflow)
+
+    def test_panel_dispatch_contains_only_public_metadata_and_is_optional(self):
+        workflow = self.read("publish-steam-service.yml")
+        self.assertIn("steam-auth-cn-published", workflow)
+        self.assertIn("PANEL_REPOSITORY_DISPATCH_TOKEN", workflow)
+        self.assertIn("steps.build.outputs.digest", workflow)
+        for field in ("upstreamRef", "imageTag", "digest", "sourceRevision"):
+            self.assertIn(field, workflow)
+        payload = workflow.split("'{event_type:", 1)[1].split("}')", 1)[0]
+        for forbidden in ("password", "ticket", "session", "registry", "refresh"):
+            self.assertNotIn(forbidden, payload.lower())
+        self.assertNotIn("pull_request_target", workflow)
 
     def test_merged_sync_is_revalidated_then_tagged_and_published(self):
         workflow = self.read("release-merged-upstream-sync.yml")

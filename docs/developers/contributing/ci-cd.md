@@ -472,3 +472,23 @@ GitHub Actions caches can accumulate over time. This pipeline removes caches tha
 Most pipelines try to send notifications to Discord when builds complete or deployments finish.
 
 To enable notifications, the `DISCORD_WEBHOOK_URL` repository secret needs to be set with a [Discord webhook URL](https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks).
+
+## Panel compatibility-matrix notification
+
+`publish-steam-service.yml` publishes only exact version tags to Docker Hub, ACR,
+and GHCR. The build output digest is recorded in the GitHub release. Mutable
+`latest` tags are intentionally not part of the release train.
+
+After the exact release and GitHub release succeed, the workflow may send
+`repository_dispatch` event `steam-auth-cn-published` to the Panel repository.
+Configure public variable `PANEL_REPOSITORY` and secret
+`PANEL_REPOSITORY_DISPATCH_TOKEN`. Prefer a GitHub App or fine-grained token
+limited to the target Panel repository and only the permission needed to create
+repository dispatches. If either value is absent, publishing succeeds without
+notification.
+
+The payload is public metadata only: `upstreamRef`, `imageTag`, `digest`, and
+`sourceRevision`. It never includes Docker credentials, Steam credentials,
+steam-session, refresh tokens, or app tickets. The Panel receiver creates or
+updates an idempotent `discovered` PR; it cannot modify main, recommend a stack,
+tag, or publish an image.

@@ -11,6 +11,7 @@
  *   download     - Download/update game depot (uses saved session or token)
  *   ticket       - Output encrypted app ticket to stdout
  *   export-token - Output saved refresh token for CI use
+ *   renew        - Ask Steam to renew saved refresh tokens (stop serve first)
  *   serve        - Run HTTP API for runtime ticket requests (default)
  *
  * Environment Variables (JSON format - preferred for multi-account):
@@ -21,6 +22,10 @@
  *   STEAM_USERNAME        - Username (fallback if STEAM_ACCOUNTS not set)
  *   STEAM_PASSWORD        - Password (fallback if STEAM_ACCOUNTS not set)
  *   STEAM_REFRESH_TOKEN   - Refresh token (fallback if STEAM_ACCOUNTS not set)
+ *
+ * Environment Variables (serve):
+ *   VALIDATE_ON_BOOT      - "false" skips the boot-time chunk-hash validation/repair of the
+ *                           installed game depot (default: enabled)
  *
  * HTTP API Query Parameters:
  *   ?account=N            - Use account N for the request (default: 0)
@@ -41,8 +46,12 @@ var port = int.Parse(Environment.GetEnvironmentVariable("PORT") ?? "3001");
 const uint StardewValleyAppId = 413150;
 const uint SteamworksSdkAppId = 1007; // Steamworks SDK Redistributable (steamclient.so)
 
+// One game validate/repair pass at a time (boot pass and POST /game/validate).
+var gameValidationLock = new SemaphoreSlim(1, 1);
+
 // Parse command
 var command = args.Length > 0 ? args[0].ToLower() : "serve";
+var isInteractiveCommand = command is "setup" or "login";
 
 string? GetEnvTrimmed(string name)
 {
@@ -126,6 +135,31 @@ Dictionary<int, (string user, string? pass, string? token)> DiscoverAccounts()
     if (user != null)
     {
         result[0] = (user, pass, token);
+        return result;
+    }
+
+    // No env account (guided installer): the newest saved session becomes account 0 so the headless
+    // commands work without STEAM_USERNAME; newest wins so a re-run or renewal never revives a
+    // stale token. Interactive commands stay account-less so they reach the picker in
+    // LoginInteractiveAsync instead.
+    if (isInteractiveCommand)
+    {
+        return result;
+    }
+
+    var sessions = SteamAuthService.FindSessions(sessionDir);
+    if (sessions.Count > 0)
+    {
+        var chosen = sessions[0].username;
+        Logger.Log($"[SteamService] Using saved session for {chosen} as account 0");
+        if (sessions.Count > 1)
+        {
+            var others = string.Join(", ", sessions.Skip(1).Select(s => s.username));
+            Logger.Log(
+                $"[SteamService] Other saved sessions: {others}. Set STEAM_USERNAME to use one of them."
+            );
+        }
+        result[0] = (chosen, null, null);
     }
 
     return result;
@@ -167,14 +201,44 @@ async Task LoginAccountAsync(
     {
         await svc.EnsureLoggedInAsync(loginConfig);
     }
-    catch (InvalidOperationException)
+    catch (InvalidOperationException ex)
     {
-        // No auth method configured — match prior log message for operators.
-        Logger.Log(
-            $"[SteamService] A{svc.AccountIndex}: No authentication method for {config.user}"
-        );
-        Logger.Log($"[SteamService] Provide credentials via STEAM_ACCOUNTS JSON or run 'setup'");
+        // No auth method; the exception text tells the operator what to set.
+        Logger.Log($"[SteamService] {ex.Message}");
     }
+}
+
+/// <summary>
+/// Logs an account in for the interactive `setup`/`login` commands: honors configured credentials
+/// non-interactively (token → saved session → password, same chain as `serve`), and falls back to
+/// the interactive password/QR flow only when there's no saved session and no credentials.
+/// </summary>
+async Task LoginOrInteractiveAsync(
+    int idx,
+    SteamAuthService svc,
+    (string user, string? pass, string? token) cfg
+)
+{
+    if (svc.HasSavedSession() || cfg.token != null || cfg.pass != null)
+    {
+        Logger.Log($"[SteamService] Account {idx}: Logging in with configured credentials...");
+        await svc.EnsureLoggedInAsync(
+            new SteamAuthService.LoginConfig(cfg.user, cfg.pass, cfg.token)
+        );
+    }
+    else
+    {
+        Logger.Log(
+            $"[SteamService] Account {idx}: No saved session or credentials, starting interactive login..."
+        );
+        await svc.LoginInteractiveAsync();
+    }
+
+    Logger.Log(
+        svc.IsLoggedIn
+            ? $"[SteamService] Account {idx}: Logged in as {svc.SteamId}"
+            : $"[SteamService] Account {idx}: Login failed"
+    );
 }
 
 // ============================================================================
@@ -207,8 +271,9 @@ switch (command)
         if (accounts.Count == 0)
         {
             // No accounts configured; run interactive setup for account 0
+            Console.WriteLine();
             Logger.Log("[SteamService] No accounts configured, running interactive setup...");
-            var svc = new SteamAuthService(0, "setup", sessionDir, gameDir);
+            var svc = new SteamAuthService(0, "", sessionDir, gameDir);
             await svc.LoginInteractiveAsync();
             if (svc.IsLoggedIn)
             {
@@ -224,32 +289,10 @@ switch (command)
             foreach (var (idx, svc) in accounts.OrderBy(kv => kv.Key))
             {
                 Logger.Log($"[SteamService] --- Account {idx}: {svc.Username} ---");
-                if (svc.HasSavedSession())
+                await LoginOrInteractiveAsync(idx, svc, accountConfigs[idx]);
+                if (svc.IsLoggedIn && downloadAccount == null)
                 {
-                    Logger.Log($"[SteamService] Account {idx}: Found saved session, logging in...");
-                    await svc.EnsureLoggedInAsync(
-                        new SteamAuthService.LoginConfig(svc.Username, null, null)
-                    );
-                }
-                else
-                {
-                    Logger.Log(
-                        $"[SteamService] Account {idx}: No saved session, starting interactive login..."
-                    );
-                    await svc.LoginInteractiveAsync();
-                }
-
-                if (svc.IsLoggedIn)
-                {
-                    Logger.Log($"[SteamService] Account {idx}: Logged in as {svc.SteamId}");
-                    if (downloadAccount == null)
-                    {
-                        downloadAccount = svc;
-                    }
-                }
-                else
-                {
-                    Logger.Log($"[SteamService] Account {idx}: Login failed");
+                    downloadAccount = svc;
                 }
             }
 
@@ -268,8 +311,9 @@ switch (command)
     case "login":
         if (accounts.Count == 0)
         {
+            Console.WriteLine();
             Logger.Log("[SteamService] No accounts configured, running interactive login...");
-            var svc = new SteamAuthService(0, "login", sessionDir, gameDir);
+            var svc = new SteamAuthService(0, "", sessionDir, gameDir);
             await svc.LoginInteractiveAsync();
             svc.Disconnect();
         }
@@ -279,29 +323,52 @@ switch (command)
             foreach (var (idx, svc) in accounts.OrderBy(kv => kv.Key))
             {
                 Logger.Log($"[SteamService] --- Account {idx}: {svc.Username} ---");
-                if (svc.HasSavedSession())
+                await LoginOrInteractiveAsync(idx, svc, accountConfigs[idx]);
+            }
+        }
+        break;
+
+    case "renew":
+        // Opens its own Steam session per account, and Steam allows one live session per account,
+        // so stop serve first. While serve runs, POST /steam/renew-token does the same in-session.
+        if (accounts.Count == 0)
+        {
+            Logger.Log(
+                "[SteamService] No account configured (set STEAM_USERNAME or STEAM_ACCOUNTS)"
+            );
+            Environment.Exit(1);
+        }
+
+        foreach (var (idx, svc) in accounts.OrderBy(kv => kv.Key))
+        {
+            Logger.Log($"[SteamService] --- Account {idx}: {svc.Username} ---");
+            try
+            {
+                await LoginAccountAsync(svc, accountConfigs[idx]);
+                if (!svc.IsLoggedIn)
                 {
-                    Logger.Log($"[SteamService] Account {idx}: Found saved session, logging in...");
-                    await svc.EnsureLoggedInAsync(
-                        new SteamAuthService.LoginConfig(svc.Username, null, null)
-                    );
-                }
-                else
-                {
-                    Logger.Log(
-                        $"[SteamService] Account {idx}: No saved session, starting interactive login..."
-                    );
-                    await svc.LoginInteractiveAsync();
+                    continue;
                 }
 
-                if (svc.IsLoggedIn)
-                {
-                    Logger.Log($"[SteamService] Account {idx}: Logged in as {svc.SteamId}");
-                }
-                else
-                {
-                    Logger.Log($"[SteamService] Account {idx}: Login failed");
-                }
+                var result = await svc.RenewRefreshTokenAsync();
+                Console.WriteLine(
+                    JsonSerializer.Serialize(
+                        new
+                        {
+                            account = idx,
+                            username = svc.Username,
+                            renewed = result.Renewed,
+                            outcome = SteamAuthService.OutcomeName(result.Outcome),
+                            error = result.Error,
+                            previous_expires_at = result.PreviousExpiry?.ToString("o"),
+                            expires_at = result.NewExpiry?.ToString("o"),
+                        }
+                    )
+                );
+            }
+            catch (Exception ex)
+            {
+                Logger.Log($"[SteamService] A{idx}: Token renewal failed: {ex.Message}");
             }
         }
         break;
@@ -375,6 +442,7 @@ switch (command)
         Console.WriteLine("  download     Download/update game depot");
         Console.WriteLine("  ticket       Output encrypted app ticket to stdout");
         Console.WriteLine("  export-token Export saved refresh tokens (for CI)");
+        Console.WriteLine("  renew        Renew saved refresh tokens (stop serve first)");
         Console.WriteLine("  serve        Run HTTP API (default)");
         Environment.Exit(1);
         return;
@@ -392,18 +460,24 @@ return;
 // Helper functions
 // ============================================================================
 
+/// <summary>
+/// SDK first: the game container launches as soon as the game's completion marker appears and
+/// only links an SDK that is already on the volume.
+/// </summary>
+async Task DownloadGameAndSdkAsync(SteamAuthService svc)
+{
+    if (!args.Contains("--skip-sdk"))
+    {
+        await svc.DownloadGameAsync(SteamworksSdkAppId, Path.Combine(gameDir, ".steam-sdk"));
+    }
+    await svc.DownloadGameAsync(StardewValleyAppId);
+}
+
 async Task DownloadAllAsync(SteamAuthService svc)
 {
     try
     {
-        await svc.DownloadGameAsync(StardewValleyAppId);
-
-        // Also download Steamworks SDK for GameServer mode (unless --skip-sdk)
-        if (!args.Contains("--skip-sdk"))
-        {
-            var steamSdkDir = Path.Combine(gameDir, ".steam-sdk");
-            await svc.DownloadGameAsync(SteamworksSdkAppId, steamSdkDir);
-        }
+        await DownloadGameAndSdkAsync(svc);
     }
     catch (Exception ex)
     {
@@ -430,11 +504,12 @@ async Task RunHttpServerAsync(
 
     var app = builder.Build();
 
-    // Correlation middleware: reads the inbound X-Request-Id header, binds it
-    // to SidecarRequestContext for the request duration, and echoes it on
-    // the response. Events emitted inside the pipeline (Logger.LogEvent)
-    // carry this id so the test harness can stitch sidecar events to the
-    // triggering mod request. Missing/blank headers leave Current == null.
+    // Correlation middleware: reads the inbound X-Request-Id / X-Test-Id
+    // headers, binds them to SidecarRequestContext for the request duration,
+    // and echoes the request id on the response. Events emitted inside the
+    // pipeline (Logger.LogEvent) carry both so the test harness can stitch
+    // sidecar events to the triggering mod request and to the originating
+    // test. A missing header leaves its id null.
     app.Use(
         async (ctx, next) =>
         {
@@ -444,7 +519,8 @@ async Task RunHttpServerAsync(
                 ctx.Response.Headers["X-Request-Id"] = requestId;
             }
 
-            using var _scope = SidecarRequestContext.Begin(requestId);
+            string? testId = ctx.Request.Headers["X-Test-Id"].FirstOrDefault();
+            using var _scope = SidecarRequestContext.Bind(requestId, testId);
             await next();
         }
     );
@@ -589,6 +665,48 @@ async Task RunHttpServerAsync(
         }
     );
 
+    // Renews over the live session, so it never collides with serve's own login the way a
+    // second `renew` process would (Steam allows one session per account).
+    app.MapPost(
+        "/steam/renew-token",
+        async (HttpContext ctx) =>
+        {
+            try
+            {
+                var svc = await EnsureAccountReadyAsync(ctx);
+                if (svc.TokenFromEnv)
+                {
+                    return Results.Json(
+                        new
+                        {
+                            error = "Token was supplied via environment; renewing it here would "
+                                + "invalidate that copy. Mint a new one with setup + export-token "
+                                + "and update the environment value.",
+                        },
+                        statusCode: 409
+                    );
+                }
+
+                var result = await svc.RenewRefreshTokenAsync();
+                return Results.Json(
+                    new
+                    {
+                        renewed = result.Renewed,
+                        outcome = SteamAuthService.OutcomeName(result.Outcome),
+                        error = result.Error,
+                        previous_expires_at = result.PreviousExpiry?.ToString("o"),
+                        expires_at = result.NewExpiry?.ToString("o"),
+                    }
+                );
+            }
+            catch (Exception ex)
+            {
+                Logger.Log($"[HTTP] Token renewal failed: {ex.Message}");
+                return Results.Json(new { error = ex.Message }, statusCode: 500);
+            }
+        }
+    );
+
     // ========================================================================
     // Lobby Management Endpoints (always use account from ?account=N, default 0)
     // ========================================================================
@@ -709,6 +827,76 @@ async Task RunHttpServerAsync(
         }
     );
 
+    // Read by the game container's entrypoint (wait_for_content_validation in startapp.sh),
+    // which holds the game back while status is pending/running. Pure read, like /health.
+    var contentValidator = new GameContentValidator();
+    app.MapGet("/game/validate-status", () => Results.Json(contentValidator.Current.ToJson()));
+
+    // On-demand validate/repair of a game directory (default: GAME_DIR), synchronous: the
+    // response is the pass's outcome. Serialized with the boot pass so two passes never
+    // rewrite one file at once. `target_dir` lets the E2E suite exercise the repair path on a
+    // scratch copy of the game volume without disturbing the live install.
+    app.MapPost(
+        "/game/validate",
+        async (HttpContext ctx) =>
+        {
+            try
+            {
+                var svc = await EnsureAccountReadyAsync(ctx);
+                var targetDir = ctx.Request.Query["target_dir"].FirstOrDefault() ?? gameDir;
+                // Only the install or a scratch copy under the temp dir: the pass writes depot
+                // files into whatever it is pointed at.
+                var isScratch = Path.GetFullPath(targetDir)
+                    .StartsWith(Path.GetTempPath(), StringComparison.Ordinal);
+                if (targetDir != gameDir && !isScratch)
+                {
+                    return Results.Json(
+                        new
+                        {
+                            error = $"target_dir must be {gameDir} or a directory under {Path.GetTempPath()}",
+                        },
+                        statusCode: 400
+                    );
+                }
+                if (!Directory.Exists(targetDir))
+                {
+                    return Results.Json(
+                        new { error = $"target_dir not found: {targetDir}" },
+                        statusCode: 400
+                    );
+                }
+
+                var validator = new GameContentValidator();
+                SteamAuthService.DownloadSummary? summary = null;
+                await validator.RunAsync(async () =>
+                {
+                    summary = await RunGameContentValidationAsync(svc, targetDir);
+                    return summary.ToString();
+                });
+
+                var outcome = validator.Current;
+                return Results.Json(
+                    new
+                    {
+                        status = GameContentValidator.StateName(outcome.State),
+                        detail = outcome.Detail,
+                        target_dir = targetDir,
+                        files_repaired = summary?.FilesRepaired,
+                        files_downloaded = summary?.FilesDownloaded,
+                        files_unchanged = summary?.FilesUnchanged,
+                        started_at = outcome.StartedAt?.ToString("o"),
+                        finished_at = outcome.FinishedAt?.ToString("o"),
+                    }
+                );
+            }
+            catch (Exception ex)
+            {
+                Logger.Log($"[HTTP] Game validation failed to start: {ex.Message}");
+                return Results.Json(new { error = ex.Message }, statusCode: 500);
+            }
+        }
+    );
+
     Logger.Log($"[SteamService] HTTP API listening on port {httpPort}");
     Logger.Log($"[SteamService] {accts.Count} account(s) configured");
     Console.WriteLine("[SteamService] Endpoints:");
@@ -716,7 +904,21 @@ async Task RunHttpServerAsync(
     Console.WriteLine("  GET  /steam/ready         - Readiness check (?account=N)");
     Console.WriteLine("  GET  /steam/app-ticket    - Get encrypted app ticket (?account=N)");
     Console.WriteLine("  GET  /steam/refresh-token - Get refresh token (?account=N)");
+    Console.WriteLine("  POST /steam/renew-token   - Renew the refresh token (?account=N)");
     Console.WriteLine("  POST /steam/lobby/create  - Create lobby (?account=N)");
+    Console.WriteLine("  GET  /game/validate-status - Boot-time game content validation state");
+    Console.WriteLine(
+        "  POST /game/validate       - Validate/repair game files now (?account=N&target_dir=)"
+    );
+
+    // Volumes provisioned before the execstack patch existed still carry the flag on the
+    // Galaxy libs; fresh downloads are handled by the download-completion hook. Only runs
+    // when the marker guarantees no download is writing these files.
+    var gameDownloadMarker = Path.Combine(gameDir, $".download-manifest-{StardewValleyAppId}");
+    if (File.Exists(gameDownloadMarker))
+    {
+        ExecstackPatcher.ClearGalaxyLibs(gameDir, "[SteamService]");
+    }
 
     // Auto-login all configured accounts in parallel
     var loginTasks = accts.Select(async kv =>
@@ -741,7 +943,274 @@ async Task RunHttpServerAsync(
 
     await Task.WhenAll(loginTasks);
 
+    _ = Task.Run(() => MaintainTokensAsync(accts));
+
+    // First-run bootstrap, so a fresh `docker compose up` self-provisions without a manual `setup`.
+    // Keyed on the completion marker startapp.sh gates on, so a half-finished download resumes
+    // instead of passing for done. Off the request path so /health comes up first; shutdown just
+    // aborts the in-flight download, which resumes next boot.
+    if (!File.Exists(gameDownloadMarker))
+    {
+        // The marker is the gate for a first-run download, so nothing waits on the validator.
+        contentValidator.MarkSkipped("no completed game download to validate");
+        if (GetEnvTrimmed("AUTO_DOWNLOAD_ON_BOOT")?.ToLowerInvariant() == "false")
+        {
+            contentValidator.MarkDisabled(
+                "AUTO_DOWNLOAD_ON_BOOT=false; verified completion marker required"
+            );
+            Logger.Log(
+                "[SteamService] Automatic game download is disabled; use the Panel install or migration workflow to prepare the verified game runtime."
+            );
+        }
+        else if (accts.Count == 0)
+        {
+            Logger.Log(
+                "[SteamService] Game files missing and no Steam account is configured — cannot "
+                    + "auto-download. Set STEAM_USERNAME/STEAM_PASSWORD (or STEAM_ACCOUNTS), or run `setup`."
+            );
+        }
+        else
+        {
+            _ = Task.Run(() => BootstrapGameFilesAsync(accts, configs));
+        }
+    }
+    else if (GetEnvTrimmed("VALIDATE_ON_BOOT")?.ToLowerInvariant() == "false")
+    {
+        contentValidator.MarkDisabled("VALIDATE_ON_BOOT=false");
+    }
+    else if (accts.Count == 0)
+    {
+        contentValidator.MarkSkipped("no Steam account configured");
+    }
+    else
+    {
+        // Runs while the HTTP server is already up, so a slow disk can't fail the healthcheck.
+        _ = Task.Run(() => ValidateGameContentAsync(contentValidator, accts, configs));
+    }
+
     await app.RunAsync();
+}
+
+/// <summary>
+/// Boot-time self-heal for corrupt game content on the shared game volume. Best-effort: any
+/// failure (no usable login, Steam down, disk error) is logged and reaches a terminal state,
+/// because the game container waits on it and must still boot; the operator runbook
+/// (`download`) stays the fallback. Uses account 0's one Steam session, like the first-run
+/// bootstrap.
+/// </summary>
+async Task ValidateGameContentAsync(
+    GameContentValidator validator,
+    Dictionary<int, SteamAuthService> accts,
+    Dictionary<int, (string user, string? pass, string? token)> configs
+)
+{
+    var (accountIndex, svc) = accts.OrderBy(kv => kv.Key).First();
+    var cfg = configs[accountIndex];
+    var loginConfig = new SteamAuthService.LoginConfig(cfg.user, cfg.pass, cfg.token);
+
+    Logger.Log(
+        "[SteamService] Validating installed game files (repairs corrupt chunks in place)..."
+    );
+    await validator.RunAsync(async () =>
+    {
+        await svc.EnsureLoggedInAsync(loginConfig);
+        var summary = await RunGameContentValidationAsync(svc, gameDir);
+        return summary.ToString();
+    });
+
+    var outcome = validator.Current;
+    if (outcome.State == GameContentValidator.State.Completed)
+    {
+        Logger.Log($"[SteamService] Game file validation complete: {outcome.Detail}.");
+    }
+    else
+    {
+        Logger.Log(
+            $"[SteamService] WARNING: Game file validation failed: {outcome.Detail}. The server "
+                + "starts with the files as they are; corrupt content is repaired by "
+                + "`docker compose run --rm steam-auth download` once Steam login works."
+        );
+    }
+}
+
+/// <summary>
+/// Chunk-hash validates the game depot in <paramref name="targetDir"/> and re-downloads the bad
+/// chunks, pinned to the manifest recorded by the directory's completion marker so a repair
+/// never doubles as an unattended game update. One pass at a time process-wide: two passes on
+/// the same directory would contend for the files they rewrite.
+/// </summary>
+async Task<SteamAuthService.DownloadSummary> RunGameContentValidationAsync(
+    SteamAuthService svc,
+    string targetDir
+)
+{
+    await gameValidationLock.WaitAsync();
+    try
+    {
+        // A repair is only a repair while it can pin the installed version; without the id the
+        // pass would fetch the current public manifest, which is an unattended game update.
+        var installedManifestId =
+            SteamAuthService.ReadInstalledManifestId(targetDir, StardewValleyAppId)
+            ?? throw new InvalidOperationException(
+                $"completion marker in {targetDir} is missing or unreadable, so the installed "
+                    + "manifest is unknown; run `download` to reinstall or update explicitly"
+            );
+        return await svc.DownloadGameAsync(
+            StardewValleyAppId,
+            targetDir,
+            pinnedManifestId: installedManifestId
+        );
+    }
+    finally
+    {
+        gameValidationLock.Release();
+    }
+}
+
+/// <summary>
+/// Retries with back-off instead of failing serve: the game container waits on the marker
+/// indefinitely, so a CDN or login flake must heal without an operator restart. Uses account 0's
+/// one Steam session (login is serialized per account), so no second login can overlap the
+/// ticket endpoints. Each app's own marker skips it once complete, so a retry after a partial
+/// success fetches only what is missing.
+/// </summary>
+async Task BootstrapGameFilesAsync(
+    Dictionary<int, SteamAuthService> accts,
+    Dictionary<int, (string user, string? pass, string? token)> configs
+)
+{
+    var (accountIndex, svc) = accts.OrderBy(kv => kv.Key).First();
+    var cfg = configs[accountIndex];
+    var loginConfig = new SteamAuthService.LoginConfig(cfg.user, cfg.pass, cfg.token);
+    var delay = TimeSpan.FromSeconds(30);
+    var maxDelay = TimeSpan.FromMinutes(5);
+
+    for (var attempt = 1; ; attempt++)
+    {
+        try
+        {
+            Logger.Log(
+                $"[SteamService] Game files not found, downloading on first run (attempt {attempt})..."
+            );
+            await svc.EnsureLoggedInAsync(loginConfig);
+            // Same lock as the validate/repair passes: a POST /game/validate must not write the
+            // volume while the first-run download is filling it.
+            await gameValidationLock.WaitAsync();
+            try
+            {
+                await DownloadGameAndSdkAsync(svc);
+            }
+            finally
+            {
+                gameValidationLock.Release();
+            }
+            Logger.Log("[SteamService] First-run game download complete.");
+            return;
+        }
+        catch (Exception ex)
+        {
+            Logger.Log(
+                $"[SteamService] First-run game download failed (attempt {attempt}): {ex.Message}. "
+                    + $"Retrying in {delay.TotalSeconds:0}s."
+            );
+            await Task.Delay(delay);
+            delay = TimeSpan.FromTicks(Math.Min(delay.Ticks * 2, maxDelay.Ticks));
+        }
+    }
+}
+
+/// <summary>
+/// Daily per-account maintenance. The renewal request is unconditional because Steam only issues
+/// a new token close to expiry and does not publish the window, so there is nothing to gate on.
+/// Environment-supplied tokens are skipped: Steam invalidates the old token on renewal, which
+/// would leave the environment copy stale.
+/// </summary>
+async Task MaintainTokensAsync(Dictionary<int, SteamAuthService> accts)
+{
+    foreach (var svc in accts.Values.Where(s => s.TokenFromEnv))
+    {
+        Logger.Log(
+            $"[SteamService] A{svc.AccountIndex} ({svc.Username}): token renewal is off for "
+                + "environment-supplied tokens, because Steam invalidates the old token on renewal "
+                + "and the environment copy would go stale. Mint a new one with `setup` + "
+                + "`export-token` before it expires."
+        );
+    }
+
+    var threshold = TimeSpan.FromDays(14);
+    while (true)
+    {
+        foreach (var svc in accts.Values)
+        {
+            // Fire-and-forget loop: a throw from the free-text logger in the warning path would
+            // otherwise kill it silently. LogEvent never throws.
+            try
+            {
+                if (svc.IsLoggedIn && !svc.TokenFromEnv)
+                {
+                    try
+                    {
+                        await svc.RenewRefreshTokenAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Log(
+                            $"[SteamService] A{svc.AccountIndex}: Token renewal failed: {ex.Message}"
+                        );
+                    }
+                }
+
+                if (svc.TokenExpiresAt is not { } expiry)
+                {
+                    continue;
+                }
+
+                var remaining = expiry - DateTimeOffset.UtcNow;
+                if (remaining > threshold)
+                {
+                    continue;
+                }
+
+                const string setup = "`docker compose run --rm -it steam-auth setup`";
+                var lastAttempt = $"last attempt {svc.LastRenewalAttemptAt:yyyy-MM-dd HH:mm} UTC";
+                var renewalState = svc.TokenFromEnv
+                    ? $"Renewal is off for environment-supplied tokens; mint a new one with {setup} + `export-token` and update the variable."
+                    : svc.LastRenewalOutcome switch
+                    {
+                        SteamAuthService.TokenRenewalOutcome.Refused =>
+                            $"Steam declined to renew it today ({lastAttempt}). Re-run {setup} before then.",
+                        SteamAuthService.TokenRenewalOutcome.Failed =>
+                            $"Renewal failed with {svc.LastRenewalError} ({lastAttempt}). Re-run {setup} before then.",
+                        _ => $"No renewal attempt has completed yet. Re-run {setup} before then.",
+                    };
+
+                Logger.Log(
+                    $"[SteamService] WARNING: A{svc.AccountIndex} ({svc.Username}) refresh token "
+                        + $"expires {expiry:yyyy-MM-dd} UTC ({Math.Max(0, (int)remaining.TotalDays)} days). "
+                        + renewalState
+                );
+                Logger.LogEvent(
+                    "account_token_expiring",
+                    new
+                    {
+                        account = svc.AccountIndex,
+                        expiresAt = expiry.ToString("o"),
+                        daysRemaining = (int)remaining.TotalDays,
+                        lastRenewalOutcome = SteamAuthService.OutcomeName(svc.LastRenewalOutcome),
+                    }
+                );
+            }
+            catch (Exception ex)
+            {
+                Logger.LogEvent(
+                    "account_token_maintenance_error",
+                    new { account = svc.AccountIndex, error = ex.Message }
+                );
+            }
+        }
+
+        await Task.Delay(TimeSpan.FromDays(1));
+    }
 }
 
 // ============================================================================

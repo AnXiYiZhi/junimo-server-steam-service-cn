@@ -65,6 +65,17 @@ def parse_fork_tag(value: str) -> dict[str, str]:
     return {"version": version, "upstream_tag": upstream_tag}
 
 
+def pinned_upstream_revision(path: str, requested_tag: str) -> str:
+    parse_upstream_tag(requested_tag)
+    manifest = json.loads(Path(path).read_text(encoding="utf-8"))
+    if manifest.get("upstreamTag") != requested_tag:
+        raise ValueError("release tag does not match the reviewed Auth upstream manifest")
+    revision = manifest.get("upstreamRevision", "")
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError("Auth upstream revision must be an exact lowercase commit SHA")
+    return revision
+
+
 def discover(tags: Iterable[str], requested: str = "") -> list[UpstreamTag]:
     parsed: list[UpstreamTag] = []
     for raw in tags:
@@ -120,6 +131,10 @@ def main() -> int:
     release_parser.add_argument("--tag", required=True)
     release_parser.add_argument("--github-output", required=True)
 
+    source_parser = subparsers.add_parser("source")
+    source_parser.add_argument("--tag", required=True)
+    source_parser.add_argument("--manifest", required=True)
+
     args = parser.parse_args()
     try:
         if args.command == "discover":
@@ -139,6 +154,8 @@ def main() -> int:
                     "recommended_fork_tag": tag.recommended_fork_tag,
                 },
             )
+        elif args.command == "source":
+            print(pinned_upstream_revision(args.manifest, args.tag))
         else:
             values = parse_fork_tag(args.tag)
             values["created"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

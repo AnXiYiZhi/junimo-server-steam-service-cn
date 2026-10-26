@@ -48,18 +48,23 @@ jobs:
           echo "ghcr_image=ghcr.io/${ghcr_owner}/junimo-steam-service-cn" >> "$GITHUB_OUTPUT"
           echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Verify the tag contains its exact upstream release
+      - name: Verify the tag contains the pinned Auth upstream release
+        id: source
         env:
           RELEASE_SHA: ${{ steps.meta.outputs.release_sha }}
           UPSTREAM_TAG: ${{ steps.meta.outputs.upstream_tag }}
         run: |
           set -euo pipefail
-          git fetch --no-tags "https://github.com/stardew-valley-dedicated-server/server.git" \
-            "+refs/tags/${UPSTREAM_TAG}:refs/upstream-tags/${UPSTREAM_TAG}"
-          git merge-base --is-ancestor "refs/upstream-tags/${UPSTREAM_TAG}" "$RELEASE_SHA" || {
+          upstream_revision="$(python .github/scripts/upstream_release.py source \
+            --tag "$UPSTREAM_TAG" --manifest tools/steam-service/upstream-release.json)"
+          git fetch --no-tags "https://github.com/stardew-valley-dedicated-server/server.git" "$upstream_revision"
+          git merge-base --is-ancestor "$upstream_revision" "$RELEASE_SHA" || {
             echo "::error::Fork tag does not contain exact upstream tag ${UPSTREAM_TAG}."
             exit 1
           }
+          echo "upstream_revision=$upstream_revision" >> "$GITHUB_OUTPUT"
+          source_tree_sha256="$(git archive HEAD tools/steam-service Directory.Build.props CodeStyle.props .editorconfig | sha256sum | awk '{print $1}')"
+          echo "source_tree_sha256=$source_tree_sha256" >> "$GITHUB_OUTPUT"
 
       - name: Set up .NET
         uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5.3.0
@@ -96,20 +101,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push exact and trial tags
+      - name: Build and push exact tags
+        id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: ./tools/steam-service/Dockerfile
           platforms: linux/amd64
           push: true
+          build-args: |
+            AUTH_VERSION=${{ steps.meta.outputs.version }}
+            SOURCE_REVISION=${{ steps.meta.outputs.release_sha }}
+            SOURCE_TREE_SHA256=${{ steps.source.outputs.source_tree_sha256 }}
+            UPSTREAM_REVISION=${{ steps.source.outputs.upstream_revision }}
+            BUILD_DATE=${{ steps.meta.outputs.created }}
           tags: |
             ${{ env.DOCKERHUB_IMAGE }}:${{ steps.meta.outputs.version }}
-            ${{ env.DOCKERHUB_IMAGE }}:latest
             ${{ env.ACR_IMAGE }}:${{ steps.meta.outputs.version }}
-            ${{ env.ACR_IMAGE }}:latest
             ${{ steps.meta.outputs.ghcr_image }}:${{ steps.meta.outputs.version }}
-            ${{ steps.meta.outputs.ghcr_image }}:latest
           labels: |
             org.opencontainers.image.title=junimo-steam-service-cn
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
@@ -117,7 +126,8 @@ jobs:
             org.opencontainers.image.version=${{ steps.meta.outputs.version }}
             org.opencontainers.image.created=${{ steps.meta.outputs.created }}
             io.anxi.upstream.tag=${{ steps.meta.outputs.upstream_tag }}
-            io.anxi.upstream.ref=refs/upstream-tags/${{ steps.meta.outputs.upstream_tag }}
+            io.anxi.upstream.revision=${{ steps.source.outputs.upstream_revision }}
+            io.anxi.upstream.url=https://github.com/stardew-valley-dedicated-server/server/commit/${{ steps.source.outputs.upstream_revision }}
           cache-from: type=gha,scope=steam-service-cn
           cache-to: type=gha,mode=max,scope=steam-service-cn
 
@@ -130,3 +140,35 @@ jobs:
           body: |
             Upstream: `${{ steps.meta.outputs.upstream_tag }}`
             Image tag: `${{ steps.meta.outputs.version }}`
+            Image digest: `${{ steps.build.outputs.digest }}`
+
+      - name: Notify Panel with public release metadata
+        if: ${{ vars.PANEL_REPOSITORY != '' }}
+        shell: bash
+        env:
+          PANEL_REPOSITORY: ${{ vars.PANEL_REPOSITORY }}
+          PANEL_TOKEN: ${{ secrets.PANEL_REPOSITORY_DISPATCH_TOKEN }}
+          UPSTREAM_TAG: ${{ steps.meta.outputs.upstream_tag }}
+          IMAGE_TAG: ${{ steps.meta.outputs.version }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          SOURCE_REVISION: ${{ steps.meta.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PANEL_TOKEN" ]; then
+            echo "::notice::Panel dispatch token is not configured; skipping optional notification."
+            exit 0
+          fi
+          case "$PANEL_REPOSITORY" in (*/*) ;; (*) exit 1;; esac
+          payload="$(jq -cn \
+            --arg upstreamRef "refs/tags/${UPSTREAM_TAG}" \
+            --arg imageTag "$IMAGE_TAG" \
+            --arg digest "$IMAGE_DIGEST" \
+            --arg sourceRevision "$SOURCE_REVISION" \
+            '{event_type:"steam-auth-cn-published",client_payload:{upstreamRef:$upstreamRef,imageTag:$imageTag,digest:$digest,sourceRevision:$sourceRevision}}')"
+          curl --fail --silent --show-error \
+            --request POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${PANEL_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${PANEL_REPOSITORY}/dispatches" \
+            --data "$payload"

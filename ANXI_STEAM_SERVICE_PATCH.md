@@ -1,5 +1,33 @@
 # Anxi Steam Service Patch Plan
 
+## 2026-10-26 upstream-aligned Auth release
+
+The .140 Auth release is named `1.5.0-preview.140-anxi.1`, with fork tag `sdvd-server-v1.5.0-preview.140-anxi.1`. This keeps the upstream preview build visible and starts the fork patch sequence for that upstream version. The earlier local `1.5.0-anxi.3` image was an engineering candidate for the same .140 protocol; it is not the public release name.
+
+`tools/steam-service/upstream-release.json` pins upstream `preview-1.5.0.140` to commit `f318717ac06a780b6b21080b0263c16278d8e6e1`. Upstream preview tags may be removed, so publication fetches this reviewed commit directly and still requires it to be a real ancestor of the release commit. A mismatched version or nonexact revision fails publication. The fork retains its connection wait, bounded connection/authentication retries and pure health/readiness behavior.
+
+The authorized publication covers this Auth repository and its fixed image tag in the existing Docker Hub, GHCR and Alibaba Cloud repositories. Panel 0.7.3/0.8.0 publication remains deferred. The previous local dedicated-account migration and invitation-code acceptance are recorded below; final release identity and publication evidence will be added after verification.
+
+## 2026-10-25 fixed local Auth candidate and Panel upgrade closeout
+
+The Panel task built local `j140-closeout-20261025-auth:rc1` as `1.5.0-anxi.3`, with OCI index/content identity `sha256:f9a363a9fde9e786d5d43bdafe7a7e41c048fd35665172b8b378795d049b9f79`. Its 17-file engineering input manifest has source-tree SHA256 `a0046eae829c671fbfcfec9bbac14b2a6aecddc0a9a6a7cccba1bf95c0721c30`, upstream `f318717ac06a780b6b21080b0263c16278d8e6e1`, and the current dirty checkout's base revision `7905c209b2d14011cffd54f9a4d8658acebcc8e5`. This is not a clean formal release revision. Only the task's isolated loopback registry received the image; nothing was published externally.
+
+Dockerfile now passes AUTH_VERSION to dotnet publish and records version, source revision/tree hash, upstream revision and UTC build time. The exact-tag publishing workflow passes those arguments and derives its source-tree digest from the archived service/build inputs. Workflow tests (17) and the patch invariant checker pass. A bounded 256 MiB probe of the same cached image, using two empty task volumes, returned health 200, Steam readiness 503 and game validation status 200; its container and volumes were removed. Evidence: `E:/stardew-server-anxi-panel/tmp/junimo140-closeout-20261025/auth-target-http-v2.json` and `auth-target-probe-result-v2.json`.
+
+On 2026-10-26 the dedicated account and Steam Guard completed on the isolated old Panel. The real Auth 2 session migrated to the exact Auth 3 image above, became ready, and produced a valid nonempty invitation code after the real old-Panel Web upgrade and explicit .140 scope confirmation. An injected stop of the new Auth 3 target also exercised the unchanged production timeout: the whole group restored the original .125/Auth 2 stack and invitation-code availability. Save, user, custom Mod, session and unrelated-container checks passed. The user explicitly accepts successful invitation-code retrieval for this task; independent Steam/GOG player joining was not performed. Long-term token expiry/renewal is not claimed. Evidence is in the Panel task's `major-full-v5-success-*`, `major-full-v5-auth-failure-*` and `world-*-success.json` artifacts.
+
+No tag, release, image promotion or external publishing workflow is authorized for this closeout. The engineering digest remains local. Formal Auth preparation must replace the dirty engineering source revision with a clean reviewed revision and its final published digest; the Panel manifest and affected candidate proofs must then be renewed. C-drive reserve was recovered through verified cache cleanup and archival, without pruning Docker or restarting shared services.
+
+## 2026-10-15 local Junimo .140 adaptation (not released)
+
+The service source is locally adapted to upstream `f318717ac06a780b6b21080b0263c16278d8e6e1` for the Panel's `.125 -> .140` work. The existing ConnectedCallback wait, connection/authentication retries and pure `/health` and `/steam/ready` contracts are retained. The service now includes upstream session selection, token maintenance, pinned-manifest content validation, non-root entrypoint and the associated validation/execstack helpers. Only `tools/steam-service` and its contract tests are adapted; the fork's server Mod is not synchronized by this task.
+
+`AUTO_DOWNLOAD_ON_BOOT=false` disables implicit first-run downloads. Panel-managed Compose also sets `VALIDATE_ON_BOOT=false`, so a missing completion marker cannot silently trigger a public-branch game update. Explicit setup/download and manual validate requests remain separate operations. Creating the verified completion marker and migrating the shared game volume still require the Panel migration transaction; disabling automatic writers alone does not make an existing `.125` volume ready for `.140`.
+
+Local image `junimo140-20261015-auth:local-v2` has image ID `sha256:b6186712daf4f2715c1a1cc62ad14294d81d87b1955b49d226810609a900d7b5`. Build and 9 contract tests passed, with HTTP proof for pure health, unavailable-account readiness, validate status and disabled bootstrap. Evidence is under `E:/stardew-server-anxi-panel/tmp/junimo140-20261015/`, including `auth-build-v2.log`, `auth-contract-tests-v2-restored.log`, `auth-final-http.json` and `auth-managed-bootstrap.json`. Login reached Steam Guard; the user explicitly deferred verification for this round, so login was stopped. No completed login, live renewal, license, real-client or game-download compatibility result is claimed. Isolated containers and session/game volumes were removed; the final engineering image and redacted evidence remain local. No image was pushed and no release workflow, tag or commit was created.
+
+The following sections describe the previously published patch and its original plan.
+
 This fork is used to publish a patched JunimoServer `steam-service` image for
 slower Steam network environments. The panel should still provide the normal
 "run one Linux command, then operate from the web UI" user flow.
@@ -338,3 +366,9 @@ run the panel container once
 open the web panel
 finish Steam auth, download, and server startup in the browser
 ```
+
+## 2026-07-14 发布/兼容矩阵接手补充
+
+本仓库在统一矩阵中的可追溯身份为：精确 fork image tag、buildx digest、`refs/tags/<Junimo upstream tag>` 与发布源码 revision。以上四项由发布成功后的可选 repository_dispatch 通知 Panel；不把本仓库自己的“发布成功”解释为五组件兼容性通过，Panel 端只能先记为 discovered。
+
+影响文件：`.github/workflows/publish-steam-service.yml`、`tests/workflows/test_workflow_contracts.py`、本说明、`ANXI_UPSTREAM_SYNC_CN.md` 和 CI/CD 文档。运行时 anxi 补丁代码未修改。后续发布必须保留精确 tag/digest 与 upstreamRef 标签，若 tag 已指向不同 digest，应停止发布列车并调查，不能用 latest 或覆盖旧 tag 修复。

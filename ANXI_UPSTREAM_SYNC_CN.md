@@ -1,5 +1,13 @@
 # 上游同步与补丁保留说明
 
+## 2026-10-15 本地 .140 配套适配
+
+本轮只在本地将 `tools/steam-service` 适配到固定上游 `f318717ac06a780b6b21080b0263c16278d8e6e1`，保留国内网络连接等待/重试和现有纯 health/readiness 契约，并接入 session 枚举、token 维护、固定已安装 manifest 的内容校验、非 root entrypoint 及辅助类。没有同步本仓 server Mod，也没有改动已有发布 workflow 草稿；当前 Git HEAD/分支不变，未提交、推送、打 tag 或发布镜像。
+
+新增 `AUTO_DOWNLOAD_ON_BOOT=false`，与 `VALIDATE_ON_BOOT=false` 配合阻止 Panel 管理卷的开机隐式写入。显式安装、共享组停写、固定 build/完成 marker、patched SMAPI 和完整回滚仍由 Panel 后续事务接线，不能据这两个开关认定迁移完成。当前 Panel 推荐仍是 `.125 + anxi.2`；用户本轮明确跳过 Steam Guard，已停止登录；隔离容器和 session/game 卷已回收。最终本地工程镜像与脱敏证据、通过范围和真实客户端边界见本文同目录 `ANXI_STEAM_SERVICE_PATCH.md` 的 2026-10-15 记录。
+
+以下章节保留已发布旧补丁的原始范围与同步方案。
+
 这个 fork 的目标不是维护一个完整的 JunimoServer 分支，而是发布一个更适合慢 Steam 网络环境的 `steam-service` 镜像。
 
 ## 当前补丁范围
@@ -263,3 +271,11 @@ STEAM_AUTH_SESSION_RETRY_DELAY_SECONDS=5
 ```
 
 这样用户环境可复现，也方便回滚。
+
+## 2026-07-14 统一发布列车接手说明
+
+上游同步与精确 fork tag 仍遵循：发现 tag -> 同步 PR -> anxi 补丁人工确认 -> 合并后重新验证 -> 创建精确 fork tag -> 调用 `publish-steam-service.yml`。发布工作流现在只推精确版本 tag，并以 buildx 输出记录跨 registry 镜像 digest；不再更新 `latest`。
+
+发布成功后可用 `PANEL_REPOSITORY_DISPATCH_TOKEN` 向 `PANEL_REPOSITORY` 发送 `steam-auth-cn-published`。payload 只包含 `refs/tags/<upstream-tag>`、精确 imageTag、digest、完整 source revision。Panel 只生成 discovered PR，重复 payload 使用相同身份，不直接推荐。缺少 token/变量时通知跳过，不把 GitHub/registry/Steam 凭据写入日志或 payload。
+
+验证：`python -m unittest discover -s tests/workflows -p 'test_*.py' -v` 覆盖 exact tag、provenance、最小公开 payload 和无 `pull_request_target`；`npm test` 覆盖已有工作流脚本。首次联动发布前仍需管理员创建最小权限 token、配置目标仓库变量，并在两个仓库的受保护环境/分支规则中启用人工 review。

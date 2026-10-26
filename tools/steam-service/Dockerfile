@@ -8,16 +8,36 @@ COPY tools/steam-service/*.csproj ./
 RUN dotnet restore
 
 COPY tools/steam-service/ .
-RUN dotnet publish -c Release -o /app
+ARG AUTH_VERSION=0.0.0-dev
+RUN dotnet publish -c Release -o /app -p:Version=$AUTH_VERSION
     # -p:EnableCompressionInSingleFile=true \
     # -p:PublishSingleFile=true \
     # -p:PublishTrimmed=true \
     # -p:PublishAot=true \
 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0
+ARG AUTH_VERSION=0.0.0-dev
+ARG SOURCE_REVISION=unknown
+ARG SOURCE_TREE_SHA256=unknown
+ARG UPSTREAM_REVISION=f318717ac06a780b6b21080b0263c16278d8e6e1
+ARG BUILD_DATE=unknown
+LABEL org.opencontainers.image.version="$AUTH_VERSION" \
+    org.opencontainers.image.revision="$SOURCE_REVISION" \
+    org.opencontainers.image.created="$BUILD_DATE" \
+    com.anxi-panel.source-tree-sha256="$SOURCE_TREE_SHA256" \
+    com.anxi-panel.upstream-revision="$UPSTREAM_REVISION"
 WORKDIR /app
 
+# gosu drops privileges to the configured USER_ID:GROUP_ID in the entrypoint (see
+# tools/steam-service/entrypoint.sh) so the shared game-data volume is owned by the operator's
+# host user instead of root. Defaults to 1000:1000; USER_ID=0 keeps running as root.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gosu \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=build /app .
+COPY tools/steam-service/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 ENV PORT=3001
 ENV SESSION_DIR=/data/steam-session
@@ -34,5 +54,5 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
 #   docker run ... login    # Just login
 #   docker run ... download # Download game
 #   docker run ... ticket   # Output app ticket
-ENTRYPOINT ["dotnet", "SteamService.dll"]
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["serve"]
