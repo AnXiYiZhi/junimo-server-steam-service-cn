@@ -1,5 +1,12 @@
 # 上游同步与补丁保留说明
 
+## 2026-10-26 .140 Auth 正式发布
+
+- 上游命名保持可见：镜像为 `1.5.0-preview.140-anxi.1`，annotated tag为 `sdvd-server-v1.5.0-preview.140-anxi.1`，指向真实包含上游 `f318717ac06a780b6b21080b0263c16278d8e6e1` 的提交 `db3f7d53b8e7705b01bbf5a87633e07dabdd34a4`。
+- 三仓固定版本同一digest：`sha256:4649205b292a89dee5073614408bc7fdbbe01886a597beb38d24e906ddba20f6`。成功发布证明run为 `40284240063`，复用首次构建的原平台镜像，没有重建或移动tag；阿里云精确digest回拉HTTP冒烟通过。旧工程名 `1.5.0-anxi.3` 仅保留历史说明。
+- `upstream-release.json` 以审阅版本/SHA固定来源，预览tag被上游清理后仍可复验，并保留真实祖先检查。ACR不支持的空配置证明附件默认禁用；恢复流程用预装Skopeo保留原manifest digest。国内连接/认证重试及纯health/readiness保持。
+- 本次仅发布Auth仓库/镜像，Panel继续不发布。后续073升级中心与080运行栈对接需要使用以上正式身份并更新验证，不复用旧工程digest作为正式证明。
+
 ## 2026-10-15 本地 .140 配套适配
 
 本轮只在本地将 `tools/steam-service` 适配到固定上游 `f318717ac06a780b6b21080b0263c16278d8e6e1`，保留国内网络连接等待/重试和现有纯 health/readiness 契约，并接入 session 枚举、token 维护、固定已安装 manifest 的内容校验、非 root entrypoint 及辅助类。没有同步本仓 server Mod，也没有改动已有发布 workflow 草稿；当前 Git HEAD/分支不变，未提交、推送、打 tag 或发布镜像。

@@ -524,6 +524,16 @@ The fork's optional Panel compatibility notification is independent of the upstr
 
 ## Panel compatibility-matrix notification
 
+Auth releases pin their reviewed upstream version and commit in
+`tools/steam-service/upstream-release.json`; deleted preview tags do not remove
+the real ancestry check. Alibaba Cloud Personal ACR cannot accept Buildx's
+empty-config attestation artifact, so optional provenance/SBOM exports are
+disabled while OCI version, commit, upstream, source-tree and build-date labels
+remain required. `recover-steam-service-publication.yml` can promote an already
+built platform manifest with Skopeo, after verifying its original index membership,
+source identity and HTTP contracts. It refuses unrelated existing target content,
+preserves the payload digest, and never rebuilds the image or moves the release tag.
+
 `publish-steam-service.yml` publishes only exact version tags to Docker Hub, ACR,
 and GHCR. The build output digest is recorded in the GitHub release. Mutable
 `latest` tags are intentionally not part of the release train.
