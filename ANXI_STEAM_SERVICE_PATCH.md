@@ -12,7 +12,7 @@ The .140 Auth release is named `1.5.0-preview.140-anxi.1`, with fork tag `sdvd-s
 
 `tools/steam-service/upstream-release.json` pins upstream `preview-1.5.0.140` to commit `f318717ac06a780b6b21080b0263c16278d8e6e1`. Upstream preview tags may be removed, so publication fetches this reviewed commit directly and still requires it to be a real ancestor of the release commit. A mismatched version or nonexact revision fails publication. The fork retains its connection wait, bounded connection/authentication retries and pure health/readiness behavior.
 
-The authorized publication covers this Auth repository and its fixed image tag in the existing Docker Hub, GHCR and Alibaba Cloud repositories. Panel 0.7.3/0.8.0 publication remains deferred. The previous local dedicated-account migration and invitation-code acceptance are recorded below; final release identity and publication evidence will be added after verification.
+The authorized publication covers this Auth repository and its fixed image tag in the existing Docker Hub, GHCR and Alibaba Cloud repositories. Panel 0.7.3/0.8.0 publication remains deferred. The previous dedicated-account migration and invitation-code acceptance are historical engineering results; the verified formal publication identity and outcomes are recorded above.
 
 ## 2026-10-25 fixed local Auth candidate and Panel upgrade closeout
 
