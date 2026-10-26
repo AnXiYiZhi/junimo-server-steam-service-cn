@@ -72,8 +72,9 @@ jobs:
           FAILED_INDEX_DIGEST: ${{ inputs.failed_index_digest }}
         run: |
           set -euo pipefail
-          for command_name in docker python3 curl jq gh; do command -v "$command_name"; done
+          for command_name in docker python3 curl jq gh skopeo; do command -v "$command_name"; done
           docker buildx version
+          skopeo --version
           [[ "$PLATFORM_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$FAILED_INDEX_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           docker buildx imagetools inspect --raw "${DOCKERHUB_IMAGE}@${FAILED_INDEX_DIGEST}" > original-index.json
@@ -126,8 +127,8 @@ jobs:
               echo 'Refusing to replace an unrelated image reference' >&2; exit 1
             fi
             if [ "$current" != "$PLATFORM_DIGEST" ]; then
-              docker buildx imagetools create --prefer-index=false \
-                --tag "$reference" "${DOCKERHUB_IMAGE}@${PLATFORM_DIGEST}"
+              skopeo copy --preserve-digests --authfile "$HOME/.docker/config.json" \
+                "docker://${DOCKERHUB_IMAGE}@${PLATFORM_DIGEST}" "docker://${reference}"
             fi
             docker buildx imagetools inspect --format '{{json .Manifest}}' "$reference" > descriptor.json
             test "$(jq -r .digest descriptor.json)" = "$PLATFORM_DIGEST"

@@ -50,7 +50,8 @@ class AuthPublicationTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/recover-steam-service-publication.yml").read_text(encoding="utf-8")
         self.assertNotIn("docker/build-push-action", workflow)
         self.assertNotIn("git tag", workflow)
-        self.assertIn("--prefer-index=false", workflow)
+        self.assertIn("skopeo copy --preserve-digests", workflow)
+        self.assertNotIn("imagetools create", workflow)
         self.assertIn("Refusing to replace an unrelated image reference", workflow)
         self.assertIn("original-index.json", workflow)
 
