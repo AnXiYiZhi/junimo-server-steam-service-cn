@@ -1,3 +1,7 @@
+---
+description: Frequently asked questions about JunimoServer — cost, saves, players, GOG, offline behavior, mods, and common troubleshooting.
+---
+
 # FAQ
 
 ## General
@@ -16,7 +20,7 @@ Configurable via `MaxPlayers` in server settings. Default is 10. The game create
 
 ### Does it work with GOG?
 
-Yes, but with limitations. GOG connections have ~50% success rate compared to Steam's ~99%. This is due to NAT traversal differences. Steam players should use Steam invite codes, GOG players use GOG invite codes.
+Yes, but with limitations. GOG connections have ~50% success rate compared to Steam's ~99%. This is due to NAT traversal differences. The same invite code works for both: a GOG client reads it as a GOG lobby, a Steam client uses Steam's relay for it.
 
 ## Gameplay
 
@@ -26,7 +30,7 @@ Crops track their owner and won't die from lack of watering while you're offline
 
 ### Does time pass when I'm offline?
 
-Time pauses when no players are online. When players are connected, time runs normally. The game saves at the end of each in-game day.
+Time pauses when no players are online, freezing wherever the last player left off. One exception: if the server empties after 1:00 AM, it waits a few minutes for someone to return, then sleeps so the next player starts a fresh morning. With players connected, time runs normally, and the game saves at the end of each in-game day.
 
 ### Can I move my cabin?
 
@@ -35,6 +39,10 @@ Yes. Stand where you want your cabin, then type `!cabin` in chat.
 ### Is money shared or separate?
 
 Configurable by the server admin. Default is shared wallet (all players share one money pool). Admins can switch it with `!changewallet shared` / `!changewallet separate`; the change applies overnight.
+
+### Can another player take over my farmer?
+
+No. Your farmer is locked to the connection identity that created it — for Steam/GOG players that means your account, and other players don't even see it in their farmer list. (Steam note: joining with the G-prefixed GOG invite code counts as a different identity than joining via the friends list or the S-prefixed code, so stick to one method.) The exception is farmers created over a direct IP connection: direct IP carries no account identity, so those farmers are shared among all direct-IP players. Server admins can transfer or unlock a farmer with the [`farmhand` command](/admins/operations/commands#farmhand).
 
 ## Technical
 
@@ -58,6 +66,10 @@ Yes. JunimoServer runs on both Linux and Windows via Docker.
 ### Do players need to install anything special?
 
 No. Players connect using the normal Stardew Valley multiplayer menu with an invite code. Content mods (if any) must match between server and players.
+
+### Why is my server's lobby always public?
+
+By design. In normal Stardew, the host's lobby defaults to "Friends Only," which lets only the host's Steam/GOG friends join. A dedicated server runs on a separate account that your players aren't friends with, so "Friends Only" would block everyone — the invite code alone wouldn't be enough. To keep invite codes working for anyone you share them with, JunimoServer forces the lobby Public. Because a Public lobby can appear in the Steam/GOG lobby list, don't treat a private invite code as access control — enable [password protection](/features/password-protection/) to actually gate who can join.
 
 ## Mods
 
@@ -88,6 +100,10 @@ See [VNC](/admins/operations/vnc#why-is-vnc-showing-a-black-screen) if you speci
 2. Check invite code is correct
 3. See [Troubleshooting](/admins/troubleshooting#player-connection-issues)
 
+### I connected, but my farmer isn't in the list
+
+You most likely joined a different way than when you created the farmer. Farmers are tied to how you connect: one created via a Steam or GOG invite code belongs to that account and never shows up over direct IP (and the other way around — a farmer created over direct IP is only offered to direct-IP players). On Steam, the G-prefixed (GOG) invite code counts as a different join method than the friends list or the S-prefixed code. Reconnect the same way you originally joined. If you genuinely need to move a farmer to another account or connection method, ask the server admin to use the [`farmhand` command](/admins/operations/commands#farmhand).
+
 ### Server won't start
 
 Check logs: `docker compose logs -f`
@@ -101,12 +117,15 @@ See [Troubleshooting](/admins/troubleshooting) for detailed solutions.
 
 ### "Asset does not appear to be a valid XNB file"
 
-Log errors like `Failed to spawn NPC '...'` or `Couldn't create the '...' location` with `ContentLoadException: Asset does not appear to be a valid XNB file` mean a game content file on disk is corrupted (for example from an interrupted download). The server doesn't repair game files on its own, so the error returns every restart until you re-run the downloader. It validates all game files and re-downloads the broken pieces:
+Log errors like `Failed to spawn NPC '...'` or `Couldn't create the '...' location` with `ContentLoadException: Asset does not appear to be a valid XNB file` mean a game content file on disk is corrupted (for example from an interrupted download). Every time the steam-auth container starts it checks all game files and re-downloads the broken pieces before the server boots, so a full restart repairs this on its own:
+
+```bash
+docker compose restart
+```
+
+If the steam-auth log shows `Game file validation failed` (usually a Steam login problem), run `docker compose run --rm -it steam-auth setup` to log in again, then repair by hand:
 
 ```bash
 docker compose run --rm steam-auth download
 docker compose restart server
 ```
-
-If it fails with a login error, run `docker compose run --rm -it steam-auth setup` first.
-

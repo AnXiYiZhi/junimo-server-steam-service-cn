@@ -2,12 +2,15 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using HarmonyLib;
+using JunimoServer.Services.AlwaysOn;
+using JunimoServer.Services.Auth;
 using JunimoServer.Services.Lobby;
 using JunimoServer.Services.MessageInterceptors;
 using JunimoServer.Services.PersistentOption;
 using JunimoServer.Services.Roles;
 using JunimoServer.Services.SaveImport;
 using JunimoServer.Services.ServerOptim;
+using JunimoServer.Services.Settings;
 using JunimoServer.Shared;
 using JunimoServer.Util;
 using Microsoft.Xna.Framework;
@@ -36,7 +39,7 @@ public class ServerJoinedEventArgs : EventArgs
 
 public delegate void ServerJoinedHandler(object sender, ServerJoinedEventArgs e);
 
-public class CabinManagerService : ModService
+public partial class CabinManagerService : ModService
 {
     public CabinManagerData Data
     {
@@ -50,14 +53,34 @@ public class CabinManagerService : ModService
 
     private readonly RoleService roleService;
 
+    // Needed by migration commit: SyncFromSettings reapplies the settings file on every
+    // boot/reload, so committing a strategy flip must also write it into
+    // server-settings.json or the next reload would flip it back.
+    private readonly ServerSettingsLoader settings;
+
     // One-way dependency (CabinManagerService → SaveImportService). Injected solely to read+clear
     // the pending save-import finalize intent; all engine-touching finalizer logic is this service's
     // own private code (Layer B). A mutual injection would be a startup-fatal constructor cycle.
     private readonly SaveImportService saveImportService;
 
+    // Ownership map lifecycle: every site that clears a stamp or deletes a farmhand entry
+    // must drop the matching owner record too, or the slot stays locked to a ghost.
+    private readonly FarmhandOwnershipService farmhandOwnership;
+
     private static readonly int minEmptyCabins = 1;
 
     private readonly HashSet<long> farmersInFarmhouse = new HashSet<long>();
+
+    // Tiles of visible (non-hidden, non-lobby) cabins removed by DestroyCabin. The
+    // delete→rebuild path (DELETE /farmhands → EnsureAtLeastXCabins) re-places onto the
+    // just-vacated tile: a deleted cabin may have been !cabin-moved off its designated
+    // spot, and rebuilding at the designated position instead would bulldoze whatever
+    // players developed there since. Strictly world-scoped: cleared on ReturnedToTitle
+    // (every /newgame, /reload, and import passes through the title, and a new game builds
+    // its cabins before its SaveLoaded even fires) — a tile carried across worlds would
+    // divert the next game's up-front None placement onto a stale position. In-memory only;
+    // after a restart the rebuild falls back to designated positions.
+    private readonly Queue<Point> _freedVisibleCabinTiles = new Queue<Point>();
 
     // Static reference ONLY for Harmony patches (unavoidable)
     private static CabinManagerService _instance;
@@ -81,7 +104,9 @@ public class CabinManagerService : ModService
         RoleService roleService,
         MessageInterceptorsService messageInterceptorsService,
         PersistentOptions options,
-        SaveImportService saveImportService
+        ServerSettingsLoader settings,
+        SaveImportService saveImportService,
+        FarmhandOwnershipService farmhandOwnership
     )
         : base(helper, monitor)
     {
@@ -96,37 +121,49 @@ public class CabinManagerService : ModService
 
         this.roleService = roleService;
         this.options = options;
+        this.settings = settings;
         this.saveImportService = saveImportService;
+        this.farmhandOwnership = farmhandOwnership;
 
         Data = new CabinManagerData(helper, monitor);
 
         Helper.Events.GameLoop.SaveLoaded += OnSaveLoaded;
         Helper.Events.GameLoop.DayStarted += OnDayStarted;
+        Helper.Events.GameLoop.ReturnedToTitle += OnReturnedToTitle;
 
-        // For None strategy, let vanilla handle starting cabins and skip message
-        // interception and farmhouse monitoring. Cabins are real and visible.
-        if (!options.IsNone)
-        {
-            // Disable default starting cabin logic, we handle it
-            harmony.Patch(
-                original: AccessTools.Method(
-                    typeof(GameLocation),
-                    nameof(GameLocation.BuildStartingCabins)
-                ),
-                prefix: new HarmonyMethod(
-                    typeof(ServerOptimizerOverrides),
-                    nameof(ServerOptimizerOverrides.Disable_Prefix)
-                )
-            );
+        // Registered unconditionally, gated per-message/per-tick on options.IsNone: the
+        // strategy can change in-process (settings-file /reload, migration commit), so
+        // constructor-time gating on the BOOT strategy would leave a None-booted server
+        // without interceptors after a switch to a stacked strategy.
 
-            // Hijack outgoing messages for cabin warp manipulation
-            messageInterceptorsService
-                .Add(Multiplayer.locationIntroduction, OnLocationIntroductionMessage)
-                .Add(Multiplayer.locationDelta, OnLocationDeltaMessage);
+        // Disable default starting cabin logic, we handle it — for every strategy: the mod
+        // places None cabins itself (vanilla's placement doesn't survive the headless
+        // new-game path; cabin-system invariant 9).
+        harmony.Patch(
+            original: AccessTools.Method(
+                typeof(GameLocation),
+                nameof(GameLocation.BuildStartingCabins)
+            ),
+            prefix: new HarmonyMethod(
+                typeof(ServerOptimizerOverrides),
+                nameof(ServerOptimizerOverrides.Disable_Prefix)
+            )
+        );
 
-            // Monitor farmhouse access; only the server host can enter (no human players)
-            Helper.Events.GameLoop.UpdateTicked += OnTicked;
-        }
+        // Hijack outgoing location introductions for cabin warp manipulation. Location
+        // DELTAS are deliberately not intercepted: server-side warp rewrites (Relocate,
+        // !cabin reset, the migration commit pass) mutate the global interior's warps via
+        // SetWarpsToFarm, which always emits a replication delta. The delta is load-bearing
+        // even right after an introduction: the client re-derives interior warps locally
+        // from the building position while deserializing it (buildings.OnValueAdded →
+        // updateInteriorWarps), clobbering the introduction's own targets.
+        messageInterceptorsService.Add(
+            Multiplayer.locationIntroduction,
+            OnLocationIntroductionMessage
+        );
+
+        // Monitor farmhouse access; only the server host can enter (no human players)
+        Helper.Events.GameLoop.UpdateTicked += OnTicked;
 
         // Always hook player join. Needed for peer tracking and auto-cabin creation.
         harmony.Patch(
@@ -135,6 +172,31 @@ public class CabinManagerService : ModService
                 nameof(GameServer.sendServerIntroduction)
             ),
             postfix: new HarmonyMethod(typeof(CabinManagerService), nameof(OnServerJoined_Postfix))
+        );
+
+        // Present the world as unpaused inside the introduction snapshot (prefix sets false,
+        // finalizer restores) without actually unpausing it. An empty auto-paused server otherwise
+        // serializes IsPaused=true to a joining vanilla client, whose first fade-in never
+        // completes (black screen). A real unpause would let repeated lobby joins bank clock time
+        // (Game1.gameTimeInterval accrues across pauses) and a lobby player never counts as
+        // present for the auto-pause. Registered here unconditionally for the same reason as the
+        // disconnect heal above: PasswordProtectionService's patches are dead without a password.
+        // The restore is a finalizer, not a postfix: if the serialization (or an earlier patch)
+        // throws, a postfix would be skipped, stranding the world unpaused for the tick until
+        // HandleAutoPause re-pauses — exactly the one-tick clock-bank the mask exists to prevent.
+        harmony.Patch(
+            original: AccessTools.Method(
+                typeof(GameServer),
+                nameof(GameServer.sendServerIntroduction)
+            ),
+            prefix: new HarmonyMethod(
+                typeof(CabinManagerService),
+                nameof(SendServerIntroduction_MaskPause_Prefix)
+            ),
+            finalizer: new HarmonyMethod(
+                typeof(CabinManagerService),
+                nameof(SendServerIntroduction_MaskPause_Finalizer)
+            )
         );
 
         // Always hook player disconnect to release abandoned slot claims, on ALL transports.
@@ -151,6 +213,17 @@ public class CabinManagerService : ModService
             )
         );
 
+        // Deferred Farm re-introduction rides behind the answer to a peer's own warp request
+        // (see CabinManagerService.FarmReintroduction).
+        harmony.Patch(
+            original: AccessTools.Method(
+                typeof(GameServer),
+                "warpFarmer",
+                new[] { typeof(Farmer), typeof(short), typeof(short), typeof(string), typeof(bool) }
+            ),
+            postfix: new HarmonyMethod(typeof(CabinManagerService), nameof(WarpFarmer_Postfix))
+        );
+
         // Defensive: make Utility.getHomeOfFarmer null-safe.
         // The vanilla implementation calls RequireLocation which throws KeyNotFoundException
         // if the cabin interior isn't findable yet (e.g. during new game setup, day transitions,
@@ -163,22 +236,102 @@ public class CabinManagerService : ModService
         );
     }
 
+    private void OnReturnedToTitle(object sender, ReturnedToTitleEventArgs e)
+    {
+        // World teardown: freed-cabin tiles belong to the world that freed them (see the
+        // field comment).
+        _freedVisibleCabinTiles.Clear();
+        FarmCabinPositions.Invalidate();
+    }
+
     private void OnSaveLoaded(object sender, SaveLoadedEventArgs e)
     {
-        // Save-import Layer B finalizer — MUST be the first statement, before Data.Read() and the
-        // whole reconciliation chain. Ordering is load-bearing three ways: (1) the demoted owner is
+        // Restore the cabin-layout choice before anything resolves designated positions.
+        // Game1.cabinsSeparate is not save-persisted (the engine resets it to false), and
+        // FarmCabinPositions mirrors vanilla's layout selection off it; the settings file
+        // is the durable source of the choice. Runs before the save-import finalizer,
+        // which can build a visible cabin under None.
+        Game1.cabinsSeparate = !settings.CabinLayoutNearby;
+
+        // Save-import Layer B finalizer — MUST run before Data.Read() and the whole
+        // reconciliation chain (only the side-effect-free layout restore above precedes
+        // it). Ordering is load-bearing two ways: (1) the demoted owner is
         // homed+bound before the reconciliation absorbs it; (2) running before
         // ClearStaleFarmhandReferences means the owner's homeLocation is already the new cabin (not
-        // the stale FarmHouse), so that sweep leaves it alone; (3) running before
-        // ClearAbandonedCabinClaimsOnLoad (which only clears uncustomized farmhands) plus keeping
-        // the owner isCustomized=true both protect the fresh userID stamp. No-op (zero cost) on
-        // normal loads with no pending import.
+        // the stale FarmHouse), so that sweep leaves it alone. (The abandoned-claim sweep can't
+        // touch the bind either way: the owner is isCustomized=true and the record is
+        // operator-origin.) No-op (zero cost) on normal loads with no pending import.
         TryFinalizeOnLoad();
 
         Data.Read();
 
         // Detect and handle strategy changes between runs
-        DetectAndMigrateStrategyChange();
+        DetectAndApplyStrategySwitch();
+
+        // A save import defers its None-cap reset to the imported save's FIRST load (see
+        // PendingNoneCapClearSaveName); consume or drop the marker before the freeze below.
+        var pendingCapClear = options.Data.PendingNoneCapClearSaveName;
+        if (!string.IsNullOrEmpty(pendingCapClear))
+        {
+            if (string.Equals(pendingCapClear, Constants.SaveFolderName, StringComparison.Ordinal))
+            {
+                options.Data.NoneCabinCount = 0;
+                Monitor.Log(
+                    "Cleared the frozen None cabin cap for the imported save; a fresh cap is "
+                        + "computed on this load.",
+                    LogLevel.Debug
+                );
+            }
+            // A non-matching marker belongs to an import that never booted (canceled or
+            // retargeted); this save keeps its own cap.
+            options.Data.PendingNoneCapClearSaveName = null;
+            options.Save();
+        }
+
+        // Terminal-state guard: None must never run with cabins still in the hidden stack.
+        // Runs before the freeze so the cap sees the reconciled visible count.
+        ReconcileHiddenCabinsUnderNone();
+
+        // Freeze the None cap for saves where NoneCabinCount is unset (0): persist
+        // min(designated positions, MaxPlayers) so a later MaxPlayers raise can't grow the
+        // ceiling onto a developed farm — floored at the visible cabin count, because a
+        // save can legitimately hold more cabins than the formula (pre-freeze saves built
+        // against both marker layouts; imports): a cap below the real count would make
+        // every farmhand deletion permanently shrink capacity (delete→rebuild sees zero
+        // headroom). Imported farms arrive with the field cleared (marker above), so they
+        // compute a fresh cap here instead of inheriting the previous game's frozen
+        // number. Premise gap for such farms: they never got the placed-up-front
+        // treatment, so on-demand growth (buildStructure(skipSafetyChecks)
+        // + ClearTerrainBelow, i.e. bulldozing) still fires on them up to this cap — the
+        // no-bulldoze guarantee is absolute only for farms created under None.
+        if (options.IsNone && options.Data.NoneCabinCount == 0)
+        {
+            var noneFarm = Game1.getFarm();
+            if (noneFarm != null)
+            {
+                var visibleCount = noneFarm.buildings.Count(b =>
+                    b.isCabin && !b.IsInHiddenStack() && !b.IsLobbyOrEditing()
+                );
+                var frozen = Math.Max(
+                    Math.Min(
+                        FarmCabinPositions.GetDesignatedPositions(noneFarm).Count,
+                        options.Data.MaxPlayers
+                    ),
+                    visibleCount
+                );
+                if (frozen > 0)
+                {
+                    options.Data.NoneCabinCount = frozen;
+                    options.Save();
+                    Monitor.Log(
+                        $"Froze None cabin cap at {frozen} "
+                            + "(min of designated map positions and MaxPlayers, floored at "
+                            + $"the {visibleCount} existing visible cabin(s)).",
+                        LogLevel.Info
+                    );
+                }
+            }
+        }
 
         // Register existing cabin owners from imported saves
         SyncExistingCabins();
@@ -306,6 +459,7 @@ public class CabinManagerService : ModService
         {
             farmhandData.Remove(key);
         }
+        farmhandOwnership.RemoveOwners(toRemove);
 
         if (toRemove.Count > 0 || homeCleared > 0 || lastSleepCleared > 0)
         {
@@ -324,12 +478,46 @@ public class CabinManagerService : ModService
 
     private void OnTicked(object sender, UpdateTickedEventArgs e)
     {
+        // Under None cabins are real and visible; farmhouse access isn't managed.
+        if (options.IsNone)
+        {
+            return;
+        }
+
         MonitorFarmhouse();
     }
 
     private static void OnServerJoined_Postfix(long peer)
     {
         _instance?.OnServerJoined(peer);
+    }
+
+    /// <summary>
+    /// PREFIX on sendServerIntroduction: present the world as unpaused inside the introduction
+    /// snapshot without unpausing it. The original serializes netWorldState synchronously, so no
+    /// game tick runs between this and the finalizer.
+    /// </summary>
+    private static void SendServerIntroduction_MaskPause_Prefix(out bool __state)
+    {
+        __state = Game1.netWorldState.Value.IsPaused;
+        if (__state)
+        {
+            Game1.netWorldState.Value.IsPaused = false;
+        }
+    }
+
+    /// <summary>
+    /// FINALIZER on sendServerIntroduction: restore the pause state captured by the prefix. A
+    /// finalizer (not a postfix) so the restore also runs if the serialization or an earlier patch
+    /// throws — otherwise the world would be left unpaused for a tick. The exception is left to
+    /// propagate untouched.
+    /// </summary>
+    private static void SendServerIntroduction_MaskPause_Finalizer(bool __state)
+    {
+        if (__state)
+        {
+            Game1.netWorldState.Value.IsPaused = true;
+        }
     }
 
     // Postfix on GameServer.playerDisconnected — runs while the disconnecting farmhand is still
@@ -339,57 +527,146 @@ public class CabinManagerService : ModService
     private static void OnPlayerDisconnected_Postfix(long disconnectee)
     {
         CleanupAbandonedCabinClaim(disconnectee);
+        _instance?._pendingFarmReintroductions.Remove(disconnectee);
     }
 
     private void OnServerJoined(long peer)
     {
+        // The join introduction carries the current fiction; a queued re-send is moot.
+        _pendingFarmReintroductions.Remove(peer);
         AddPeer(peer);
         EnsureAtLeastXCabins(excludePeer: peer);
     }
 
-    #region Strategy Change Migration
+    #region Strategy Switch (settings file)
 
-    private void DetectAndMigrateStrategyChange()
+    // The settings-file strategy-switch path ("edit cabinStrategy + reload"). Distinct from
+    // the staged, admin-driven migration flow in the next region, which enforces different
+    // rules — only the diagnostic event names (cabin_strategy_migration*) are shared.
+
+    private void DetectAndApplyStrategySwitch()
     {
         var previousStrategy = options.PreviousCabinStrategy;
         var currentStrategy = options.Data.CabinStrategy;
+
+        // Post-commit crash heal: the strategy flip (global options + settings file) is
+        // disk-durable at commit, but the world changes (staged positions, record clear,
+        // warp pass) live in the save and persist only at the next game save. A crash in
+        // that window reloads a pre-commit world — active record, cabins still staged or
+        // hidden — under the already-flipped strategy. Revert the strategy to the record's
+        // FromStrategy (which the loaded world matches) and leave the record active, so the
+        // admin resumes staging and re-commits.
+        // (previous == current distinguishes this from a settings-file edit to the target
+        // strategy during staging, which the in-progress refusal below handles instead.)
+        if (
+            Data.ActiveMigration != null
+            && currentStrategy == Data.ActiveMigration.ToStrategy
+            && previousStrategy == currentStrategy
+        )
+        {
+            var record = Data.ActiveMigration;
+            Monitor.Log(
+                $"Loaded a pre-commit world for a committed migration {record.FromStrategy} → "
+                    + $"{record.ToStrategy} (the commit's world changes were not yet saved). "
+                    + $"Reverting strategy to {record.FromStrategy}; the staging is still active — "
+                    + "re-run 'cabins migrate commit' when ready.",
+                LogLevel.Warn
+            );
+            if (record.ToStrategy == CabinStrategy.None)
+            {
+                // The commit also froze the None cap; undo that with the strategy, or a much
+                // later legitimate switch to None would inherit this staging's stale count
+                // (the load-time freeze only computes at 0). A re-commit re-freezes it.
+                options.Data.NoneCabinCount = 0;
+            }
+            ApplyStrategyDurably(record.FromStrategy);
+            return;
+        }
 
         if (previousStrategy == currentStrategy)
         {
             return;
         }
 
+        // A staged migration owns the strategy for its whole staging window: a file-driven
+        // change would flip the strategy underneath the record, so refuse it and revert to
+        // the strategy the record started from. The admin finishes or aborts via
+        // 'cabins migrate'. Revert-only (the settings file is left untouched), so every
+        // reload re-warns and re-reverts until the operator edits the file back.
+        if (Data.ActiveMigration != null)
+        {
+            var active = Data.ActiveMigration;
+            Monitor.Log(
+                $"CabinStrategy change {previousStrategy} → {currentStrategy} via settings file "
+                    + $"refused: a staged migration {active.FromStrategy} → {active.ToStrategy} is in "
+                    + $"progress. Reverting to {active.FromStrategy}; use 'cabins migrate commit' or "
+                    + "'cabins migrate abort' first. This warning repeats on every reload until "
+                    + $"server-settings.json is edited back to {active.FromStrategy}.",
+                LogLevel.Warn
+            );
+            options.Data.CabinStrategy = active.FromStrategy;
+            options.Save();
+            return;
+        }
+
         Monitor.Log(
-            $"CabinStrategy changed from {previousStrategy} to {currentStrategy}, migrating cabins...",
+            $"CabinStrategy changed from {previousStrategy} to {currentStrategy}, applying switch...",
             LogLevel.Warn
         );
-        MigrateCabins(previousStrategy, currentStrategy);
+        ApplyStrategySwitch(previousStrategy, currentStrategy);
     }
 
-    private void MigrateCabins(CabinStrategy from, CabinStrategy to)
+    /// <summary>
+    /// Durably applies a strategy flip: persisted options AND server-settings.json.
+    /// SyncFromSettings reapplies the file on every boot/reload, so both writes must land
+    /// together or the next reload reverts the flip. The refusal sites deliberately do NOT
+    /// use this — they revert the persisted options only and leave the file to the operator.
+    /// </summary>
+    private void ApplyStrategyDurably(CabinStrategy strategy)
+    {
+        options.Data.CabinStrategy = strategy;
+        options.Save();
+        settings.SetCabinStrategy(strategy);
+    }
+
+    private void ApplyStrategySwitch(CabinStrategy from, CabinStrategy to)
     {
         var farm = Game1.getFarm();
-        bool fromUsesHidden = (
-            from == CabinStrategy.CabinStack || from == CabinStrategy.FarmhouseStack
-        );
-        bool toUsesHidden = (to == CabinStrategy.CabinStack || to == CabinStrategy.FarmhouseStack);
-
         int migrated = 0;
 
-        if (fromUsesHidden && !toUsesHidden)
+        if (RequiresStagedMigration(from, to))
         {
-            // Stacked → None: move hidden cabins to visible farm positions
+            // A materializing direction never happens via the settings file: switching to
+            // None physically places cabins at designated map positions via
+            // buildStructure(skipSafetyChecks) + ClearTerrainBelow (bulldozing whatever a
+            // player built there), and FarmhouseStack → CabinStack makes the shared stack
+            // ghost appear on a farm spot players may have developed. Both are rejected on a
+            // developed save and the persisted strategy reverted; the supported paths are a
+            // fresh game or the staged 'cabins migrate' flow (validated, never-destructive,
+            // flip-at-commit).
+            //
+            // Gated on hiddenCabins.Count — nothing hidden means nothing can materialize, so
+            // the switch is safe. Fresh games never reach this branch at all:
+            // SetPersistentOptions aligns PreviousCabinStrategy at game creation (a fresh
+            // stacked game parks a hidden cabin before its first SaveLoaded, so without the
+            // alignment a stale previous strategy would false-trip this rejection and
+            // silently revert the fresh game's strategy).
             var hiddenCabins = farm.buildings.Where(b => b.isCabin && b.IsInHiddenStack()).ToList();
 
-            var availablePositions = FarmCabinPositions.GetAvailablePositions(farm);
-
-            if (hiddenCabins.Count > availablePositions.Count)
+            if (hiddenCabins.Count > 0)
             {
+                var consequence =
+                    to == CabinStrategy.None
+                        ? "would place real cabins on the farm and bulldoze anything on the "
+                            + "designated spots"
+                        : "would make the shared stack cabin appear on a farm spot players may "
+                            + "have developed";
                 Monitor.Log(
-                    $"CabinStrategy migration {from} → {to} aborted: {hiddenCabins.Count} hidden cabin(s) "
-                        + $"but only {availablePositions.Count} designated position(s) available on this farm map. "
-                        + $"Reverting strategy to {from}. Add cabin positions to the Paths layer or remove "
-                        + $"surplus cabins before retrying.",
+                    $"CabinStrategy switch {from} → {to} rejected: switching an existing save "
+                        + $"via the settings file {consequence}. Reverting strategy to {from}; "
+                        + $"use the staged 'cabins migrate start {to}' console flow (or create a "
+                        + $"new game) to switch to {to}. This warning repeats on every reload "
+                        + $"until server-settings.json is edited back to {from}.",
                     LogLevel.Warn
                 );
 
@@ -400,9 +677,7 @@ public class CabinManagerService : ModService
                         fromStrategy = from.ToString(),
                         toStrategy = to.ToString(),
                         hiddenCabinCount = hiddenCabins.Count,
-                        availablePositionCount = availablePositions.Count,
-                        deficit = hiddenCabins.Count - availablePositions.Count,
-                        reason = "insufficient_designated_positions",
+                        reason = "requires_staged_migration",
                     }
                 );
 
@@ -414,32 +689,12 @@ public class CabinManagerService : ModService
                 options.Save();
                 return;
             }
-
-            foreach (var cabin in hiddenCabins)
-            {
-                var nextPos = FarmCabinPositions.GetNextAvailablePosition(farm);
-                // Pre-validation above guarantees a slot for every hidden cabin: MigrateCabins
-                // runs synchronously on the game thread inside OnSaveLoaded, no buildStructure
-                // call can interleave, so the count cannot shrink mid-loop. nextPos is always set.
-                cabin.Relocate(nextPos.Value);
-                Monitor.Log(
-                    $"  Migrated cabin to ({nextPos.Value.X}, {nextPos.Value.Y})",
-                    LogLevel.Info
-                );
-                migrated++;
-            }
         }
-        else if (!fromUsesHidden && toUsesHidden)
+        else if (!UsesHiddenStack(from) && UsesHiddenStack(to))
         {
-            // None → Stacked: move visible cabins to hidden stack (exclude lobby/editing
-            // cabins and any cabin a player explicitly placed via /cabin)
+            // None → Stacked: move sweepable visible cabins to the hidden stack.
             var visibleCabins = farm
-                .buildings.Where(b =>
-                    b.isCabin
-                    && !b.IsInHiddenStack()
-                    && !b.IsLobbyOrEditing()
-                    && !HasSavedPosition(b)
-                )
+                .buildings.Where(b => b.isCabin && IsSweepableIntoStack(b))
                 .ToList();
 
             foreach (var cabin in visibleCabins)
@@ -448,11 +703,36 @@ public class CabinManagerService : ModService
                 Monitor.Log($"  Migrated cabin to hidden stack", LogLevel.Info);
                 migrated++;
             }
-        }
-        // Stacked ↔ Stacked: no relocation needed, only warp behavior changes
 
-        // Aborts (insufficient positions) emit cabin_strategy_migration_aborted and
-        // return early, so this success event never carries a failure count.
+            // A stale DefaultCabinLocation override can point the shared stack ghost at a
+            // developed tile, silently weakening the "ghost lands on the just-vacated spot"
+            // guarantee of this switch. Validate it now that the sweep has vacated the
+            // designated spots; on failure fall back to the map default.
+            if (
+                to == CabinStrategy.CabinStack
+                && Data.DefaultCabinLocation.HasValue
+                && !CabinPlacementValidator.TryValidateFootprint(
+                    farm,
+                    Data.DefaultCabinLocation.Value.ToPoint(),
+                    out var overrideReason
+                )
+            )
+            {
+                Monitor.Log(
+                    $"Stack-position override {Data.DefaultCabinLocation.Value} is no longer "
+                        + $"valid ({overrideReason}); falling back to the map's default stack "
+                        + "position.",
+                    LogLevel.Warn
+                );
+                Data.DefaultCabinLocation = null;
+                Data.Write();
+            }
+        }
+        // Remaining directions (CabinStack → FarmhouseStack, or a materializing direction
+        // with an empty hidden stack): pure-hide, only warp behavior changes.
+
+        // Rejections emit cabin_strategy_migration_aborted and return early, so this
+        // success event never carries a failure count.
         Diagnostics.ModEventLog.Emit(
             "cabin_strategy_migration",
             new
@@ -462,6 +742,156 @@ public class CabinManagerService : ModService
                 migrated,
             }
         );
+    }
+
+    /// <summary>
+    /// Load-time terminal-state guard: a live None strategy must never coexist with hidden
+    /// non-lobby cabins — under None no interceptor runs, so a hidden cabin is invisible
+    /// with dead warps, yet it still counts against the None cap, so joins are refused
+    /// while nothing is ever built. No supported flow produces the combination, but two
+    /// crash/ordering shapes can: a staged migration whose start AND commit both fell into
+    /// one unsaved window (the record never reached the save, so the pre-commit heal has
+    /// nothing to detect), and an import of a stacked-strategy save onto a None-configured
+    /// server (previous == current, so no switch is detected at all). Reconcile the way a
+    /// commit would: validator-gated, non-destructive placement onto designated spots,
+    /// then point every visible cabin's exit at its own door. A cabin that finds no valid
+    /// spot stays hidden with a Warn.
+    /// </summary>
+    private void ReconcileHiddenCabinsUnderNone()
+    {
+        if (!options.IsNone || Data.ActiveMigration != null)
+        {
+            return;
+        }
+
+        var farm = Game1.getFarm();
+        if (farm == null || !farm.buildings.Any(b => b.isCabin && b.IsInHiddenStack()))
+        {
+            return;
+        }
+
+        Monitor.Log(
+            "None strategy loaded with cabins still in the hidden stack (crashed migration "
+                + "commit, or a stacked-strategy save imported onto a None server); placing "
+                + "them at designated map spots.",
+            LogLevel.Warn
+        );
+
+        var placed = PlaceHiddenCabinsOntoDesignatedSpots(
+            farm,
+            (cabin, spot) =>
+            {
+                cabin.SetPosition(spot);
+                return true;
+            }
+        );
+
+        foreach (var building in farm.buildings)
+        {
+            if (building.isCabin && !building.IsInHiddenStack() && !building.IsLobbyOrEditing())
+            {
+                building.SetWarpsToFarmCabinDoor();
+            }
+        }
+
+        var leftHidden = farm.buildings.Count(b => b.isCabin && b.IsInHiddenStack());
+        if (leftHidden > 0)
+        {
+            Monitor.Log(
+                $"{leftHidden} hidden cabin(s) found no valid designated spot and stay "
+                    + "hidden (their slots are unusable); free up designated spots and "
+                    + "reload.",
+                LogLevel.Warn
+            );
+        }
+
+        Diagnostics.ModEventLog.Emit("cabin_none_reconciled", new { placed, leftHidden });
+    }
+
+    #endregion
+
+    #region Stack Spot (CabinStack)
+
+    /// <summary>
+    /// Read model for the CabinStack shared stack spot: the tile each player's ghost cabin
+    /// renders at, whether it comes from the persisted override or the map default, and
+    /// whether a cabin footprint there currently fails placement validation.
+    /// </summary>
+    public readonly record struct StackSpotStatus(
+        Point Spot,
+        bool IsOverride,
+        bool IsObstructed,
+        string ObstructionReason
+    );
+
+    /// <summary>
+    /// Live stack-spot status, or null when it doesn't apply (no loaded game, or the
+    /// active strategy is not CabinStack — FarmhouseStack renders no stack cabin and None
+    /// has no hidden cabins).
+    /// </summary>
+    public StackSpotStatus? GetStackSpotStatus()
+    {
+        if (!Game1.hasLoadedGame || !options.IsCabinStack)
+        {
+            return null;
+        }
+
+        var farm = Game1.getFarm();
+        if (farm == null)
+        {
+            return null;
+        }
+
+        var spot = StackLocation.Create(Data).ToPoint();
+        var obstructed = !CabinPlacementValidator.TryValidateFootprint(farm, spot, out var reason);
+        return new StackSpotStatus(spot, Data.DefaultCabinLocation.HasValue, obstructed, reason);
+    }
+
+    /// <summary>
+    /// Sets the CabinStack shared stack spot (writes the persisted DefaultCabinLocation).
+    /// CabinStack-only; refused during a staged migration (the migration owns the spot
+    /// choice via 'cabins migrate place'); footprint-validated. Connected players get a Farm
+    /// re-introduction — the ghost position lives only in each peer's location-introduction
+    /// copy, and deltas rewrite warps, not positions.
+    /// </summary>
+    public bool TrySetStackSpot(Point topLeft, out string message)
+    {
+        if (!Game1.hasLoadedGame)
+        {
+            message = "No game loaded yet.";
+            return false;
+        }
+
+        if (!options.IsCabinStack)
+        {
+            message =
+                "The stack spot applies only to the CabinStack strategy "
+                + $"(active: {options.Data.CabinStrategy}).";
+            return false;
+        }
+
+        if (Data.ActiveMigration != null)
+        {
+            message =
+                "A staged migration is in progress — choose the spot with "
+                + "'cabins migrate place <x> <y>' (or '!migrate place'), or finish the "
+                + "migration first.";
+            return false;
+        }
+
+        if (!CabinPlacementValidator.TryValidateFootprint(Game1.getFarm(), topLeft, out var reason))
+        {
+            message = $"Can't use ({topLeft.X},{topLeft.Y}) as the stack spot: {reason}.";
+            return false;
+        }
+
+        Data.DefaultCabinLocation = topLeft.ToVector2();
+        Data.Write();
+        message =
+            $"Stack spot set to ({topLeft.X},{topLeft.Y})."
+            + DescribeDeferredReintroductions(ReintroduceFarmToOnlinePeers());
+        Monitor.Log(message, LogLevel.Info);
+        return true;
     }
 
     #endregion
@@ -478,6 +908,37 @@ public class CabinManagerService : ModService
     {
         var ownerId = cabin.GetIndoors<Cabin>()?.owner?.UniqueMultiplayerID ?? 0;
         return ownerId != 0 && Data.PlayerCabinPositions.ContainsKey(ownerId);
+    }
+
+    /// <summary>
+    /// True for a cabin the bulk movers (SyncExistingCabins' MoveToStack sweep,
+    /// ApplyStrategySwitch's None→stacked sweep) may pull into the hidden stack: not
+    /// already hidden, not a lobby/editing cabin, not /cabin-placed (player intent
+    /// outranks the sweep), and not placed by the active staged migration (must survive
+    /// interim reloads). Callers pre-filter on isCabin.
+    /// </summary>
+    private bool IsSweepableIntoStack(Building cabin) =>
+        !cabin.IsInHiddenStack()
+        && !cabin.IsLobbyOrEditing()
+        && !HasSavedPosition(cabin)
+        && !IsMigrationPlaced(cabin);
+
+    /// <summary>
+    /// True if the cabin was placed by the active staged migration. Such a cabin must
+    /// survive interim reloads: the bulk movers (MoveToStack / strategy migration) exempt
+    /// it exactly like a /cabin-placed one. Matched by interior NameOrUniqueName — unique
+    /// and save-stable; spare cabins are ownerless so an owner key won't do.
+    /// </summary>
+    private bool IsMigrationPlaced(Building cabin)
+    {
+        var placedNames = Data.ActiveMigration?.PlacedCabinIndoorNames;
+        if (placedNames == null || placedNames.Count == 0)
+        {
+            return false;
+        }
+
+        var name = cabin.GetIndoors<Cabin>()?.NameOrUniqueName;
+        return name != null && placedNames.Contains(name);
     }
 
     private void SyncExistingCabins()
@@ -530,9 +991,7 @@ public class CabinManagerService : ModService
             && options.Data.ExistingCabinBehavior == ExistingCabinBehavior.MoveToStack
         )
         {
-            var visibleCabins = allCabins
-                .Where(b => !b.IsInHiddenStack() && !b.IsLobbyOrEditing() && !HasSavedPosition(b))
-                .ToList();
+            var visibleCabins = allCabins.Where(IsSweepableIntoStack).ToList();
             if (visibleCabins.Count > 0)
             {
                 Monitor.Log(
@@ -553,6 +1012,14 @@ public class CabinManagerService : ModService
 
     private void OnLocationIntroductionMessage(MessageContext context)
     {
+        // Under None there is no hidden stack and no warp manipulation — leave the
+        // message untouched. Checked per message (not at registration) because the
+        // strategy can change in-process.
+        if (options.IsNone)
+        {
+            return;
+        }
+
         // Parse message
         var forceCurrentLocation = context.Reader.ReadBoolean();
         var netRootLocation = NetRoot<GameLocation>.Connect(context.Reader);
@@ -572,18 +1039,24 @@ public class CabinManagerService : ModService
             // farmhouse building, we adjust its warps while leaving all cabins in
             // `HiddenCabinLocation`.
             farm = Game1.getFarm();
-            var fhCabin = farm.GetCabin(context.PeerId);
+            var fhCabin = ResolveCabinRepairingLink(farm, context.PeerId, "FarmhouseStack");
             if (fhCabin != null)
             {
-                fhCabin.SetWarpsToFarmFarmhouseDoor();
+                // A cabin its owner moved out via !cabin exits at its own door; everyone
+                // else keeps the shared farmhouse-door exit. Gate on HasSavedPosition
+                // (intent), NOT !IsInHiddenStack(): lobby cabins live on row y=-21, outside
+                // the (-20,-20) hidden-stack check, and must not be exempted.
+                if (HasSavedPosition(fhCabin))
+                {
+                    fhCabin.SetWarpsToFarmCabinDoor();
+                }
+                else
+                {
+                    fhCabin.SetWarpsToFarmFarmhouseDoor();
+                }
             }
-            else
-            {
-                Monitor.Log(
-                    $"FarmhouseStack: cabin not found for peer {context.PeerId} during location introduction (cabin ownership may not be linked yet)",
-                    LogLevel.Warn
-                );
-            }
+            // A null return is an unrecoverable one-way link that ResolveCabinRepairingLink
+            // already logged; the player joins with the cabin hidden.
         }
         else
         {
@@ -592,37 +1065,30 @@ public class CabinManagerService : ModService
             // Only relocate cabins that are in the hidden stack. Cabins at real
             // positions (e.g. from imported saves with KeepExisting) stay put.
             farm = netRootFarm;
-            var cabin = farm.GetCabin(context.PeerId);
+            var cabin = ResolveCabinRepairingLink(farm, context.PeerId, "CabinStack");
             if (cabin != null && cabin.IsInHiddenStack())
             {
                 cabin.Relocate(StackLocation.Create(_cabinManagerData).ToPoint());
             }
             else if (cabin != null && !cabin.IsInHiddenStack())
             {
-                // This peer's own cabin is NOT in the hidden stack (they moved it via
-                // /cabin, or it imported visible under KeepExisting), so they'd otherwise
-                // see an empty spot at the shared StackLocation where everyone else sees a
-                // cabin. Render one hidden-stack cabin there as a *door-dead* dummy so the
-                // empty spot is filled without exposing another player's home.
-                //
-                // Both routes (!cabin-moved and KeepExisting-imported-visible) reach this
-                // branch through the identical `!IsInHiddenStack()` precondition, which is all
-                // this branch reads — the saved-position intent map is not consulted here. So
-                // the !cabin-moved E2E test (DummyCabin_AfterMoveAndReconnect...) covers the
-                // KeepExisting route by equivalence; a separate KeepExisting test would
-                // exercise the same dummy code with heavier strategy-setup, not new coverage.
-                //
-                // FirstOrDefault + null-guard are load-bearing defense: a First/. would turn
-                // the (effectively unreachable on a real join — EnsureAtLeastXCabins replenishes
-                // the hidden pool before locationIntroduction) zero-candidate case into a broken
-                // join handshake. IsInHiddenStack() checks (-20,-20) only, so lobby cabins at
-                // (-21,-21) are excluded automatically.
-                var dummy = farm.buildings.FirstOrDefault(b =>
-                    b.isCabin && b != cabin && b.IsInHiddenStack()
+                // Own cabin is visible, so fill the stack spot with a door-less phantom in this
+                // peer's copy. Must be a fresh Building: clients resolve every farmer's home by
+                // interior name across Farm.buildings and never rebuild interiors, so nulling a
+                // real cabin's interior makes its owner's home unresolvable there (festival
+                // loadActors throws). No hidden cabin means nobody sees one at the spot.
+                var skinSource = farm.buildings.FirstOrDefault(b =>
+                    b.isCabin && b.IsInHiddenStack()
                 );
-                if (dummy != null)
+                if (skinSource != null)
                 {
-                    PlaceDoorDeadDummyCabin(dummy);
+                    var phantom = new Building(
+                        "Cabin",
+                        StackLocation.Create(_cabinManagerData).Location
+                    );
+                    phantom.skinId.Value = skinSource.skinId.Value;
+                    phantom.daysOfConstructionLeft.Value = 0;
+                    farm.buildings.Add(phantom);
                 }
             }
         }
@@ -636,43 +1102,139 @@ public class CabinManagerService : ModService
     }
 
     /// <summary>
-    /// Renders a hidden-stack cabin at the shared StackLocation as a door-dead dummy, mutating
-    /// only the per-peer message copy passed in. The cabin fills the empty spot the peer would
-    /// otherwise see, but its door is a no-op — stepping on it does nothing, so it never exposes
-    /// the real owner's home.
+    /// Resolves the joining peer's cabin building for the location-introduction warp rewrite,
+    /// healing a corrupt one-way farmhand↔cabin link when it can be done safely.
     ///
-    /// How the door is killed sure-fire: Building.doAction only warps the player inside when
-    /// GetIndoors() != null (decompiled Building.cs:950). GetIndoors() reads indoors.Value then
-    /// nonInstancedIndoorsName; null both → no interior → no entry. The client never re-creates
-    /// the interior: LoadFromBuildingData's createIndoors is gated on `hasLoaded || forConstruction`
-    /// (Building.cs:523), and hasLoaded is only ever set on the master (Building.load() early-returns
-    /// `if (!Game1.IsMasterGame)`), so on a farmhand client hasLoaded stays false and the nulled
-    /// interior survives deserialization. humanDoor IS reset from data on the client, but that's
-    /// irrelevant once GetIndoors() is null. This mutates the deserialized copy only (NetRoot.Connect
-    /// builds a fresh graph), so master state and other peers are untouched.
+    /// The vanilla join gate (GameServer.checkFarmhandRequest → NetWorldState.TryAssignFarmhandHome)
+    /// approves a farmhand the moment its homeLocation resolves to SOME Cabin, WITHOUT verifying
+    /// that cabin's farmhandReference points back at it (decompiled NetWorldState.cs:783). So the
+    /// only reachable state in which GetCabin(peerId) returns null here is a one-way link:
+    /// farmhand→cabin (homeLocation) intact, cabin→farmhand (farmhandReference) stale or null. Re-
+    /// establish the back-link on the farmhand's OWN home cabin, guarded so we never take a cabin a
+    /// real farmhand owns (a genuine two-claimant corruption the join must surface). A null/self
+    /// reference is rewritten directly; a stale reference to a spurious unclaimed placeholder is
+    /// re-homed via Cabin.AssignFarmhand, which DELETES that placeholder cleanly (a bare reference
+    /// write would orphan it) — see <see cref="TryRepairHomeCabinDurable"/> /
+    /// <see cref="IsSpuriousPlaceholder"/>.
+    ///
+    /// The passed <paramref name="farm"/> differs by strategy: FarmhouseStack passes master
+    /// (Game1.getFarm()), so the master repair both heals durably and resolves this call; CabinStack
+    /// passes the per-peer netRootFarm copy (a fresh graph from NetRoot.Connect) that the master
+    /// repair cannot reach, so the copy is repaired too for a seamless current join. Returns the
+    /// resolved cabin building, or null when the link is genuinely unrecoverable (having logged).
     /// </summary>
-    private void PlaceDoorDeadDummyCabin(Building dummy)
+    private Building ResolveCabinRepairingLink(GameLocation farm, long peerId, string strategyLabel)
     {
-        dummy.SetPosition(StackLocation.Create(_cabinManagerData).ToPoint());
-        // Kill the door: null both interior references so GetIndoors() returns null on the client.
-        // No need to set interior warps — there is no interior to warp into anymore.
-        dummy.indoors.Value = null;
-        dummy.nonInstancedIndoorsName.Value = null;
-    }
-
-    private void OnLocationDeltaMessage(MessageContext context)
-    {
-        if (NetworkHelper.IsLocationDeltaMessageForLocation(context, out Cabin cabin))
+        var cabin = farm.GetCabin(peerId);
+        if (cabin != null)
         {
-            if (this.options.IsFarmHouseStack)
+            return cabin; // Healthy back-link — the no-op fast path on every normal join.
+        }
+
+        var farmhand = Game1.GetPlayer(peerId);
+        var homeName = farmhand?.homeLocation.Value;
+        if (string.IsNullOrEmpty(homeName))
+        {
+            LogUnrecoverableCabinLink(strategyLabel, peerId);
+            return null;
+        }
+
+        // Durable heal on master: re-establish the home cabin's back-link to its rightful owner.
+        // This fixes every future join even when the current call resolves against a per-peer copy.
+        if (Game1.getLocationFromName(homeName) is Cabin masterHome)
+        {
+            TryRepairHomeCabinDurable(masterHome, farmhand);
+        }
+
+        cabin = farm.GetCabin(peerId);
+        if (cabin != null)
+        {
+            return cabin; // FarmhouseStack (farm == master) now resolves.
+        }
+
+        // CabinStack: farm is the per-peer message copy the master repair didn't touch. Locate the
+        // copy's cabin by interior name (stable guid across master and copy) and heal it in place so
+        // this join is also seamless.
+        var copyCabin = farm.GetBuilding(b =>
+            b.isCabin && b.GetIndoors<Cabin>()?.NameOrUniqueName == homeName
+        );
+        if (copyCabin?.GetIndoors<Cabin>() is Cabin copyHome && CanTakeHomeCabin(copyHome, peerId))
+        {
+            // Ephemeral per-peer intro copy — a direct reference write suffices; the master heal
+            // above already deleted any spurious placeholder durably, so nothing to delete here.
+            copyHome.farmhandReference.Value = farmhand;
+            cabin = farm.GetCabin(peerId);
+            if (cabin != null)
             {
-                cabin.SetWarpsToFarmFarmhouseDoor();
-            }
-            else
-            {
-                cabin.SetWarpsToFarmCabinDoor();
+                return cabin;
             }
         }
+
+        LogUnrecoverableCabinLink(strategyLabel, peerId);
+        return null;
+    }
+
+    /// <summary>
+    /// Durably re-establishes the back-link from <paramref name="cabin"/> to
+    /// <paramref name="farmhand"/> on the master graph, dispatching on what the cabin's
+    /// farmhandReference currently points at:
+    ///  • null or this same farmhand — a direct reference write; there is no farmhand to displace,
+    ///    so AssignFarmhand's DeleteFarmhand path (cabin-system invariant 10) is neither needed nor
+    ///    wanted.
+    ///  • a spurious unclaimed placeholder (<see cref="IsSpuriousPlaceholder"/>) — the cabin is
+    ///    genuinely this farmhand's; AssignFarmhand takes it, DELETING the placeholder cleanly.
+    ///    A bare reference write would instead orphan the placeholder (still homed here, no cabin),
+    ///    re-tripping this heal on its own next join.
+    ///  • a real, stamped, or recorded claimant — a genuine two-claimant corruption; leave it so
+    ///    the join surfaces it (the caller joins with the cabin hidden) rather than stealing a home.
+    /// </summary>
+    private void TryRepairHomeCabinDurable(Cabin cabin, Farmer farmhand)
+    {
+        var owner = cabin.owner;
+        if (owner == null || owner.UniqueMultiplayerID == farmhand.UniqueMultiplayerID)
+        {
+            cabin.farmhandReference.Value = farmhand;
+        }
+        else if (IsSpuriousPlaceholder(owner))
+        {
+            // Guarded above against a real owner, so AssignFarmhand's mismatch throw is unreachable.
+            cabin.AssignFarmhand(farmhand);
+        }
+        // else: real/stamped/recorded claimant — decline; the caller logs it and hides the cabin.
+    }
+
+    /// <summary>
+    /// Whether <paramref name="cabin"/> may be pointed at <paramref name="peerId"/> in a throwaway
+    /// per-peer intro copy: currently unowned, already this peer's, or a spurious placeholder. A
+    /// real, stamped, or recorded claimant returns false (never show a joiner another player's
+    /// home). The copy is ephemeral, so this gates only a direct reference write — deleting a
+    /// spurious placeholder durably is the master heal's job (<see cref="TryRepairHomeCabinDurable"/>).
+    /// </summary>
+    private bool CanTakeHomeCabin(Cabin cabin, long peerId)
+    {
+        var owner = cabin.owner;
+        return owner == null || owner.UniqueMultiplayerID == peerId || IsSpuriousPlaceholder(owner);
+    }
+
+    /// <summary>
+    /// A cabin owner that is a genuine unclaimed placeholder — safe to displace/delete: an
+    /// uncustomized farmhand with no userID stamp AND no ownership-map record. isCustomized alone
+    /// is unreliable (cabin-system invariant 10: a stuck abandoned claim also reads uncustomized),
+    /// so either a stamp or an ownership record marks a real claimant that must not be displaced.
+    /// </summary>
+    private bool IsSpuriousPlaceholder(Farmer owner) =>
+        owner.isUnclaimedFarmhand
+        && string.IsNullOrEmpty(owner.userID.Value)
+        && !farmhandOwnership.TryGetOwner(owner.UniqueMultiplayerID, out _);
+
+    private void LogUnrecoverableCabinLink(string strategyLabel, long peerId)
+    {
+        Monitor.Log(
+            $"{strategyLabel}: farmhand {peerId} has a one-way cabin link that cannot be safely "
+                + "repaired (home cabin missing or owned by another farmhand) — joining with cabin "
+                + "hidden; save data may be inconsistent",
+            LogLevel.Warn
+        );
     }
 
     #endregion
@@ -747,6 +1309,27 @@ public class CabinManagerService : ModService
         var effectiveMin = Math.Max(minEmptyCabins, minRequired);
         var cabinsMissingCount = effectiveMin - availableCount;
 
+        // None cap: total cabins never grow past min(designated positions, MaxPlayers) — the
+        // honest player ceiling. This bounds every caller (join, save-load, farmhand-menu
+        // reservations, delete-rebuild) so on-demand growth can't place a cabin onto a
+        // developed farm. The save-import finalizer is deliberately exempt: it builds via
+        // BuildNewCabinVisibleReturning directly, so a swap-host import can always place its
+        // owner's cabin (counted against the cap afterwards).
+        if (options.IsNone && cabinsMissingCount > 0)
+        {
+            var totalCount = farm.buildings.Count(b => b.isCabin && !b.IsLobbyOrEditing());
+            var headroom = Math.Max(0, GetNoneCabinCap(farm) - totalCount);
+            if (cabinsMissingCount > headroom)
+            {
+                Monitor.Log(
+                    $"Cabin check: None cap reached ({totalCount}/{GetNoneCabinCap(farm)} cabins), "
+                        + $"clamping build request from {cabinsMissingCount} to {headroom}",
+                    LogLevel.Debug
+                );
+                cabinsMissingCount = headroom;
+            }
+        }
+
         Monitor.Log(
             $"Cabin check: {availableCount}/{effectiveMin} available, building {Math.Max(0, cabinsMissingCount)}",
             LogLevel.Debug
@@ -796,6 +1379,27 @@ public class CabinManagerService : ModService
     }
 
     /// <summary>
+    /// The None strategy's total-cabin ceiling: the count frozen at game creation
+    /// (min(designated positions, MaxPlayers) — see GameCreatorService.CreateNewGame). A later
+    /// MaxPlayers raise does NOT grow it; deletes replenish in place only, onto the just-freed
+    /// designated spot. For a save predating the frozen field (NoneCabinCount == 0), fall back
+    /// to computing the same min live.
+    /// </summary>
+    public int GetNoneCabinCap(Farm farm)
+    {
+        var frozen = options.Data.NoneCabinCount;
+        if (frozen > 0)
+        {
+            return frozen;
+        }
+
+        return Math.Min(
+            FarmCabinPositions.GetDesignatedPositions(farm).Count,
+            options.Data.MaxPlayers
+        );
+    }
+
+    /// <summary>
     /// Count available (unassigned) cabins, strategy-aware.
     /// A cabin is available if its owner has NOT been customized (isCustomized = false)
     /// and has no userID assigned. This matches how SyncExistingCabins determines claimed cabins.
@@ -804,7 +1408,7 @@ public class CabinManagerService : ModService
     private int GetAvailableCabinCount(GameLocation farm, long excludePeer = 0)
     {
         return farm
-            .buildings.Where(b => b.isCabin && !LobbyService.IsLobbyCabin(b))
+            .buildings.Where(b => b.isCabin && !b.IsLobbyOrEditing())
             .Count(b => IsCabinAvailable(b, excludePeer));
     }
 
@@ -856,36 +1460,75 @@ public class CabinManagerService : ModService
     }
 
     /// <summary>
+    /// First non-lobby cabin whose slot is available (<see cref="IsCabinAvailable"/>) AND has an
+    /// owner entry to mutate — the canonical scan for test endpoints that stamp or precustomize a
+    /// spare slot. Null when no such slot exists. Game-thread only.
+    /// </summary>
+    public Cabin FindAvailableCabinWithOwner()
+    {
+        var farm = Game1.getFarm();
+        if (farm == null)
+        {
+            return null;
+        }
+
+        foreach (var building in farm.buildings)
+        {
+            if (!building.isCabin || building.IsLobbyOrEditing())
+            {
+                continue;
+            }
+
+            var cabin = building.GetIndoors<Cabin>();
+            if (cabin?.owner == null || !IsCabinAvailable(building))
+            {
+                continue;
+            }
+
+            return cabin;
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// Releases an abandoned slot claim on a single farmhand entry. A claim is "abandoned" when
-    /// the farmhand has a userID set (a player clicked the slot, which stamps their platform ID
-    /// via vanilla Client.sendPlayerIntroduction) but isCustomized is false (they quit before
-    /// finishing character creation). Vanilla FarmhandMenu then greys the slot out for every
-    /// other player, locking it to the ghost. Clearing userID re-opens the slot.
+    /// the slot carries any ownership marker — a userID stamp (a player clicked the slot, which
+    /// stamps their platform ID via vanilla Client.sendPlayerIntroduction) and/or an ownership-map
+    /// record (written at the join gate's approve moment) — but isCustomized is false (they quit
+    /// before finishing character creation). Vanilla FarmhandMenu greys a stamped slot for every
+    /// other player, and the ownership gate locks a mapped slot to the ghost; a map-only claim is
+    /// real too (a Galaxy-auth-failed Steam client stamps nothing, but the gate recorder maps it
+    /// at approve), so an empty stamp must NOT early-return. Clearing both re-opens the slot.
+    ///
+    /// Operator-origin records (farmhand rebind / save-import bind) are NOT abandoned claims —
+    /// a pre-assignment on a not-yet-customized slot is deliberate and must survive restarts and
+    /// the assignee's own quit-during-character-creation; only the ghost stamp is cleared then.
     ///
     /// Caller-agnostic: both the disconnect heal (CleanupAbandonedCabinClaim) and the save-load
-    /// sweep (ClearAbandonedCabinClaimsOnLoad) pass the persisted farmhandData entry. The only
-    /// mutation is the userID NetString value write; the rest of the farmhand stays in its
+    /// sweep (ClearAbandonedCabinClaimsOnLoad) pass the persisted farmhandData entry. The
+    /// farmhand mutation is only the userID NetString value write; the rest stays in its
     /// default uncustomized state. Returns true if a claim was cleared.
     /// </summary>
     private bool TryClearAbandonedClaim(Farmer farmhand)
     {
-        if (farmhand == null)
+        if (farmhand == null || farmhand.isCustomized.Value)
         {
-            return false;
+            return false; // no entry / real player — must not touch
         }
 
-        if (string.IsNullOrEmpty(farmhand.userID.Value))
+        var hasStamp = !string.IsNullOrEmpty(farmhand.userID.Value);
+        var hasOwner = farmhandOwnership.TryGetOwner(farmhand.UniqueMultiplayerID, out var owner);
+        var clearOwner = hasOwner && owner.Origin != FarmhandOwnershipService.OriginOperator;
+        if (!hasStamp && !clearOwner)
         {
-            return false; // no claim
-        }
-
-        if (farmhand.isCustomized.Value)
-        {
-            return false; // real player — must not touch
+            return false; // no claim (or only a deliberate operator pre-assignment)
         }
 
         Monitor.Log(
-            $"Releasing abandoned cabin claim (userID='{ChatRedaction.MaskValue(farmhand.userID.Value)}', slot was claimed but not customized)",
+            $"Releasing abandoned cabin claim (userID='{ChatRedaction.MaskValue(farmhand.userID.Value)}', "
+                + $"hadOwnerRecord={hasOwner}, ownerRecordKept={hasOwner && !clearOwner}, "
+                + "slot was claimed but not customized)",
             LogLevel.Info
         );
         Diagnostics.ModEventLog.Emit(
@@ -894,9 +1537,16 @@ public class CabinManagerService : ModService
             {
                 clearedUserId = farmhand.userID.Value,
                 ownerUniqueMultiplayerId = farmhand.UniqueMultiplayerID,
+                hadOwnerRecord = hasOwner,
+                ownerRecordKept = hasOwner && !clearOwner,
             }
         );
         farmhand.userID.Value = "";
+        if (clearOwner)
+        {
+            farmhandOwnership.RemoveOwner(farmhand.UniqueMultiplayerID);
+        }
+
         return true;
     }
 
@@ -1041,7 +1691,16 @@ public class CabinManagerService : ModService
     public Cabin BuildNewCabinVisibleReturning(GameLocation location)
     {
         var farm = location as Farm ?? Game1.getFarm();
-        var position = FarmCabinPositions.GetNextAvailablePosition(farm);
+        // The cabin is created before its position is picked so the freed-tile check can
+        // run the full placement validation against its real footprint; buildStructure
+        // assigns the position (and OnValueAdded re-derives the interior warps), so the
+        // placeholder position never leaks. A just-freed visible-cabin tile (DestroyCabin)
+        // outranks the designated positions: re-placing there keeps the delete→rebuild
+        // slot in place — validated at take time, so it can never bulldoze player work.
+        var cabin = CreateCabinBuilding(Vector2.Zero);
+        var position =
+            TakeFreedVisibleCabinTile(farm, cabin)
+            ?? FarmCabinPositions.GetNextAvailablePosition(farm);
 
         if (!position.HasValue)
         {
@@ -1053,15 +1712,15 @@ public class CabinManagerService : ModService
             return null;
         }
 
-        var cabin = CreateCabinBuilding(position.Value);
-
         if (location.buildStructure(cabin, position.Value, Game1.player, true))
         {
-            cabin.ClearTerrainBelow();
-
             var indoors = cabin.GetIndoors<Cabin>();
             if (indoors == null)
             {
+                // buildStructure added the cabin to the location, but with no interior it can't
+                // host a farmhand — remove the orphan (raw Remove, matching DestroyCabin) rather
+                // than leave a dead building, and leave the footprint uncleared (ClearTerrainBelow
+                // runs only on the success path below).
                 Monitor.Log(
                     $"Visible cabin at ({position.Value.X}, {position.Value.Y}) was built but has no interior; farmhand not created",
                     LogLevel.Warn
@@ -1076,8 +1735,11 @@ public class CabinManagerService : ModService
                         reason = "no_interior_after_buildStructure",
                     }
                 );
+                location.buildings.Remove(cabin);
                 return null;
             }
+
+            cabin.ClearTerrainBelow();
 
             Monitor.Log(
                 $"Built visible cabin at ({position.Value.X}, {position.Value.Y})",
@@ -1096,6 +1758,28 @@ public class CabinManagerService : ModService
                 reason = "buildStructure_returned_false",
             }
         );
+        return null;
+    }
+
+    /// <summary>
+    /// The most recently freed visible-cabin tile that still passes full placement
+    /// validation for <paramref name="probe"/>, or null. Validated at take time with
+    /// <see cref="CabinPlacementValidator"/> (footprint, terrain/objects, farmers) — not
+    /// mere anchor occupancy: the tile may have been freed days ago, and anything a player
+    /// built or planted on the footprint since must disqualify it, because the caller
+    /// builds with skipSafetyChecks + ClearTerrainBelow. A failing tile is dropped.
+    /// </summary>
+    private Vector2? TakeFreedVisibleCabinTile(Farm farm, Building probe)
+    {
+        while (_freedVisibleCabinTiles.Count > 0)
+        {
+            var tile = _freedVisibleCabinTiles.Dequeue();
+            if (CabinPlacementValidator.TryValidate(farm, probe, tile, out _))
+            {
+                return new Vector2(tile.X, tile.Y);
+            }
+        }
+
         return null;
     }
 
@@ -1132,6 +1816,11 @@ public class CabinManagerService : ModService
             indoors.DeleteFarmhand();
         }
 
+        if (ownerId != 0)
+        {
+            farmhandOwnership.RemoveOwner(ownerId);
+        }
+
         // Vanilla Cabin.demolish() resets every villager homed in the cabin to its canonical home
         // before removal (Cabin.cs:196-203); our raw-remove path skips it, stranding an NPC that
         // married this cabin's owner — its DefaultMap stays "FarmHouse<guid>", and the next
@@ -1141,6 +1830,13 @@ public class CabinManagerService : ModService
         if (indoors != null && !string.IsNullOrEmpty(deletedName))
         {
             ResetVillagersHomedAt(indoors, deletedName);
+        }
+
+        if (!cabinBuilding.IsInHiddenStack() && !cabinBuilding.IsLobbyOrEditing())
+        {
+            _freedVisibleCabinTiles.Enqueue(
+                new Point(cabinBuilding.tileX.Value, cabinBuilding.tileY.Value)
+            );
         }
 
         farm.buildings.Remove(cabinBuilding);
@@ -1573,7 +2269,7 @@ public class CabinManagerService : ModService
         // physically stranded inside a lobby/editing interior.
         foreach (var building in farm.buildings)
         {
-            if (!building.isCabin || !LobbyService.IsLobbyCabin(building))
+            if (!building.isCabin || !building.IsLobbyOrEditing())
             {
                 continue;
             }
@@ -1760,7 +2456,7 @@ public class CabinManagerService : ModService
 
         foreach (var building in farm.buildings)
         {
-            if (!building.isCabin || LobbyService.IsLobbyCabin(building))
+            if (!building.isCabin || building.IsLobbyOrEditing())
             {
                 continue;
             }
@@ -1815,10 +2511,13 @@ public class CabinManagerService : ModService
     /// <summary>
     /// One-shot save-import finalizer. Reads the pending finalize intent (written by
     /// <see cref="SaveImportService.ExecuteImport"/> during a swap import); if present and for this
-    /// save, demotes the imported owner into a known cabin, moves their farmhouse contents and
-    /// household NPCs into it, and re-stamps their platform userID. Self-heals (Warn + clear +
-    /// return) on any pre-condition miss, and clears the intent on EVERY exit (including a throw
-    /// after a world mutation) so a failed finalize never retries against an already-changed world.
+    /// save, binds the demoted owner's platform identity in the ownership map (first, so any
+    /// later failure leaves them claimable), then homes them into a known cabin and moves their
+    /// farmhouse contents and household NPCs into it. Self-heals (Warn + clear + return) on any
+    /// pre-condition miss, and clears the intent on EVERY exit (including a throw after a world
+    /// mutation) so a failed finalize never retries against an already-changed world. Every exit
+    /// ends in <see cref="HostFarmhouseUpgradeGuard.EnsureHostPlayerBed"/>: the load-time heal skips
+    /// the bed while an intent is pending, since the farmhouse holds the owner's bed until the move.
     /// </summary>
     private void TryFinalizeOnLoad()
     {
@@ -1828,6 +2527,18 @@ public class CabinManagerService : ModService
             return; // zero cost on normal loads
         }
 
+        try
+        {
+            FinalizeOnLoad(intent);
+        }
+        finally
+        {
+            HostFarmhouseUpgradeGuard.EnsureHostPlayerBed();
+        }
+    }
+
+    private void FinalizeOnLoad(PendingFinalize intent)
+    {
         // Wrong-save guard: a stale intent (or an unrelated loader write between import and reboot)
         // must not mis-finalize a different save.
         if (!string.Equals(Constants.SaveFolderName, intent.SaveName, StringComparison.Ordinal))
@@ -1870,18 +2581,34 @@ public class CabinManagerService : ModService
 
         try
         {
-            // Step 4 — resolve the owner's cabin handle (reuse an auto-assigned cabin if the load
+            // Step 4 — record the bind FIRST (idempotent map write; depends only on the owner uid
+            // and the intent's userId), so a failure in any later cabin/content step still leaves
+            // the demoted owner claimable by their platform identity. Also clear any legacy userID
+            // stamp: the map is what the join gate and visibility filter enforce; a stamp would
+            // additionally trigger vanilla client-side graying by Galaxy-space compare, which
+            // would show the bound owner their own farmhand as LOCKED on any Steam/GOG client
+            // (no transport ever presents a Steam64 as getUserID()).
+            failedStep = "bind_ownership";
+            farmhandOwnership.RecordOwner(
+                owner.UniqueMultiplayerID,
+                FarmhandOwnershipService.ClassifyPlatformId(intent.UserId),
+                intent.UserId,
+                FarmhandOwnershipService.OriginOperator
+            );
+            owner.userID.Value = "";
+
+            // Step 5 — resolve the owner's cabin handle (reuse an auto-assigned cabin if the load
             // coroutine already homed the owner into a spare one, else build a fresh cabin).
             failedStep = "resolve_cabin";
             var cabin = ResolveOrBuildOwnerCabin(owner, out var builtFresh);
             if (cabin == null)
             {
-                // Loud-fail at Warn (not Error). The owner stays a customized-but-cabin-less
-                // farmhand (progress intact, recoverable by a later reassignment); never proceed to
-                // the world-mutating steps.
+                // Loud-fail at Warn (not Error). The owner stays a customized, cabin-less but
+                // BOUND farmhand (progress intact, claimable; a later reassignment can re-home);
+                // never proceed to the world-mutating steps.
                 Monitor.Log(
                     $"Save-import: could not resolve or build a cabin for owner {intent.OwnerUid}; "
-                        + "finalize aborted (owner kept, progress intact).",
+                        + "finalize aborted (owner kept and bound, progress intact).",
                     LogLevel.Warn
                 );
                 Diagnostics.ModEventLog.Emit(
@@ -1902,25 +2629,19 @@ public class CabinManagerService : ModService
 
             var farmHouse = Game1.getLocationFromName("FarmHouse") as FarmHouse;
 
-            // Step 5 — move the owner's farmhouse contents into the cabin.
+            // Step 6 — move the owner's farmhouse contents into the cabin.
             failedStep = "move_contents";
             contentsMoved = TransferFarmhouseContentsToCabin(farmHouse, cabin, builtFresh);
 
-            // Step 6 — relocate the owner's household NPCs (pet, spouse, children) into the cabin.
+            // Step 7 — relocate the owner's household NPCs (pet, spouse, children) into the cabin.
             failedStep = "relocate_household";
             npcsMoved = RelocateHouseholdToCabin(farmHouse, cabin, owner);
 
-            // Step 7 — move the owner's cellar contents (casks/wine, built in the master-keyed
+            // Step 8 — move the owner's cellar contents (casks/wine, built in the master-keyed
             // "Cellar"-1 while they were the master) into the cellar the engine reassigns to them as
             // a farmhand. Counts toward contentsMoved.
             failedStep = "move_cellar";
             contentsMoved += TransferOwnerCellarContents(owner, cabin);
-
-            // Step 8 — re-stamp userID (idempotent whether vanilla cleared or preserved it). Owner
-            // is now homed + customized + bound; on any later reload it is homed → ResetFarmhandState
-            // early-returns → userID survives.
-            failedStep = "restamp_userid";
-            owner.userID.Value = intent.UserId;
 
             // Success — count it so the single-shot test can prove the finalizer ran exactly once
             // across reloads (a re-fire would bump this past 1).
@@ -1944,12 +2665,13 @@ public class CabinManagerService : ModService
         }
         catch (Exception ex)
         {
-            // A throw after a world mutation leaves a partially-moved-but-stable world. The owner is
-            // already customized + cabin-homed (progress intact), so a missing content/NPC move is a
-            // recoverable cosmetic gap, not a boot-loop. Warn (never Error) + emit partial.
+            // A throw after a world mutation leaves a partially-moved-but-stable world. The owner
+            // is already bound (step 4 runs first) and customized (progress intact), so a missing
+            // content/NPC move is a recoverable cosmetic gap, not a boot-loop. Warn (never Error)
+            // + emit partial.
             Monitor.Log(
                 $"Save-import finalize failed at step '{failedStep}': {ex.Message}. World is partially "
-                    + "moved but stable; owner kept. Intent cleared (no retry).",
+                    + "moved but stable; owner kept and bound. Intent cleared (no retry).",
                 LogLevel.Warn
             );
             Diagnostics.ModEventLog.Emit(
@@ -2022,9 +2744,10 @@ public class CabinManagerService : ModService
     /// <summary>
     /// Moves the former owner's placed farmhouse contents (chests + contents, machines + held items,
     /// furniture, fridge, mini-jukebox, wallpaper/flooring) from the FarmHouse into their cabin, then
-    /// clears the FarmHouse copies so the Server host boots into an empty house. The engine has no
-    /// built-in farmhouse→cabin transfer, so this is hand-written from the source-derived content
-    /// list. Returns the count of moved objects + furniture (for the finalize event).
+    /// clears the FarmHouse copies so the Server host boots into a house holding only the default
+    /// bed. The engine has no built-in farmhouse→cabin transfer, so this is hand-written from the
+    /// source-derived content list. Returns the count of moved objects + furniture (for the
+    /// finalize event).
     /// </summary>
     private int TransferFarmhouseContentsToCabin(FarmHouse farmHouse, Cabin cabin, bool builtFresh)
     {

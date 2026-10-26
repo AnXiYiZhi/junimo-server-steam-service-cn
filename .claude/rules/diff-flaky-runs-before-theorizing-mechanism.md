@@ -1,0 +1,15 @@
+---
+paths:
+  - "tests/**/*.cs"
+---
+
+# Localize a defect empirically before theorizing a mechanism
+
+A plausible mechanism story is cheap to invent and expensive to chase down the wrong layer. Two localization moves, both cheaper than theorizing:
+
+- **Flaky failure with pass + fail artifacts → diff the population.** The runs ARE a built experiment: pick one observable signal (a timestamp ordering, a logged date/count/id, which code path fired, an event's presence/absence) and tabulate it across several passes and the fail(s). A signal that splits cleanly along the pass/fail line is the differentiator — chase that, not your first mechanism hunch. If no single signal splits, widen the signal set rather than falling back to speculation.
+- **Wrong artifact from a multi-stage pipeline → bisect the stages.** For any producer→transform→consumer chain (capture→segment→concat→extract→encode, or similar), probe the intermediate output at each boundary and ask "is the defect present *here* yet?" The first stage where it appears is where to fix — often upstream of where you noticed it. A reproduction that isolates one stage (probe a single input unit; swap one tool/flag and re-measure) outranks any reasoning about how the tool "should" behave.
+
+**Why:** Both moves are anchored to expensive wrong-layer sessions. Diffing: the `AbandonedClaim_SweptOnReload` flake (33%) burned a long session on four plausible-but-wrong mechanism theories, each refuted only after detailed log-staring; tabulating one signal ("what in-game date did the reload load?") across 4 passing + 1 failing run gave a perfect 5/5 split and localized the cause to `/newgame`'s gating `SaveLoaded` in one step. Bisecting: a per-test recording came out 2× time-compressed; two confident mechanism stories led to a fix at the stage being stared at (reverted by the user as wrong), while two cheap probes — `ffprobe` on one raw segment, then swapping the concat method on the same segments — located the real cause at the earlier demux stage in minutes.
+
+**How to apply:** Apply whichever move matches the evidence you have, before proposing any fix. Sibling of [`runtime-post-conditions-are-gates.md`](universal/runtime-post-conditions-are-gates.md), which verifies a hypothesis by *running* it — this rule is about *forming* the hypothesis from evidence you already have.

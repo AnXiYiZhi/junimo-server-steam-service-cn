@@ -121,10 +121,13 @@ public abstract class TestBase : IAsyncLifetime, IDisposable
     private CancellationTokenSource? _budgetCts;
     private bool _budgetArmed;
 
-    // Token returned by Lease.Managed.RegisterRunningTest() at the queue→active
-    // transition. Disposed at the very end of DisposeAsync (after lease release)
-    // so server_disposed (per_test_release) annotations still resolve to this
-    // test. Null when AcquireServerAsync was never reached (dispose-during-init).
+    // Instance BindToActiveInstance last bound to; a re-acquire on the same instance is a no-op.
+    private string? _lastBoundInstanceId;
+
+    // Token from Lease.Managed.RegisterRunningTest(), re-pointed by BindToActiveInstance on a
+    // mid-test re-acquire. Disposed at the very end of DisposeAsync (after lease release) so
+    // server_disposed (per_test_release) annotations still resolve to this test. Null when no
+    // instance was ever bound (dispose-during-init).
     private IDisposable? _runningTestToken;
 
     /// <summary>
@@ -151,15 +154,18 @@ public abstract class TestBase : IAsyncLifetime, IDisposable
     /// <summary>
     /// Marks the queue→active transition: stamps <see cref="_activeStartTime"/>,
     /// emits <c>test_running</c> for the UI, and arms the per-test timeout.
-    /// Idempotent — only the first call has any effect, so mid-test
-    /// re-acquisitions (e.g. via <see cref="EnsureConnectedAsync"/> when
-    /// a persistent session was found dead) don't reset the timeout.
-    /// Call once per test, at the point where every harness queueing wait
-    /// (turn lock, client capacity, server slot, exclusive gate drain) has
-    /// completed and the test is about to run its own logic.
+    /// Only the first call arms the timeout, so mid-test re-acquisitions
+    /// (e.g. via <see cref="EnsureConnectedAsync"/> when a persistent session
+    /// was found dead) don't reset it; every call re-runs
+    /// <see cref="BindToActiveInstance"/>, since the re-acquired instance may
+    /// differ. Call at the point where every harness queueing wait (turn lock,
+    /// client capacity, server slot, exclusive gate drain) has completed and
+    /// the test is about to run its own logic.
     /// </summary>
     private void MarkActiveAndArmBudget()
     {
+        BindToActiveInstance();
+
         if (_budgetArmed)
         {
             return;
@@ -175,23 +181,47 @@ public abstract class TestBase : IAsyncLifetime, IDisposable
             _testDisplayName ?? $"{_testClassName}.unknown"
         );
 
-        // Register this test as currently executing on the leased server so
-        // broker-side annotations (server_poisoned, server_disposed,
-        // mod_phase forwarding) attribute to the running test rather than the
-        // test that originally took the lease (which differs under
-        // KeepConnected). Lease may be null for dispose-during-init paths;
-        // skip silently in that case.
-        if (Lease != null && _testDisplayName != null)
-        {
-            _runningTestToken = Lease.Managed.RegisterRunningTest(_testDisplayName);
-        }
-
         // Per-test progress heartbeat for the stall watchdog: a long KeepConnected class
         // holds one lease across many sequential methods (no acquire/release between them),
         // so without this its method boundaries would look like a stalled run.
         TestResourceBroker.Instance.MarkRunProgress();
 
         _budgetCts?.CancelAfter(TestTimeout);
+    }
+
+    /// <summary>
+    /// Binds this test's per-instance diagnostics to the currently-leased server; a repeat call on
+    /// the same instance is a no-op. Two bindings must track the active instance:
+    /// <list type="number">
+    ///   <item>the running-test registration, so broker-side annotations (server_poisoned,
+    ///   server_disposed, mod_phase forwarding) attribute to this test rather than the lease owner,
+    ///   which differs under KeepConnected;</item>
+    ///   <item>the <c>test_instance_bound</c> record in <c>infrastructure.jsonl</c>.
+    ///   <c>server_acquired</c> fires only for the test that took the lease; under
+    ///   KeepConnected/adopted sessions one lease spans many methods, so the other methods would
+    ///   have no on-disk test-to-instance link.</item>
+    /// </list>
+    /// A dead KeepConnected session re-acquires a possibly different instance mid-method, so both
+    /// bindings re-run there.
+    /// </summary>
+    private void BindToActiveInstance()
+    {
+        if (
+            Lease?.ServerInstanceId is not { } instanceId
+            || _testDisplayName == null
+            || instanceId == _lastBoundInstanceId
+        )
+        {
+            return;
+        }
+
+        _lastBoundInstanceId = instanceId;
+
+        // The prior token (if any) is on a lease this method no longer holds.
+        _runningTestToken?.Dispose();
+        _runningTestToken = Lease.Managed.RegisterRunningTest(_testDisplayName);
+
+        InfrastructureEventLog.Emit("test_instance_bound", new { serverInstanceId = instanceId });
     }
 
     /// <summary>
@@ -270,33 +300,21 @@ public abstract class TestBase : IAsyncLifetime, IDisposable
         // non-empty (rejects degraded responses where game state wasn't readable).
         // PlayerCount is NOT checked; other tests may have clients connected.
         var readySw = System.Diagnostics.Stopwatch.StartNew();
-        await PollingHelper.LongPollAsync(
+        var serverReady = await Lease.Api.WaitForStatusMatchAsync(
             WaitName.Polling_TestBase_ServerReady,
-            async (since, remaining) =>
-            {
-                var status = await Lease.Api.WaitForStatusAsync(
-                    since: since,
-                    isReady: true,
-                    timeout: remaining,
-                    ct: ct
-                );
-                if (status == null)
-                {
-                    return new PollingHelper.LongPollResult(false, since);
-                }
-
-                if (!string.IsNullOrEmpty(status.FarmName))
-                {
-                    return new PollingHelper.LongPollResult(true, status.Version);
-                }
-                // IsReady matched but FarmName empty (degraded snapshot) — advance
-                // cursor and wait for the next snapshot.
-                return new PollingHelper.LongPollResult(false, status.Version);
-            },
             TestTimings.ServerReadyBetweenTests,
-            cancellationToken: ct
+            matches: status => !string.IsNullOrEmpty(status.FarmName),
+            isReady: true,
+            ct: ct
         );
         LogTrace($"ServerReady wait: {SetupEventBus.FormatDuration(readySw.Elapsed)}");
+
+        if (!serverReady)
+        {
+            LogWarning(
+                $"{WaitName.Polling_TestBase_ServerReady} did not confirm a ready server within {TestTimings.ServerReadyBetweenTests.TotalSeconds}s; continuing setup."
+            );
+        }
 
         ServerStatus = await Lease.Api.GetStatus();
     }
@@ -386,8 +404,8 @@ public abstract class TestBase : IAsyncLifetime, IDisposable
 
         // Reuse the same classifier the broker poison path uses (walks the inner-exception
         // chain), so the acquire-time skip and the host-poison decision agree on what counts
-        // as transport. A non-null reason means Socket/Http/EOF/broken-pipe etc.
-        return TransportFaultClassifier.Classify(ex).Reason is not null;
+        // as transport: forward- or host-scoped only — an unclassified fault is application-level.
+        return TransportFaultClassifier.Classify(ex).IsTransportFault;
     }
 
     /// <summary>
@@ -417,7 +435,7 @@ public abstract class TestBase : IAsyncLifetime, IDisposable
             SetupEventBus.EmitInstanceLeased(
                 lease.InstanceId,
                 _testDisplayName,
-                serverLease.Managed?.InstanceId
+                serverLease.Managed.InstanceId
             );
         }
 
@@ -437,6 +455,10 @@ public abstract class TestBase : IAsyncLifetime, IDisposable
 
         _connection = new ConnectionHelper(lease.Client, connectionOptions, ServerApi);
 
+        // Wire the per-server join gate onto the join core (see ConnectionHelper.AcquireJoinGate).
+        _connection.AcquireJoinGate = serverLease.Managed.AcquireJoinGateAsync;
+        _connection.ReleaseJoinGate = serverLease.Managed.ReleaseJoinGate;
+
         _connection.OnCheckpointScreenshot = async (label) =>
         {
             if (ScreenshotMode == TestScreenshotMode.All)
@@ -453,7 +475,6 @@ public abstract class TestBase : IAsyncLifetime, IDisposable
         );
         WireExceptionMonitorContext(_exceptions);
 
-        lease.Client.CancellationToken = serverLease.ErrorToken;
         return lease.Client;
     }
 
@@ -473,14 +494,19 @@ public abstract class TestBase : IAsyncLifetime, IDisposable
     /// <summary>
     /// Lease an additional client (for multi-client tests like concurrent auth).
     /// </summary>
-    protected async Task<ClientLease> LeaseClientAsync(CancellationToken ct = default)
+    /// <param name="requireSteam">See <see cref="ResourceLease.LeaseClientAsync"/> — pass
+    /// <c>false</c> for a client that will only connect via LAN.</param>
+    protected async Task<ClientLease> LeaseClientAsync(
+        CancellationToken ct = default,
+        bool? requireSteam = null
+    )
     {
         if (Lease == null)
         {
             throw new InvalidOperationException("Server not acquired.");
         }
 
-        var lease = await Lease.LeaseClientAsync(ct);
+        var lease = await Lease.LeaseClientAsync(ct, requireSteam);
 
         // Mark additional client container for video recording clip extraction
         if (RecordingPolicy.IsEnabled)
@@ -597,10 +623,13 @@ public abstract class TestBase : IAsyncLifetime, IDisposable
     /// Leases an additional client container for a Fixture/ helper (e.g. a second concurrent
     /// farmer). Delegates to the protected <see cref="LeaseClientAsync"/> so the
     /// recording-mark side effect is preserved; the protected method isn't reachable from a
-    /// sibling-namespace helper.
+    /// sibling-namespace helper. Never requires a Steam-bearing client: the helper's farmer
+    /// joins via LAN by design (<see cref="Fixture.FarmerTestHelper.ConnectSecondFarmerAsync"/>),
+    /// and on a Steam server a second Steam-required lease would deadlock against the test's
+    /// own primary holding the pool's single Steam-bearing client.
     /// </summary>
     internal Task<ClientLease> LeaseClientForHelperAsync(CancellationToken ct = default) =>
-        LeaseClientAsync(ct);
+        LeaseClientAsync(ct, requireSteam: false);
 
     internal Task AcquireServerAsyncInternal(
         ResourceRequirements requirements,
@@ -709,9 +738,13 @@ public abstract class TestBase : IAsyncLifetime, IDisposable
     /// </summary>
     protected async Task CreateNewGameOnServerAsync(
         FarmTypeSetting farmType,
-        string farmName = "Junimo",
+        string farmName = "Server",
         int startingCabins = 1,
-        string cabinStrategy = "CabinStack"
+        string cabinStrategy = "CabinStack",
+        int? maxPlayers = null,
+        bool? allowCabinRelocation = null,
+        bool? allowIpConnections = null,
+        CancellationToken? ct = null
     )
     {
         if (Lease == null)
@@ -721,10 +754,61 @@ public abstract class TestBase : IAsyncLifetime, IDisposable
             );
         }
 
-        await Lease.CreateNewGameAsync(farmType, farmName, startingCabins, cabinStrategy, TestCt);
+        // Test-body callers pass nothing and ride TestCt; cleanup callers pass their own
+        // budget so the reset survives a body timeout (see ResetServerToPooledConfigAsync).
+        var token = ct ?? TestCt;
+
+        await Lease.CreateNewGameAsync(
+            farmType,
+            farmName,
+            startingCabins,
+            cabinStrategy,
+            maxPlayers,
+            allowCabinRelocation,
+            allowIpConnections,
+            token
+        );
 
         // Refresh the cached server status
-        ServerStatus = await ServerApi.GetStatus(TestCt);
+        ServerStatus = await ServerApi.GetStatus(token);
+    }
+
+    /// <summary>
+    /// Resets the server to a fresh game matching its POOLED configuration, passing every
+    /// value the mod persists into the settings file at game creation explicitly
+    /// (maxPlayers, cabinStrategy, allowCabinRelocation, allowIpConnections — the
+    /// load-reapplied set; creation-only settings like farm type/seed aren't file-persisted
+    /// and can't leak). Cleanup paths must use this (not a bare
+    /// <c>CreateNewGameOnServerAsync(farmType: 0)</c>) whenever the class's tests passed
+    /// /newgame overrides: a cleanup /newgame that omits such a field inherits the test's
+    /// override from the mutated file and leaks it to the next pooled reuser — drifting
+    /// the server from the config hash it was pooled under (max players, strategy, and
+    /// allow-IP are hash inputs).
+    /// </summary>
+    protected async Task ResetServerToPooledConfigAsync()
+    {
+        if (Lease == null)
+        {
+            throw new InvalidOperationException(
+                "No server lease. Call AcquireServerAsync() first."
+            );
+        }
+
+        var reqs = Lease.Managed.Requirements;
+        // Independent cleanup budget, NOT TestCt: this runs from DisposeAsync and must still
+        // complete after a per-test body timeout has already cancelled TestCt. Binding it to
+        // TestCt would throw here on every timed-out test and PoisonServer a healthy pooled
+        // instance (a full reboot) through the caller's cleanup catch.
+        using var resetCts = new CancellationTokenSource(TestTimings.ServerResetCleanupBudget);
+        await CreateNewGameOnServerAsync(
+            farmType: reqs.FarmType,
+            startingCabins: reqs.StartingCabins,
+            cabinStrategy: reqs.CabinStrategy,
+            maxPlayers: reqs.MaxPlayers,
+            allowCabinRelocation: reqs.AllowCabinRelocation,
+            allowIpConnections: reqs.AllowIpConnections,
+            ct: resetCts.Token
+        );
     }
 
     /// <summary>
@@ -873,82 +957,21 @@ public abstract class TestBase : IAsyncLifetime, IDisposable
     #region Cabin Helpers
 
     /// <summary>
-    /// Polls /cabins until a cabin owned by the given player UID appears.
-    /// Prefer this over the name-based overload: OwnerId (UMI) is set immediately
-    /// at AssignFarmhand and avoids the customization-sync race that delays both
-    /// OwnerName and IsAssigned for several seconds after a fresh customization.
-    /// On timeout dumps <see cref="FailureContext"/>.
+    /// <see cref="ServerApiClient.WaitForCabinAssignedByIdAsync"/> against this test's server.
+    /// Prefer this over the name-based overload: OwnerId is set immediately at assignment.
     /// </summary>
-    protected async Task<CabinInfoResponse?> WaitForCabinAssignedAsync(
+    protected Task<CabinInfoResponse?> WaitForCabinAssignedAsync(
         long playerId,
         CancellationToken ct = default
-    )
-    {
-        CabinInfoResponse? result = null;
-        CabinsResponse? lastCabins = null;
-        await PollingHelper.WaitUntilAsync(
-            WaitName.Polling_TestBase_WaitForCabinAssignedById,
-            async () =>
-            {
-                lastCabins = await ServerApi.GetCabins(ct);
-                result = lastCabins?.Cabins.FirstOrDefault(c => c.OwnerId == playerId);
-                return result != null;
-            },
-            TestTimings.CabinAssignmentTimeout,
-            cancellationToken: ct,
-            onTimeoutAsync: async () =>
-                await FailureContext.DumpAsync(
-                    ServerApi,
-                    reason: "WaitForCabinAssignedAsync_timeout",
-                    extras: new Dictionary<string, object?>
-                    {
-                        ["playerId"] = playerId,
-                        ["lastCabinsSnapshot"] = lastCabins?.Cabins,
-                    }
-                )
-        );
-        return result;
-    }
+    ) => ServerApi.WaitForCabinAssignedByIdAsync(playerId, ct: ct);
 
     /// <summary>
-    /// Polls /cabins until a cabin owned by the given farmer name appears.
-    /// Use the UID overload when possible — name lookup races with the
-    /// customization sync (OwnerName can be empty briefly after fresh joins).
-    /// On timeout dumps <see cref="FailureContext"/>.
+    /// <see cref="ServerApiClient.WaitForCabinAssignedByNameAsync"/> against this test's server.
     /// </summary>
-    protected async Task<CabinInfoResponse?> WaitForCabinAssignedAsync(
+    protected Task<CabinInfoResponse?> WaitForCabinAssignedAsync(
         string farmerName,
         CancellationToken ct = default
-    )
-    {
-        CabinInfoResponse? result = null;
-        CabinsResponse? lastCabins = null;
-        await PollingHelper.WaitUntilAsync(
-            WaitName.Polling_TestBase_WaitForCabinAssignedByName,
-            async () =>
-            {
-                lastCabins = await ServerApi.GetCabins(ct);
-                result = lastCabins?.Cabins.FirstOrDefault(c =>
-                    c.OwnerName.Equals(farmerName, StringComparison.OrdinalIgnoreCase)
-                    && c.IsAssigned
-                );
-                return result != null;
-            },
-            TestTimings.CabinAssignmentTimeout,
-            cancellationToken: ct,
-            onTimeoutAsync: async () =>
-                await FailureContext.DumpAsync(
-                    ServerApi,
-                    reason: "WaitForCabinAssignedAsync_timeout",
-                    extras: new Dictionary<string, object?>
-                    {
-                        ["farmerName"] = farmerName,
-                        ["lastCabinsSnapshot"] = lastCabins?.Cabins,
-                    }
-                )
-        );
-        return result;
-    }
+    ) => ServerApi.WaitForCabinAssignedByNameAsync(farmerName, ct: ct);
 
     #endregion
 

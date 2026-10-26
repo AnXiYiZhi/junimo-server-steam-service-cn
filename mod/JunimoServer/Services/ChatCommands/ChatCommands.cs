@@ -21,6 +21,7 @@ public class ChatCommandsService : ModService, IChatCommandApi
     private readonly IMonitor _monitor;
     private readonly IModHelper _helper;
     private readonly ApiService _apiService;
+    private readonly RoleService _roleService;
 
     private readonly List<ChatCommand> _registeredCommands = new List<ChatCommand>();
 
@@ -37,6 +38,7 @@ public class ChatCommandsService : ModService, IChatCommandApi
         _monitor = monitor;
         _helper = helper;
         _apiService = apiService;
+        _roleService = roleService;
 
         // Enable cheat/debug commands work (https://stardewvalleywiki.com/Modding:Console_commands#Debug_commands)
         Program.enableCheats = true;
@@ -118,26 +120,30 @@ public class ChatCommandsService : ModService, IChatCommandApi
 
     private void HelpCommand(string[] args, ReceivedMessage msg)
     {
+        // Hide admin-only commands from non-admins so their help stays uncluttered.
+        var visible = _registeredCommands.Where(command => CanPlayerUse(command, msg.SourceFarmer));
+
         if (args.Length > 0)
         {
             // Show help for specific commands passed as args
-            foreach (
-                var command in _registeredCommands.Where(command =>
-                    args.Contains(command.Name, StringComparer.OrdinalIgnoreCase)
-                )
-            )
-            {
-                _helper.SendPrivateMessage(msg.SourceFarmer, command.CommandUsage);
-            }
+            visible = visible.Where(command =>
+                args.Contains(command.Name, StringComparer.OrdinalIgnoreCase)
+            );
         }
-        else
+
+        foreach (var command in visible)
         {
-            // Show help for all commands
-            foreach (var command in _registeredCommands)
-            {
-                _helper.SendPrivateMessage(msg.SourceFarmer, command.CommandUsage);
-            }
+            _helper.SendPrivateMessage(msg.SourceFarmer, command.CommandUsage);
         }
+    }
+
+    /// <summary>
+    /// Whether a player may run — and see in <c>!help</c> — the given command. Admin-only
+    /// commands require the player to be an admin; all others are open.
+    /// </summary>
+    private bool CanPlayerUse(ChatCommand command, long playerId)
+    {
+        return !command.RequiresAdmin || _roleService.IsPlayerAdmin(playerId);
     }
 
     private void OnChatMessage(ReceivedMessage receivedMessage)
@@ -159,27 +165,119 @@ public class ChatCommandsService : ModService, IChatCommandApi
             return;
         }
 
-        foreach (
-            var command in _registeredCommands.Where(command =>
-                command.Name.Equals(
-                    receivedMessage.Command.Name,
-                    StringComparison.OrdinalIgnoreCase
+        var receivedCommand = receivedMessage.Command;
+        var (args, page) = ExtractPageNumber(receivedCommand.Args);
+
+        // Reconstruct the command string (without the page arg) for the footer hint.
+        var commandForFooter =
+            "!" + receivedCommand.Name + (args.Length > 0 ? " " + string.Join(" ", args) : "");
+
+        var scope = new ChatResponseScope();
+        ChatResponseContext.Current = scope;
+        try
+        {
+            foreach (
+                var command in _registeredCommands.Where(command =>
+                    command.Name.Equals(receivedCommand.Name, StringComparison.OrdinalIgnoreCase)
                 )
             )
-        )
-        {
-            _monitor.Log($"[ChatCommands] Found command: {command.Name}", LogLevel.Trace);
-            command.Action(receivedMessage.Command.Args, receivedMessage);
+            {
+                _monitor.Log($"[ChatCommands] Found command: {command.Name}", LogLevel.Trace);
+
+                if (!CanPlayerUse(command, receivedMessage.SourceFarmer))
+                {
+                    _helper.SendPrivateMessage(
+                        receivedMessage.SourceFarmer,
+                        "You are not an admin."
+                    );
+                    continue;
+                }
+
+                command.Action(args, receivedMessage);
+            }
         }
+        finally
+        {
+            ChatResponseContext.Current = null;
+            scope.Flush(
+                (playerId, line) =>
+                    _helper
+                        .GetMultiplayer()
+                        .sendChatMessage(ChatLanguageDetector.DetectLanguage(line), line, playerId),
+                page,
+                commandForFooter
+            );
+        }
+    }
+
+    /// <summary>
+    /// Extracts a page number from the command args, supporting <c>--page N</c>,
+    /// <c>page:N</c>, and <c>-p N</c>. Returns the args with the matched token(s) removed
+    /// and the requested page (1 if none is present). These tokens are reserved in ANY
+    /// argument position — no command parses them as data, so an arg value that happens to
+    /// equal one (e.g. a layout named "page:2") is consumed here rather than passed through.
+    /// </summary>
+    private static (string[] args, int page) ExtractPageNumber(string[] args)
+    {
+        var page = 1;
+        var found = false;
+        var cleaned = new List<string>(args);
+
+        // Strip EVERY page token so none reaches the command as data (the reserved-token
+        // contract above); the first valid one wins if several are given.
+        var i = 0;
+        while (i < cleaned.Count)
+        {
+            // --page N  or  -p N  (flag + separate value)
+            if (
+                (cleaned[i] == "--page" || cleaned[i] == "-p")
+                && i + 1 < cleaned.Count
+                && int.TryParse(cleaned[i + 1], out var flagPage)
+                && flagPage >= 1
+            )
+            {
+                if (!found)
+                {
+                    page = flagPage;
+                    found = true;
+                }
+
+                cleaned.RemoveAt(i); // remove the flag
+                cleaned.RemoveAt(i); // remove its value (now shifted into this index)
+                continue;
+            }
+
+            // page:N  (single token)
+            if (
+                cleaned[i].StartsWith("page:", StringComparison.OrdinalIgnoreCase)
+                && int.TryParse(cleaned[i]["page:".Length..], out var colonPage)
+                && colonPage >= 1
+            )
+            {
+                if (!found)
+                {
+                    page = colonPage;
+                    found = true;
+                }
+
+                cleaned.RemoveAt(i);
+                continue;
+            }
+
+            i++;
+        }
+
+        return (cleaned.ToArray(), page);
     }
 
     public void RegisterCommand(
         string name,
         string description,
-        Action<string[], ReceivedMessage> action
+        Action<string[], ReceivedMessage> action,
+        bool requiresAdmin = false
     )
     {
-        _registeredCommands.Add(new ChatCommand(name, description, action));
+        _registeredCommands.Add(new ChatCommand(name, description, action, requiresAdmin));
     }
 
     public void RegisterCommand(ChatCommand command)

@@ -22,7 +22,7 @@ public class InviteCodeCommand
         // Register chat command
         chatCommandsService.RegisterCommand(
             "invitecode",
-            "Displays the current server invite code.",
+            "Shows the server invite code.",
             (args, msg) =>
             {
                 if (Game1.server == null)
@@ -31,22 +31,17 @@ public class InviteCodeCommand
                     return;
                 }
 
-                var inviteCode = Game1.server.getInviteCode();
-
-                if (inviteCode == null)
-                {
-                    helper.SendPrivateMessage(msg.SourceFarmer, "No invite code available.");
-                    return;
-                }
-
-                helper.SendPrivateMessage(msg.SourceFarmer, $"Invite code: {inviteCode}");
+                helper.SendPrivateMessage(
+                    msg.SourceFarmer,
+                    $"Invite code: {InviteCodes.Describe()}"
+                );
             }
         );
 
         // Register console command
-        helper.ConsoleCommands.Add(
+        helper.ConsoleCommands.Register(
             "invitecode",
-            "Displays the current server invite code.",
+            "Shows the server invite code.",
             InviteCodeConsoleCommand
         );
     }
@@ -55,18 +50,18 @@ public class InviteCodeCommand
     {
         if (Game1.server == null)
         {
-            _monitor.Log("Server is not running.", LogLevel.Error);
+            _monitor.Log("Server is not running.", LogLevel.Warn);
             return;
         }
 
-        var inviteCode = Game1.server.getInviteCode();
-
-        if (inviteCode == null)
-        {
-            _monitor.Log("No invite code available.", LogLevel.Warn);
-            return;
-        }
-
-        _monitor.Log($"Invite code: {inviteCode}", LogLevel.Info);
+        var inviteCode = InviteCodes.Joinable;
+        var status = InviteCodes.StatusCodeOf(inviteCode);
+        // A missing code is worth a warning only while one is expected; a server without Steam auth
+        // never has one.
+        var level =
+            inviteCode == null && status != ConnectionStatusCode.InviteUnavailable
+                ? LogLevel.Warn
+                : LogLevel.Info;
+        _monitor.Log($"Invite code: {ConnectionStatus.Render(status, inviteCode)}", level);
     }
 }

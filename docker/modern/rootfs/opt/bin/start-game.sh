@@ -6,7 +6,7 @@ MODS_DEST_DIR="/data/Mods"
 GAME_DEST_DIR="/data/game"
 GAME_EXECUTABLE="${GAME_DEST_DIR}/StardewValley"
 SMAPI_EXECUTABLE="${GAME_DEST_DIR}/StardewModdingAPI"
-STEAM_DEST_DIR="/root/.steam/sdk64/"
+STEAM_DEST_DIR="${HOME}/.steam/sdk64/"
 
 # ============================================================================
 # Helpers
@@ -51,28 +51,6 @@ validate_environment() {
         echo ""
         exit 1
     fi
-}
-
-# ============================================================================
-# Time sync
-# ============================================================================
-
-init_time_sync() {
-    echo "Synchronizing system time..."
-
-    if hwclock --hctosys 2>/dev/null; then
-        echo "Time synced from hardware clock"
-        return 0
-    fi
-
-    if ntpdate -u pool.ntp.org 2>/dev/null; then
-        echo "Time synced from NTP server"
-        return 0
-    fi
-
-    echo "Warning: Could not sync time automatically"
-    echo "Current time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-    echo "If Galaxy P2P disconnects occur after ~30 seconds, check system time sync"
 }
 
 # ============================================================================
@@ -194,9 +172,10 @@ init_mods() {
 # ============================================================================
 
 init_permissions() {
+    # Ownership is set by the root init-runtime oneshot (etc/s6-overlay/s6-rc.d/init-runtime)
+    # before this service drops to the app user; here we only ensure the game binary is
+    # executable (the app user owns it by now, so this succeeds without root).
     chmod +x "${GAME_EXECUTABLE}"
-    chmod -R 755 "${GAME_DEST_DIR}"
-    chown -R 1000:1000 "${GAME_DEST_DIR}"
 }
 
 # ============================================================================
@@ -204,7 +183,6 @@ init_permissions() {
 # ============================================================================
 
 validate_environment
-init_time_sync
 init_stardew
 init_steam_sdk
 init_smapi
@@ -213,10 +191,14 @@ init_permissions
 
 # Run the game through SMAPI with FIFO for command input
 LOG_FILE="/tmp/server-output.log"
-INPUT_FIFO="/tmp/smapi-input"
+# Not directly in /tmp: with fs.protected_fifos set on the host, root (attach-cli, toggle-rendering)
+# cannot write to a FIFO owned by the app user inside a sticky world-writable dir.
+FIFO_DIR="/tmp/junimo"
+INPUT_FIFO="${FIFO_DIR}/smapi-input"
 
 touch "${LOG_FILE}"
 
+mkdir -p "${FIFO_DIR}"
 rm -f "${INPUT_FIFO}"
 mkfifo "${INPUT_FIFO}"
 
@@ -224,8 +206,11 @@ mkfifo "${INPUT_FIFO}"
 # __pthread_key_create (glibc internal symbol not provided by musl/gcompat)
 export LD_PRELOAD="/opt/lib/pthread_shim.so${LD_PRELOAD:+:$LD_PRELOAD}"
 
-# Start SMAPI with stdin from FIFO, output to log file and stdout
-# Using 'script' to create a PTY so SMAPI outputs colors (thinks it's a terminal)
+# Start SMAPI with stdin from the FIFO. `script` gives it a PTY so it prints colors and copies
+# output to both stdout (docker logs) and LOG_FILE (tailed by attach-cli). `tail -f` keeps the
+# FIFO open between writers. Keep this pipeline unfiltered: startup noise is filtered at the read
+# site instead (attach-cli tails through strip-startup-noise.awk). A filter interposed on
+# script's stdout here stalled the session under `wait`, so don't reintroduce one.
 script -q -f --return -c "tail -f \"${INPUT_FIFO}\" | \"${SMAPI_EXECUTABLE}\"" "${LOG_FILE}" &
 SMAPI_PID=$!
 

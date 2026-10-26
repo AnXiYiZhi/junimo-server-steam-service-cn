@@ -2,6 +2,8 @@
 
 Wire contract for structured events emitted across the process graph. This document is the authoritative definition — source code references it, not the other way around. When this spec changes, every emitter is updated in the same PR; the spec change **is** the API change.
 
+Authoring note: when a field's values are inline string literals at the emit site, don't enumerate the variants verbatim here (or in the `InfrastructureEventLog` catalog) — reference the enum or the emitting class instead ("see `ContainerRecorder` for the definitive list"). Verbatim value lists go silently stale when a variant is added at the emit site; a small, stable set (3-4 values) may be listed, and a large one is a signal the strings should become a typed enum.
+
 ## Core envelope
 
 Every structured event is a single JSON line (JSONL) with exactly these fields:
@@ -11,6 +13,7 @@ Every structured event is a single JSON line (JSONL) with exactly these fields:
   "ts":        "<DateTime.UtcNow ISO-8601>",   // always
   "runMs":     <long>,                          // optional
   "requestId": "<string>",                      // optional
+  "testId":    "<string>",                      // optional
   "service":   "<string>",                      // always
   "test":      { "class": "...",
                  "method": "...",
@@ -25,8 +28,9 @@ Every structured event is a single JSON line (JSONL) with exactly these fields:
 - `ts` — ISO-8601 UTC timestamp captured at emit.
 - `runMs` — milliseconds since `RunMetadata.RunClock` start. Populated by `InfrastructureEventLog`.
 - `requestId` — ambient correlation identifier. Set when a correlation scope is active (HTTP request handler, logical operation scope from `CorrelationContext.BeginWithId`, outbound `TracingHandler` request). Null when no scope is active — do not fabricate.
+- `testId` — the originating test's display name, carried on the `X-Test-Id` request header and bound as `RequestContext.TestId` for the request duration. The server/sidecar-side counterpart to `test.*`: forwarded mod and sidecar events can't hold the nested `test` object, so they carry `testId` instead. Sent at every tracing level (unlike `requestId`), so reads are attributable too. Header and `test.displayName` come from the same `TestIdentityContext` normalizer, so join `.testId` to `.test.displayName` directly. Null when no test context reached the emitting operation: production, the harness's own background polls (health watchdog, stats collector, broker readiness waits), and game-network activity such as a join or chat message from a test's client, which arrives outside any request. Work queued to the game thread still carries it: `GameThreadDispatcher` captures and rebinds it across the queue, which `AsyncLocal` doesn't cross.
 - `service` — which service emitted this event. Always one of the four canonical values below.
-- `test` — nested object identifying the currently-executing test: `{ class, method, displayName }`. Populated by `InfrastructureEventLog` when a test is active. Absent on forwarded mod/sidecar events (shared containers serve many tests) and on test-harness emits outside any test (pre-warming, broker lifecycle).
+- `test` — nested object identifying the currently-executing test: `{ class, method, displayName }`. Populated by `InfrastructureEventLog` when a test is active. Absent on forwarded mod/sidecar events (shared containers serve many tests; those carry `testId` instead) and on test-harness emits outside any test (pre-warming, broker lifecycle).
 - `phase` — lifecycle phase of the currently-executing test (`setup`, `connect`, `artifacts`, `cleanup`, or a checkpoint label). Set by `TestIdentityContext.PushPhase` scopes in `TestBase`; absent when no scope is active. Used by the failure runbook to locate which phase emitted a given event.
 - `tickMs` — game-tick counter at emit. Populated by mod emitters only (`ModEventLog`); caller-supplied because reading `Game1.ticks` off-thread is unsafe.
 - `event` — short snake-case event name. See each emitter for its catalog.
@@ -101,8 +105,9 @@ Breaking changes to the envelope bump this number in lockstep in both manifest f
 
 Two orthogonal filtering axes:
 
-- **`requestId`** — per-HTTP-call join key. One end-to-end flow across harness → mod → sidecar shares one id. Answers "what did this API call do?"
-- **`test.*`** — which test caused the event. Populated only on test-harness-emitted events (`service = "test-harness"`); absent on forwarded mod/sidecar events because shared containers serve many tests. Answers "what did this test do?"
+- **`requestId`** — per-HTTP-call join key. One end-to-end flow across harness → mod → sidecar shares one id. Answers "what did this API call do?" Present only when tracing mints one (`Basic`+ for mutations, `Full` for every verb).
+- **`test.*`** — which test caused the event, as a nested object. Populated only on test-harness-emitted events (`service = "test-harness"`). Answers "what did this test do?"
+- **`testId`** — the same axis on forwarded mod/sidecar events, which can't carry the nested `test` object. Sent on every request regardless of tracing level, so a forwarded `http_served` for a read is attributable too. Answers "which test issued this server event?" Join `.testId` to a test-harness event's `.test.displayName`.
 
 Typical queries:
 
@@ -115,15 +120,21 @@ jq 'select(.requestId == "abc123")' infrastructure.jsonl
 
 # A specific call within a specific test
 jq 'select(.test.displayName == "X" and .data.path == "/newgame")' infrastructure.jsonl
+
+# Every server event a given test caused (forwarded mod events carry testId, not test.*)
+jq 'select(.testId == "NavigationTests.JoinServer")' infrastructure.jsonl
+
+# Which instance a test ran on, for any isolation mode
+jq 'select(.event == "test_instance_bound" and .test.displayName == "X") | .data.serverInstanceId' infrastructure.jsonl
 ```
 
 A single `requestId` stitches a logical operation across every structured stream:
 
 - Test code (or fixture) calls `ServerApiClient.CreateNewGameAsync(...)`, which enters a `CorrelationContext` scope via `TracingHandler`.
 - `TracingHandler` adds `X-Request-Id` to the outbound request and emits `http_request` (service `test-harness`) into `infrastructure.jsonl` with that id.
-- The server mod's `ApiService.HandleRequestAsync` reads the header and binds `ModRequestContext.RequestId` (AsyncLocal) for the request duration. `ModEventLog.Emit` reads this when it writes `http_served` and any other server-side events.
-- If the mod makes an outbound HTTP call to the sidecar during this request, `SteamAuthCorrelationHandler` forwards the same `X-Request-Id` header. The sidecar's Kestrel middleware reads it and binds `SidecarRequestContext.Current` (AsyncLocal) for the request duration.
-- The test-client mod's `TestApiServer` reads inbound `X-Request-Id` and binds `ClientRequestContext` for the handler duration. `ClientEventLog.Emit` reads this.
+- The server mod's `ApiService.HandleRequestAsync` reads the header and binds `RequestContext.RequestId` (AsyncLocal) for the request duration, alongside `RequestContext.TestId` from the `X-Test-Id` header. `ModEventLog.Emit` reads both when it writes `http_served` and any other server-side events. Both are captured and rebound across the game-thread queue (`GameThreadDispatcher`), which `AsyncLocal` doesn't cross on its own.
+- If the mod makes an outbound HTTP call to the sidecar during this request, `SteamAuthCorrelationHandler` forwards the same `X-Request-Id` and `X-Test-Id` headers. The sidecar's Kestrel middleware reads both and binds `SidecarRequestContext` (AsyncLocal) for the request duration, so `Logger.LogEvent` stamps `requestId` and `testId` on sidecar events emitted inside the request pipeline.
+- The test-client mod's `TestApiServer` reads inbound `X-Request-Id` and `X-Test-Id` and binds `RequestContext` for the handler duration (captured and rebound across its game-thread queue, like the server). `ClientEventLog.Emit` reads both.
 
 Events emitted outside any scope carry `requestId = null`. SteamKit callbacks, game-engine reactions, and background watchdogs are the common cases. Correlate those via `service`, `ts`, and `forwardedVia`.
 

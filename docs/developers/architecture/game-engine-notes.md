@@ -16,9 +16,10 @@ For full source-of-truth, the decompiled game lives at `decompiled/sdv-1.6.15-24
 - When `isGameAvailable() == false`, the server sends message type 11 (`Client_WaitForHostAvailability`); the client shows "Waiting for host event" in `FarmhandMenu` and times out after 45s.
 - `checkFarmhandRequest` with `isGameAvailable() == false` sends type 11 and registers a `whenGameAvailable` callback that calls `sendAvailableFarmhands` (NOT `Check()`); the client bounces back to `FarmhandMenu`.
 
-## newDaySync barrier behavior on disconnect
+## newDaySync barrier behavior
 
 - When a client disconnects during the barrier: `playerDisconnected()` enqueues into `disconnectingFarmers`, `removeDisconnectedFarmers()` removes the entry from `otherFarmers`, and with empty `otherFarmers` the `barrierReady()` check returns true immediately.
+- Every instance runs the same `barrierReady()` against its own `otherFarmers`, farmhands included, and a farmhand is unmodded. A connected farmer that never checks in (an unauthenticated lobby player never receives `newDaySync`) therefore stalls every farmhand at the first barrier, and the host at the next one, however the host filters its own check. The server closes this by sending the barrier check-in on the excluded farmer's behalf (`LobbyService.BarrierReady_Postfix`).
 
 ## Cabin system — reference
 
@@ -28,4 +29,4 @@ Prescriptive cabin invariants are in [.claude/rules/cabin-system.md](https://git
 
 ## Server invite code
 
-- LAN-only servers (`AllowIpConnections=true`, no Steam account configured) never write an invite code. `InviteCodeFile.Read()` returns null in that configuration.
+- Servers without Steam auth configured (`AllowIpConnections=true`, no Steam account) never write an invite code. `InviteCodeFile.Read()` returns null in that configuration.

@@ -41,9 +41,6 @@ make test FILTER=PasswordProtection
 
 # Run with web UI
 make test-web
-
-# With host game client (local Stardew Valley + Steam, instead of Docker)
-make test SDVD_HOST_CLIENT=true
 ```
 
 ## Visual Observation
@@ -151,8 +148,6 @@ TestResults/runs/{timestamp}_{sha}/tests/{Class}.{Method}/
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SDVD_IMAGE_TAG` | `local` | Docker image tag for server/client |
-| `SDVD_HOST_CLIENT` | `false` | Use local Stardew Valley process instead of Docker containers (requires Steam) |
-| `SDVD_VOLUME_PREFIX` | `server` | Docker volume name prefix |
 | `SDVD_TEST_SCREENSHOTS` | `done` | Screenshot capture mode: none/done/all |
 | `SDVD_TEST_RECORDING` | `none` | Video recording mode: none/failure/all |
 | `NO_COLOR` | unset | Set (to any value) to disable colored output |
@@ -175,14 +170,14 @@ The E2E suite runs from `.github/workflows/e2e-tests.yml` (the coordinator runs 
 the GitHub runner; the game containers run on a remote VPS over SSH). That workflow
 is the source of truth for CI invocation. There are three ways to launch it, all
 manual and **maintainer-gated** — it is never an automatic merge gate (an external
-VPS being down must not block the queue):
+VPS being down must not block merges):
 
 - **Actions tab → "Run workflow"** (`workflow_dispatch`) — runs the full suite from a
   trusted branch; the optional `filter` input narrows it to a class/method. The optional
   `pr` input instead resolves that PR's HEAD and tests it, posting the same sticky comment
   as the comment path; fork PRs pause at the `fork-pr` approval (same as the comment path),
   and an empty `pr` runs the selected branch / master exactly as before.
-- **`/run-tests-e2e [filter]` PR comment** — runs against the PR's
+- **`!run-tests-e2e [filter]` PR comment** — runs against the PR's
   HEAD commit and posts results back to the PR (see below). `filter` is an xUnit
   class/method substring; omit it for the full suite.
 - **The "🔁 Re-run E2E tests" checkbox** in the bot's results comment — ticking it
@@ -448,9 +443,9 @@ Transfer size is governed by the **coordinator's** image store, not the remote's
 
 ### Tunneling
 
-For each remote host, the coordinator pre-creates an SSH `ControlMaster` (`ssh -M -N -f -o ControlMaster=auto -o ControlPath=… -o ControlPersist=10m`). For each container start, the coordinator opens a per-port `ssh -O forward -L localhost:{coordinatorPort}:127.0.0.1:{mappedPort} {sshDest}` against that master with `ExitOnForwardFailure=yes`. URL construction always goes through `TunnelManager.OpenAsync` so the same code path works on local and remote hosts — local hosts return the mapped port unchanged.
+For each remote host, the coordinator pre-creates an SSH `ControlMaster` (`ssh -M -N -f -o ControlMaster=auto -o ControlPath=…`). For each container start, the coordinator opens a per-port `ssh -O forward -L localhost:{coordinatorPort}:127.0.0.1:{mappedPort} {sshDest}` against that master with `ExitOnForwardFailure=yes`. URL construction always goes through `TunnelManager.OpenAsync` so the same code path works on local and remote hosts — local hosts return the mapped port unchanged.
 
-Tunnels close on container dispose via `ssh -O cancel`. Coordinator shutdown drains all forwards in parallel (bounded per-cancel timeout) before sending `ssh -O exit` to each master.
+Tunnels close on container dispose via `ssh -O cancel`. Coordinator shutdown drains all forwards in parallel (bounded per-cancel timeout) before terminally tearing down each master: `ssh -O exit`, then a pid kill if the process survives it, with the control socket unlinked only once the process is confirmed gone. Each master is also recorded in a temp-dir journal (`sdvd-ssh-journal-{pid}.json`); abort paths tear masters down from the journal, and the next run's preflight reaps any journal whose coordinator process is dead — so a master can't outlive its run even after a hard kill or crash.
 
 ### Remote-host cold-start floor
 
@@ -460,7 +455,7 @@ If you're sizing a remote host or interpreting `infrastructure.jsonl`, treat the
 
 ### Host disconnect
 
-When a Docker.DotNet call against a remote host throws a transport-class exception (HTTP timeout, broken pipe, SSH auth failure), the host is poisoned for the rest of the run. Future placements skip it; the active test fails with status `host_disconnected` (distinct from cancel/timeout/test-fail). A `KeepConnected` session pinned to a class on a poisoned host fails the rest of that class with `host_disconnected` (N-test cascade). This is by design — re-placing the class on a different host would defeat the no-auto-retry rule and silently mask the disconnect.
+When a Docker.DotNet call against a remote host throws a transport-class exception, the runner classifies it. A host-scoped fault (host unreachable) poisons the host for the rest of the run. A forward-scoped fault (connection reset/refused) or an ambiguous daemon-responsiveness timeout is corroborated with `ssh -O check`: if the master is alive the runner heals the forward and retries, and only a failed check poisons the host. Future placements skip a poisoned host; the active test fails with status `host_disconnected` (distinct from cancel/timeout/test-fail). A `KeepConnected` session pinned to a class on a poisoned host fails the rest of that class with `host_disconnected` (N-test cascade). This is by design — re-placing the class on a different host would defeat the no-auto-retry rule and silently mask the disconnect.
 
 If every host is poisoned, the run aborts with a non-zero exit code and a final `run_aborted` event naming the disconnect reasons per host.
 
@@ -473,9 +468,14 @@ run-metadata.json       # coordinator writes
 summary.json            # passed/failed/canceled counts + degradation
 ctrf-report.json        # CTRF format
 diagnostics/
-  infrastructure.jsonl  # structured event stream; host_id field on host-fanned
-                        #   events (container_started/stopped/oom_killed,
-                        #   docker_preflight, image_transfer_*, capacity_*).
+  infrastructure.jsonl    # structured event stream; host_id field on host-fanned
+                          #   events (container_started/stopped/oom_killed,
+                          #   docker_preflight, image_transfer_*, capacity_*).
+  instance-stats.jsonl    # per-instance container/game stats history
+  instance-history.jsonl  # per-instance lifecycle (leased/poisoned/…) + final state
+  run-events.jsonl        # UI event stream; only on-disk home for xUnit diag/error
+  test-details.jsonl      # per-test output, ordering/timing, used instances
+  setup-phases.jsonl      # prestart/warmup phase + step breakdown
 flakiness.jsonl
 tests/
   {Class}.{Method}/     # per-test artifacts (screenshots, recordings)

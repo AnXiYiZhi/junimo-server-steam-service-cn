@@ -16,8 +16,8 @@ public class HostAutomationTests : TestBase
 
     /// <summary>
     /// Verifies that game time does NOT advance when no other player is connected.
-    /// The server's AlwaysOn service pauses the game when otherFarmers.Count == 0
-    /// and timeOfDay is between 610 and 2500.
+    /// The server's AlwaysOn service pauses the game whenever no authenticated player is
+    /// present and the host is at rest, at any time of day.
     ///
     /// Uses Exclusive=true to prevent other tests from acquiring this server
     /// during the verification window.
@@ -28,58 +28,18 @@ public class HostAutomationTests : TestBase
     {
         await Connect.EnsureDisconnectedAsync();
 
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         Log($"Exclusive access granted, refs={Lease!.RefCount}");
 
-        // Wait until no other players are connected (previous test may still be cleaning up).
-        var noPlayers = await PollingHelper.LongPollAsync(
-            WaitName.Polling_HostAutomation_NoPlayers,
-            async (since, remaining) =>
-            {
-                var s = await ServerApi.WaitForStatusAsync(
-                    since: since,
-                    isReady: true,
-                    playerCount: 0,
-                    timeout: remaining,
-                    ct: ct
-                );
-                if (s != null)
-                {
-                    Log(
-                        $"PlayerCount==0 confirmed: PlayerCount={s.PlayerCount}, IsReady={s.IsReady}"
-                    );
-                }
+        await WaitForNoPlayersAsync(ct);
 
-                return new PollingHelper.LongPollResult(s != null, s?.Version ?? since);
-            },
-            TestTimings.ServerReadyBetweenTests,
-            cancellationToken: ct
-        );
-        Assert.True(noPlayers, "Server should have no players connected before testing time pause");
-
-        // Set time to a known mid-day value so we're firmly inside the pause window (610-2500)
+        // Set time to a known mid-day value
         var setTimeResult = await ServerApi.SetTime(TestTimings.Noon, ct);
         Assert.NotNull(setTimeResult);
         Assert.True(setTimeResult.Success, $"SetTime failed: {setTimeResult.Error}");
         Log($"Set time to {setTimeResult.TimeOfDay}");
 
-        // Poll until the game reports IsPaused=true (confirms AlwaysOn paused with 0 players)
-        var pauseConfirmed = await PollingHelper.LongPollAsync(
-            WaitName.Polling_HostAutomation_PauseConfirmed,
-            async (since, remaining) =>
-            {
-                var s = await ServerApi.WaitForStatusAsync(
-                    since: since,
-                    isPaused: true,
-                    timeout: remaining,
-                    ct: ct
-                );
-                return new PollingHelper.LongPollResult(s != null, s?.Version ?? since);
-            },
-            TestTimings.NetworkSyncTimeout,
-            cancellationToken: ct
-        );
-        Assert.True(pauseConfirmed, "Server should report IsPaused=true with no players connected");
+        await WaitForPausedAsync(WaitName.Polling_HostAutomation_PauseConfirmed, ct);
 
         // Read current time
         var status1 = await ServerApi.GetStatus(ct);
@@ -96,34 +56,24 @@ public class HostAutomationTests : TestBase
 
         try
         {
-            // Poll for the verification window. If time advances at any point,
-            // the test fails immediately instead of waiting the full duration.
-            // At 10x speed, 2s covers ~28 game-ticks worth of verification.
-            // No equality filter on TimeOfDay — use `since` to wait for any newer
-            // snapshot, then check TimeOfDay-changed on the returned body.
-            var timeAdvanced = await PollingHelper.LongPollAsync(
+            // Watch the verification window; a match means time advanced and the test
+            // fails without waiting out the window. At 10x speed, 2s covers ~28
+            // game-ticks. TimeOfDay has no server filter, so wait for any newer snapshot
+            // and compare on the body.
+            var timeAdvanced = await ServerApi.WaitForStatusMatchAsync(
                 WaitName.Polling_HostAutomation_TimeAdvanced,
-                async (since, remaining) =>
+                TestTimings.TimePausedVerification,
+                matches: s =>
                 {
-                    var s = await ServerApi.WaitForStatusAsync(
-                        since: since,
-                        timeout: remaining,
-                        ct: ct
-                    );
-                    if (s == null)
+                    if (s.TimeOfDay == time1)
                     {
-                        return new PollingHelper.LongPollResult(false, since);
+                        return false;
                     }
 
-                    if (s.TimeOfDay != time1)
-                    {
-                        Log($"Time changed: {time1} → {s.TimeOfDay}, PlayerCount={s.PlayerCount}");
-                        return new PollingHelper.LongPollResult(true, s.Version);
-                    }
-                    return new PollingHelper.LongPollResult(false, s.Version);
+                    Log($"Time changed: {time1} → {s.TimeOfDay}, PlayerCount={s.PlayerCount}");
+                    return true;
                 },
-                TestTimings.TimePausedVerification,
-                cancellationToken: ct
+                ct: ct
             );
 
             // Time should NOT have advanced (game is paused with no other players)
@@ -131,6 +81,18 @@ public class HostAutomationTests : TestBase
                 timeAdvanced,
                 $"Time should not advance while no players connected, but changed from {time1}"
             );
+
+            // A false return also covers "every observation transport-faulted" and "no
+            // snapshot published" (stalled game thread), which WaitForStatusMatchAsync
+            // reports the same as "clock held". Read the clock directly and require a newer
+            // snapshot so a silent outage during the window can't pass this negative check.
+            var statusFinal = await ServerApi.GetStatus(ct);
+            Assert.NotNull(statusFinal);
+            Assert.True(
+                statusFinal.Sequence > status1.Sequence,
+                "The server did not publish a new status snapshot during the pause window"
+            );
+            Assert.Equal(time1, statusFinal.TimeOfDay);
             LogSuccess("Confirmed: time did not advance while no players connected");
         }
         finally
@@ -148,9 +110,9 @@ public class HostAutomationTests : TestBase
     [TestServer(Exclusive = true)]
     public async Task TimeAdvances_WhenPlayerConnected()
     {
-        await Farmers.ConnectNewAsync(ct: TestContext.Current.CancellationToken);
+        await Farmers.ConnectFastAsync(ct: TestCt);
 
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
 
         // Set time to a known value so the measurement is clean
         var setTimeResult = await ServerApi.SetTime(TestTimings.Noon, ct);
@@ -158,30 +120,12 @@ public class HostAutomationTests : TestBase
         Assert.True(setTimeResult.Success, $"SetTime failed: {setTimeResult.Error}");
 
         // Poll until game is unpaused (confirms game is running with player connected)
-        var unpauseConfirmed = await PollingHelper.LongPollAsync(
+        var unpauseConfirmed = await ServerApi.WaitForStatusMatchAsync(
             WaitName.Polling_HostAutomation_UnpauseConfirmed,
-            async (since, remaining) =>
-            {
-                var s = await ServerApi.WaitForStatusAsync(
-                    since: since,
-                    isPaused: false,
-                    timeout: remaining,
-                    ct: ct
-                );
-                if (s == null)
-                {
-                    return new PollingHelper.LongPollResult(false, since);
-                }
-
-                if (s.TimeOfDay >= TestTimings.Noon)
-                {
-                    return new PollingHelper.LongPollResult(true, s.Version);
-                }
-
-                return new PollingHelper.LongPollResult(false, s.Version);
-            },
             TestTimings.NetworkSyncTimeout,
-            cancellationToken: ct
+            matches: s => s.TimeOfDay >= TestTimings.Noon,
+            isPaused: false,
+            ct: ct
         );
         Assert.True(
             unpauseConfirmed,
@@ -199,27 +143,13 @@ public class HostAutomationTests : TestBase
 
         try
         {
-            // Poll until time advances (should complete in ~0.7s at 10x speed).
-            // No equality filter on TimeOfDay — wait for any newer snapshot via
-            // `since`, then check the >- condition on the returned body.
-            await PollingHelper.LongPollAsync(
+            // Poll until time advances (~0.7s at 10x speed). TimeOfDay has no server
+            // filter, so wait for any newer snapshot and compare on the body.
+            await ServerApi.WaitForStatusMatchAsync(
                 WaitName.Polling_HostAutomation_TimeAdvancedSecond,
-                async (since, remaining) =>
-                {
-                    var s = await ServerApi.WaitForStatusAsync(
-                        since: since,
-                        timeout: remaining,
-                        ct: ct
-                    );
-                    if (s == null)
-                    {
-                        return new PollingHelper.LongPollResult(false, since);
-                    }
-
-                    return new PollingHelper.LongPollResult(s.TimeOfDay > time1, s.Version);
-                },
                 TestTimings.TimeAdvanceWait,
-                cancellationToken: ct
+                matches: s => s.TimeOfDay > time1,
+                ct: ct
             );
         }
         finally
@@ -253,10 +183,10 @@ public class HostAutomationTests : TestBase
     [TestServer(Exclusive = true)]
     public async Task HostAutoSleeps_WhenPlayerSleeps()
     {
-        await Farmers.ConnectNewAsync(ct: TestContext.Current.CancellationToken);
+        await Farmers.ConnectFastAsync(ct: TestCt);
 
         // Record the current day
-        var statusBefore = await ServerApi.GetStatus(TestContext.Current.CancellationToken);
+        var statusBefore = await ServerApi.GetStatus(TestCt);
         Assert.NotNull(statusBefore);
         var dayBefore = statusBefore.Day;
         var seasonBefore = statusBefore.Season;
@@ -292,7 +222,7 @@ public class HostAutomationTests : TestBase
             seasonBefore,
             yearBefore,
             checkConnection: true,
-            TestContext.Current.CancellationToken
+            TestCt
         );
 
         Assert.False(
@@ -306,7 +236,7 @@ public class HostAutomationTests : TestBase
             "Day should have advanced after farmhand slept and host auto-slept"
         );
 
-        var statusAfter = await ServerApi.GetStatus(TestContext.Current.CancellationToken);
+        var statusAfter = await ServerApi.GetStatus(TestCt);
         Assert.NotNull(statusAfter);
         Log(
             $"After sleep: {statusAfter.Season} {statusAfter.Day}, Year {statusAfter.Year}, Time {statusAfter.TimeOfDay}"
@@ -325,17 +255,17 @@ public class HostAutomationTests : TestBase
     /// Verifies that when time reaches 2:00 AM (2600 game-time) with a player connected,
     /// the game triggers a pass-out and the host bot ensures the day transitions.
     ///
-    /// At 2600, AlwaysOn unpauses the game, the game forces performPassoutWarp(),
+    /// With a player present the world runs, so at 2600 the game forces performPassoutWarp()
     /// and both players transition to the next day.
     /// </summary>
     [Fact]
     [TestServer(Exclusive = true)]
     public async Task HostPassesOut_WhenTimeReaches2AM()
     {
-        await Farmers.ConnectNewAsync(ct: TestContext.Current.CancellationToken);
+        await Farmers.ConnectFastAsync(ct: TestCt);
 
         // Record the current day
-        var statusBefore = await ServerApi.GetStatus(TestContext.Current.CancellationToken);
+        var statusBefore = await ServerApi.GetStatus(TestCt);
         Assert.NotNull(statusBefore);
         var dayBefore = statusBefore.Day;
         var seasonBefore = statusBefore.Season;
@@ -345,16 +275,13 @@ public class HostAutomationTests : TestBase
         );
 
         // Set time to 2550, just one 10-minute tick before 2:00 AM (2600).
-        var setTimeResult = await ServerApi.SetTime(
-            TestTimings.PrePassOutTime,
-            TestContext.Current.CancellationToken
-        );
+        var setTimeResult = await ServerApi.SetTime(TestTimings.PrePassOutTime, TestCt);
         Assert.NotNull(setTimeResult);
         Assert.True(setTimeResult.Success, $"SetTime failed: {setTimeResult.Error}");
         Log($"Set time to {setTimeResult.TimeOfDay}, waiting for 2:00 AM pass-out...");
 
         // Speed up clock 10x so the tick from 2550→2600 takes ~0.7s instead of ~7s
-        var speedResult = await ServerApi.SetClockSpeed(10, TestContext.Current.CancellationToken);
+        var speedResult = await ServerApi.SetClockSpeed(10, TestCt);
         Assert.True(speedResult?.Success, $"SetClockSpeed failed: {speedResult?.Error}");
 
         bool dayChanged;
@@ -362,21 +289,16 @@ public class HostAutomationTests : TestBase
         {
             // Wait for the day to transition.
             // At 2600, the game forces pass-out → sleep ready check → day transition.
-            dayChanged = await DayChange.WaitAsync(
-                dayBefore,
-                seasonBefore,
-                yearBefore,
-                TestContext.Current.CancellationToken
-            );
+            dayChanged = await DayChange.WaitAsync(dayBefore, seasonBefore, yearBefore, TestCt);
         }
         finally
         {
             // Always restore clock speed
-            await ServerApi.SetClockSpeed(1, TestContext.Current.CancellationToken);
+            await ServerApi.SetClockSpeed(1, TestCt);
         }
         Assert.True(dayChanged, "Day should have advanced after 2:00 AM pass-out");
 
-        var statusAfter = await ServerApi.GetStatus(TestContext.Current.CancellationToken);
+        var statusAfter = await ServerApi.GetStatus(TestCt);
         Assert.NotNull(statusAfter);
         Log(
             $"After pass-out: {statusAfter.Season} {statusAfter.Day}, Year {statusAfter.Year}, Time {statusAfter.TimeOfDay}"
@@ -407,8 +329,8 @@ public class HostAutomationTests : TestBase
     [TestServer(Exclusive = true)]
     public async Task HostCompletesQiPlaneEvent_AcrossFpsMatrix(int fps)
     {
-        var ct = TestContext.Current.CancellationToken;
-        await Farmers.ConnectNewAsync(ct: ct);
+        var ct = TestCt;
+        await Farmers.ConnectFastAsync(ct: ct);
 
         var initialRendering = await ServerApi.GetRendering(ct);
         Assert.NotNull(initialRendering);
@@ -463,5 +385,227 @@ public class HostAutomationTests : TestBase
             using var cleanupCts = new CancellationTokenSource(TestTimings.CleanupTimeout);
             await ServerApi.SetServerFps(initialFps, cleanupCts.Token);
         }
+    }
+
+    /// <summary>
+    /// An empty server pauses on a festival date exactly as on any other day: the pause keys
+    /// on player presence and the host being at rest, not on the calendar.
+    /// </summary>
+    [Fact]
+    [TestServer(Clients = 0, Exclusive = true)]
+    public async Task TimePaused_WhenNoPlayersConnected_OnFestivalDay()
+    {
+        await Connect.EnsureDisconnectedAsync();
+        var ct = TestCt;
+        await WaitForNoPlayersAsync(ct);
+
+        var statusBefore = await ServerApi.GetStatus(ct);
+        Assert.NotNull(statusBefore);
+
+        try
+        {
+            // Egg Festival. /test/set_date runs the new-day reset, so the clock is at 6:00.
+            var setDate = await ServerApi.SetDate("spring", 13, statusBefore.Year, ct);
+            Assert.True(setDate?.Success, $"SetDate(spring 13) failed: {setDate?.Error}");
+
+            // The scenario proof: the server's own festival-date predicate must read true.
+            // whereIsTodaysFest can't serve here — it is only written by the ten-minute clock
+            // tick, which the pause under test prevents.
+            var festival = await ServerApi.GetFestivalState(ct);
+            Assert.True(
+                festival?.IsFestivalDay == true,
+                "IsFestivalDay must be true after SetDate(spring 13); the test would otherwise run on an ordinary day"
+            );
+
+            await WaitForPausedAsync(WaitName.Polling_HostAutomation_FestivalDayPauseConfirmed, ct);
+
+            var status = await ServerApi.GetStatus(ct);
+            Assert.NotNull(status);
+            Assert.True(
+                status.TimeOfDay == 600,
+                $"Empty server on a festival date must hold at 6:00, got {status.TimeOfDay} (the clock ran before the pause engaged)"
+            );
+            LogSuccess("Empty server paused at 6:00 on the Egg Festival date");
+        }
+        finally
+        {
+            // Leave the shared server on an ordinary date for the next test.
+            using var cleanupCts = new CancellationTokenSource(TestTimings.CleanupTimeout);
+            await ServerApi.SetDate("spring", 14, statusBefore.Year, cleanupCts.Token);
+        }
+    }
+
+    /// <summary>
+    /// At exactly 1:00 AM (timeOfDay 2500, the inclusive lower bound of the grace window) an
+    /// empty server pauses like at any other time, then closes the day through the host's own
+    /// sleep once AUTO_SLEEP_GRACE_SECONDS (seconds in the test config) elapse with nobody
+    /// returning. Pinning the boundary here guards the inclusive 2500 check against a regression
+    /// to a strict comparison. The clock never runs unattended: it must still read the value set
+    /// here when the pause is confirmed, and the new day must start paused at 6:00.
+    /// </summary>
+    [Fact]
+    [TestServer(Clients = 0, Exclusive = true)]
+    public async Task HostSleepsAfterGrace_WhenServerEmptyAtOneAm()
+    {
+        await Connect.EnsureDisconnectedAsync();
+        var ct = TestCt;
+        await WaitForNoPlayersAsync(ct);
+
+        var before = await ServerApi.GetStatus(ct);
+        Assert.NotNull(before);
+
+        var setTime = await ServerApi.SetTime(TestTimings.OneAmTime, ct);
+        Assert.True(setTime?.Success, $"SetTime failed: {setTime?.Error}");
+
+        await WaitForPausedAsync(WaitName.Polling_HostAutomation_GracePauseConfirmed, ct);
+        var paused = await ServerApi.GetStatus(ct);
+        Assert.NotNull(paused);
+        Assert.True(
+            paused.TimeOfDay == TestTimings.OneAmTime,
+            $"Empty server at 1:00 AM must pause at {TestTimings.OneAmTime}, got {paused.TimeOfDay} (the clock ran unattended)"
+        );
+
+        var dayChanged = await DayChange.WaitAsync(before.Day, before.Season, before.Year, ct);
+        Assert.True(
+            dayChanged,
+            "Day should advance through the host's grace sleep with nobody connected"
+        );
+
+        await WaitForPausedAsync(WaitName.Polling_HostAutomation_NextDayPauseConfirmed, ct);
+        var morning = await ServerApi.GetStatus(ct);
+        Assert.NotNull(morning);
+        Assert.True(
+            morning.TimeOfDay == 600,
+            $"The new day must start paused at 6:00, got {morning.TimeOfDay}"
+        );
+        LogSuccess(
+            $"Empty server slept after the grace period: {before.Season} {before.Day} → {morning.Season} {morning.Day}, paused at 6:00"
+        );
+    }
+
+    /// <summary>
+    /// An overnight farm event ticks only while the world is unpaused. On an empty server the
+    /// grace sleep drives the night, the event plays inside the transition the guard keeps
+    /// unpaused, and the pause must engage at 6:00 only once the event is gone.
+    /// Uses the earthquake sound event: farmEventOverride bypasses the random pick, its setUp has
+    /// no preconditions, and it needs several seconds of unpaused ticks (the Qi plane event
+    /// completes on its first host tick, so it never meets the pause).
+    /// </summary>
+    [Fact]
+    [TestServer(Clients = 0, Exclusive = true)]
+    public async Task HostCompletesFarmEvent_AfterGraceSleep_WhenServerEmpty()
+    {
+        await Connect.EnsureDisconnectedAsync();
+        var ct = TestCt;
+        await WaitForNoPlayersAsync(ct);
+
+        var queueResult = await ServerApi.QueueFarmEvent("earthquake", ct);
+        Assert.True(queueResult?.Success, $"QueueFarmEvent failed: {queueResult?.Error}");
+
+        var before = await ServerApi.GetStatus(ct);
+        Assert.NotNull(before);
+
+        var setTime = await ServerApi.SetTime(TestTimings.PrePassOutTime, ct);
+        Assert.True(setTime?.Success, $"SetTime failed: {setTime?.Error}");
+
+        var dayChanged = await DayChange.WaitAsync(before.Day, before.Season, before.Year, ct);
+        Assert.True(
+            dayChanged,
+            "Day should advance through the grace sleep with a farm event queued"
+        );
+
+        // The day counter, the pause flag, and timeOfDay=600 all read the same whether the event
+        // completed or is still up, so the completion itself is the assertion: a stalled event
+        // keeps farmEvent non-null.
+        var eventCompleted = await PollingHelper.WaitUntilAsync(
+            WaitName.Polling_HostAutomation_FarmEventCompleted,
+            async () =>
+            {
+                var state = await ServerApi.GetFarmEventState(ct);
+                return state?.Success == true && !state.Active;
+            },
+            timeout: TestTimings.NetworkSyncTimeout,
+            cancellationToken: ct
+        );
+        Assert.True(
+            eventCompleted,
+            "The overnight farm event must complete on the empty server; a farmEvent still up means the pause froze it"
+        );
+
+        await WaitForPausedAsync(WaitName.Polling_HostAutomation_FarmEventDayPauseConfirmed, ct);
+        var morning = await ServerApi.GetStatus(ct);
+        Assert.NotNull(morning);
+        Assert.True(
+            morning.TimeOfDay == 600,
+            $"The new day must start paused at 6:00 after the farm event, got {morning.TimeOfDay}"
+        );
+        LogSuccess("Empty server ran the overnight farm event to completion and paused at 6:00");
+    }
+
+    /// <summary>
+    /// The last player leaves at 2:00 AM, during or just before the host's pass-out. The game
+    /// ends the day only through that pass-out (UpdateOther fires it once the clock reads 2600,
+    /// the animation hands over to NewDay), and every step of it runs inside the block the pause
+    /// gates. The at-rest check must keep the pause off from 2600 until the transition starts;
+    /// otherwise the host freezes mid-pass-out until someone joins. Setting 2600 on an empty
+    /// server reproduces the exact state the departing player leaves behind.
+    /// </summary>
+    [Fact]
+    [TestServer(Clients = 0, Exclusive = true)]
+    public async Task HostPassesOut_WhenServerEmptyAt2AM()
+    {
+        await Connect.EnsureDisconnectedAsync();
+        var ct = TestCt;
+        await WaitForNoPlayersAsync(ct);
+
+        var before = await ServerApi.GetStatus(ct);
+        Assert.NotNull(before);
+
+        var setTime = await ServerApi.SetTime(TestTimings.PassOutTime, ct);
+        Assert.True(setTime?.Success, $"SetTime failed: {setTime?.Error}");
+
+        var dayChanged = await DayChange.WaitAsync(before.Day, before.Season, before.Year, ct);
+        Assert.True(
+            dayChanged,
+            "The empty server must pass out at 2:00 AM and start the next day; a pause engaged at 2600 freezes the pass-out"
+        );
+
+        await WaitForPausedAsync(WaitName.Polling_HostAutomation_PassOutDayPauseConfirmed, ct);
+        var morning = await ServerApi.GetStatus(ct);
+        Assert.NotNull(morning);
+        Assert.True(
+            morning.TimeOfDay == 600,
+            $"The new day must start paused at 6:00 after the pass-out, got {morning.TimeOfDay}"
+        );
+        LogSuccess("Empty server passed out at 2:00 AM and paused at 6:00");
+    }
+
+    /// <summary>
+    /// Wait until no other players are connected (a previous test may still be cleaning up).
+    /// </summary>
+    private async Task WaitForNoPlayersAsync(CancellationToken ct)
+    {
+        var noPlayers = await ServerApi.WaitForStatusMatchAsync(
+            WaitName.Polling_HostAutomation_NoPlayers,
+            TestTimings.ServerReadyBetweenTests,
+            isReady: true,
+            playerCount: 0,
+            ct: ct
+        );
+        Assert.True(noPlayers, "Server should have no players connected before testing time pause");
+    }
+
+    /// <summary>
+    /// Long-poll the status snapshot until it reports IsPaused=true.
+    /// </summary>
+    private async Task WaitForPausedAsync(WaitName waitName, CancellationToken ct)
+    {
+        var pauseConfirmed = await ServerApi.WaitForStatusMatchAsync(
+            waitName,
+            TestTimings.NetworkSyncTimeout,
+            isPaused: true,
+            ct: ct
+        );
+        Assert.True(pauseConfirmed, "Server should report IsPaused=true with no players connected");
     }
 }

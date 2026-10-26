@@ -1,7 +1,10 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Runtime.Serialization;
 using JunimoServer.Services.CabinManager;
 using JunimoServer.Services.GameCreator;
+using JunimoServer.Util;
 using Newtonsoft.Json;
 using StardewModdingAPI;
 
@@ -55,21 +58,32 @@ public class ServerSettingsLoader
 
     public int MaxPlayers => _settings.Server.MaxPlayers;
 
-    public CabinStrategy CabinStrategy => ParseCabinStrategy(_settings.Server.CabinStrategy);
+    public CabinStrategy CabinStrategy => _settings.Server.CabinStrategy;
 
     public bool SeparateWallets => _settings.Server.SeparateWallets;
 
-    public ExistingCabinBehavior ExistingCabinBehavior =>
-        ParseExistingCabinBehavior(_settings.Server.ExistingCabinBehavior);
+    public ExistingCabinBehavior ExistingCabinBehavior => _settings.Server.ExistingCabinBehavior;
 
     public bool VerboseLogging => _settings.Server.VerboseLogging;
 
     public bool AllowIpConnections => _settings.Server.AllowIpConnections;
 
     /// <summary>
+    /// Whether players may relocate their cabin via the !cabin command
+    /// (see <see cref="ServerRuntimeSettings.AllowCabinRelocation"/>).
+    /// </summary>
+    public bool AllowCabinRelocation => _settings.Server.AllowCabinRelocation;
+
+    /// <summary>
+    /// Whether the farmhand ownership gate and transport-scoped visibility narrowing are
+    /// enforced (see <see cref="ServerRuntimeSettings.EnforceFarmhandOwnership"/>).
+    /// </summary>
+    public bool EnforceFarmhandOwnership => _settings.Server.EnforceFarmhandOwnership;
+
+    /// <summary>
     /// Lobby mode for password protection: Shared or Individual.
     /// </summary>
-    public LobbyMode LobbyMode => ParseLobbyMode(_settings.Server.LobbyMode);
+    public LobbyMode LobbyMode => _settings.Server.LobbyMode;
 
     /// <summary>
     /// Name of the active lobby layout for new players.
@@ -109,6 +123,79 @@ public class ServerSettingsLoader
     }
 
     /// <summary>
+    /// Persists a new cabin strategy into the settings file. Used by the staged-migration
+    /// commit: the settings file is the durable source of truth (SyncFromSettings reapplies
+    /// it on every boot/reload), so a committed strategy flip must be written here or the
+    /// next reload would revert it.
+    /// </summary>
+    public void SetCabinStrategy(CabinStrategy value)
+    {
+        _settings.Server.CabinStrategy = value;
+        Save();
+    }
+
+    /// <summary>
+    /// Persists into server-settings.json the parts of a new game's configuration that a
+    /// later load RE-APPLIES from the file: the runtime settings SyncFromSettings pushes on
+    /// every boot/reload (maxPlayers, cabinStrategy, allowCabinRelocation), the
+    /// AllowIpConnections door (reapplied by IpConnectionService at every SaveLoaded), and
+    /// CabinLayoutNearby (re-read at every load to resolve the designated cabin layout).
+    /// Without these writes a /newgame override silently reverts at the next reload — an
+    /// API-created None game would even sync the file's CabinStack back and sweep every
+    /// visible cabin into the hidden stack. Creation-only settings (farm name/type, seed,
+    /// starting cabins, …) are deliberately NOT written: nothing re-applies them to the
+    /// created game, so in the file they keep describing the configured defaults for the
+    /// NEXT new game.
+    /// </summary>
+    public void ApplyNewGameConfig(NewGameConfig config)
+    {
+        _settings.Game.CabinLayoutNearby = config.CabinLayoutNearby;
+        _settings.Server.MaxPlayers = config.MaxPlayers;
+        _settings.Server.CabinStrategy = config.CabinStrategy;
+        _settings.Server.AllowCabinRelocation = config.AllowCabinRelocation;
+        _settings.Server.AllowIpConnections = config.AllowIpConnections;
+        Save();
+    }
+
+    /// <summary>
+    /// The settings-file values <see cref="ApplyNewGameConfig"/> writes, captured so a
+    /// failed game creation can restore them (see <see cref="RestoreAppliedNewGameConfig"/>).
+    /// </summary>
+    public readonly record struct AppliedNewGameConfig(
+        bool CabinLayoutNearby,
+        int MaxPlayers,
+        CabinStrategy CabinStrategy,
+        bool AllowCabinRelocation,
+        bool AllowIpConnections
+    );
+
+    public AppliedNewGameConfig CaptureAppliedNewGameConfig() =>
+        new(
+            _settings.Game.CabinLayoutNearby,
+            _settings.Server.MaxPlayers,
+            _settings.Server.CabinStrategy,
+            _settings.Server.AllowCabinRelocation,
+            _settings.Server.AllowIpConnections
+        );
+
+    /// <summary>
+    /// Restores the values <see cref="ApplyNewGameConfig"/> wrote. Game creation persists
+    /// its config into the file BEFORE the engine builds the world (SaveLoaded consumers
+    /// read it), so a throw mid-creation would otherwise leave the durable file describing
+    /// a game that never came to exist — and the next boot would process a strategy switch
+    /// the operator never asked for on the old, still-targeted save.
+    /// </summary>
+    public void RestoreAppliedNewGameConfig(AppliedNewGameConfig prior)
+    {
+        _settings.Game.CabinLayoutNearby = prior.CabinLayoutNearby;
+        _settings.Server.MaxPlayers = prior.MaxPlayers;
+        _settings.Server.CabinStrategy = prior.CabinStrategy;
+        _settings.Server.AllowCabinRelocation = prior.AllowCabinRelocation;
+        _settings.Server.AllowIpConnections = prior.AllowIpConnections;
+        Save();
+    }
+
+    /// <summary>
     /// Persists current settings to the config file.
     /// </summary>
     public void Save()
@@ -139,10 +226,20 @@ public class ServerSettingsLoader
             try
             {
                 var json = File.ReadAllText(_settingsPath);
-                var settings = JsonConvert.DeserializeObject<ServerSettings>(json);
+                var rejects = new List<SettingReject>();
+                var settings = JsonConvert.DeserializeObject<ServerSettings>(
+                    json,
+                    new JsonSerializerSettings
+                    {
+                        // Reject sink for the settings converters, which have no IMonitor — they
+                        // record unparseable values here for the loader to warn about.
+                        Context = new StreamingContext(StreamingContextStates.Other, rejects),
+                    }
+                );
                 if (settings != null)
                 {
                     _monitor.Log($"Loaded settings from {_settingsPath}", LogLevel.Info);
+                    LogSettingRejects(rejects);
                     return settings;
                 }
             }
@@ -192,15 +289,6 @@ public class ServerSettingsLoader
 
     #region Parsers
 
-    private static CabinStrategy ParseCabinStrategy(string value)
-    {
-        if (Enum.TryParse<CabinStrategy>(value, ignoreCase: true, out var result))
-        {
-            return result;
-        }
-        return CabinManager.CabinStrategy.CabinStack;
-    }
-
     private static bool? ParseNullableBool(string value)
     {
         if (string.Equals(value, "auto", StringComparison.OrdinalIgnoreCase))
@@ -214,22 +302,19 @@ public class ServerSettingsLoader
         return null;
     }
 
-    private static ExistingCabinBehavior ParseExistingCabinBehavior(string value)
+    /// <summary>
+    /// Warns (naming the file) about each value a settings converter could not parse. Warn, not
+    /// Error — an Error line is E2E test poison (see rules/debugging.md).
+    /// </summary>
+    private void LogSettingRejects(IReadOnlyList<SettingReject> rejects)
     {
-        if (Enum.TryParse<ExistingCabinBehavior>(value, ignoreCase: true, out var result))
+        foreach (var reject in rejects)
         {
-            return result;
+            _monitor.Log(
+                $"Invalid {reject.Path} in {_settingsPath}: '{reject.RejectedValue}' is not recognized; using '{reject.FallbackUsed}'.",
+                LogLevel.Warn
+            );
         }
-        return CabinManager.ExistingCabinBehavior.KeepExisting;
-    }
-
-    private static LobbyMode ParseLobbyMode(string value)
-    {
-        if (Enum.TryParse<LobbyMode>(value, ignoreCase: true, out var result))
-        {
-            return result;
-        }
-        return Settings.LobbyMode.Shared;
     }
 
     private int ClampBroadcastPeriod(int value)

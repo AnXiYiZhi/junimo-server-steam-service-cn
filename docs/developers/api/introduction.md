@@ -1,6 +1,6 @@
 # REST API
 
-The dedicated server exposes an HTTP REST API on port 8080 for monitoring and controlling your server programmatically.
+The dedicated server exposes an HTTP REST API (port 8080 by default, see `API_PORT`) for monitoring and controlling your server programmatically. Behind the optional [HTTPS proxy](/admins/operations/reverse-proxy) the same API is served under the server's proxy URL.
 
 Use the sidebar to browse available endpoints.
 
@@ -23,34 +23,41 @@ The API is enabled by default. Configure via environment variables:
 |----------|-------------|---------|
 | `API_ENABLED` | Enable/disable the API | `true` |
 | `API_PORT` | Port for the API server | `8080` |
-| `API_KEY` | API key for write endpoints | (empty = no auth) |
+| `API_KEY` | API key required by authenticated endpoints | (empty = no auth; startup then requires `ALLOW_INSECURE_SETUP=true`) |
 
 ## Authentication
 
-When `API_KEY` is set, all endpoints require authentication via the `Authorization` header:
+If `API_KEY` is set, send it with every request:
 
-```
+```http
 Authorization: Bearer <your-api-key>
 ```
 
-### Public Endpoints
+Each endpoint page in this reference says whether it needs the key. Health, status and the docs pages work without one. To show `/status` on a website, see [Public Server Status](/admins/operations/public-status).
 
-These endpoints remain accessible without authentication:
+## Invite code status
 
-| Endpoint | Purpose |
-|----------|---------|
-| `/health` | Health checks for monitoring tools |
-| `/docs` | API documentation UI |
-| `/swagger/v1/swagger.json` | OpenAPI specification |
+`/status` carries the invite code beside `connectionStatusCode`, one stable value that says whether the code is usable and by whom. The server derives it from whether `inviteCode` is present and the raw connectivity signals (`steamRelayReady`, `galaxyLobbyState`, `steamSessionState`), which stay on the response for diagnostics; a display maps only the code to text.
+
+| Value | Meaning |
+|-------|---------|
+| `ready` | The code is usable by everyone |
+| `steamRelayPending` | The code is shown and GOG clients can join; the Steam relay is not ready yet |
+| `reconnecting` | The multiplayer session is recovering |
+| `starting` | The session is starting up; the lobby is still forming |
+| `steamSessionDown` | The Steam session is not up, so there is no code yet |
+| `inviteUnavailable` | Invite codes are not configured on this server (`STEAM_AUTH_URL` unset) |
+
+The value is present whenever the mod answers `/status`; the mod's `invitecode` and `info` replies, the Discord bot, and the status widget all show the same state.
 
 ### Example
 
 ```sh
 # Without auth (will fail if API_KEY is set)
-curl "http://localhost:8080/status"
+curl "http://localhost:8080/players"
 
 # With auth
-curl "http://localhost:8080/status" \
+curl "http://localhost:8080/players" \
   -H "Authorization: Bearer your-api-key"
 ```
 

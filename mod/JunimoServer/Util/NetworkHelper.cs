@@ -4,7 +4,9 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.NetworkInformation;
+using System.Reflection;
 using System.Threading.Tasks;
+using HarmonyLib;
 using JunimoServer.Services.MessageInterceptors;
 using Netcode;
 using StardewValley;
@@ -57,6 +59,29 @@ public class NetworkHelper
         Timeout = TimeSpan.FromSeconds(5),
     };
 
+    private static readonly MethodInfo _sendLocationMethod = AccessTools.Method(
+        typeof(GameServer),
+        "sendLocation",
+        new[] { typeof(long), typeof(GameLocation), typeof(bool) }
+    );
+
+    /// <summary>
+    /// Sends a full location introduction (message 3) to one peer through the private
+    /// GameServer.sendLocation. Outgoing interceptors (CabinManagerService's farm rewrite) see
+    /// it like any join-time introduction. <paramref name="forceCurrent"/> makes the client
+    /// switch to the location and run its entry reset; without it the client only swaps an
+    /// always-active location in place, or answers an open warp request with it.
+    /// </summary>
+    public static void SendLocation(
+        GameServer server,
+        long peerId,
+        GameLocation location,
+        bool forceCurrent
+    )
+    {
+        _sendLocationMethod.Invoke(server, new object[] { peerId, location, forceCurrent });
+    }
+
     public static IPAddress GetIpAddressLocal()
     {
         var interfaces = NetworkInterface
@@ -105,26 +130,6 @@ public class NetworkHelper
         }
 
         return incMsg;
-    }
-
-    public static bool IsLocationDeltaMessageForLocation<T>(MessageContext context, out T location)
-        where T : GameLocation
-    {
-        var isStructure = context.Reader.ReadByte() > 0;
-        var locationName = context.Reader.ReadString();
-
-        if (locationName.StartsWith(typeof(T).Name))
-        {
-            // Uses global location, so changes affect server + all clients
-            if (Game1.getLocationFromName(locationName, isStructure) is T locationGeneric)
-            {
-                location = locationGeneric;
-                return true;
-            }
-        }
-
-        location = null;
-        return false;
     }
 
     public static OutgoingMessage CreateMessagePlayerIntroduction(

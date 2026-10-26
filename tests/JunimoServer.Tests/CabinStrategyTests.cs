@@ -29,8 +29,8 @@ public class CabinStrategyTests : TestBase
     [TestServer(Clients = 0)]
     public async Task Cabins_StrategyMatchesSettings()
     {
-        var cabins = await ServerApi.GetCabins(TestContext.Current.CancellationToken);
-        var settings = await ServerApi.GetSettings(TestContext.Current.CancellationToken);
+        var cabins = await ServerApi.GetCabins(TestCt);
+        var settings = await ServerApi.GetSettings(TestCt);
 
         Assert.NotNull(cabins);
         Assert.NotNull(settings);
@@ -46,7 +46,7 @@ public class CabinStrategyTests : TestBase
     [TestServer(Clients = 0)]
     public async Task DefaultCabinStack_HasAtLeastOneAvailableCabin()
     {
-        var cabins = await ServerApi.GetCabins(TestContext.Current.CancellationToken);
+        var cabins = await ServerApi.GetCabins(TestCt);
 
         Assert.NotNull(cabins);
         Assert.True(
@@ -63,7 +63,7 @@ public class CabinStrategyTests : TestBase
     [TestServer(Clients = 0)]
     public async Task Cabins_CountsAreConsistent()
     {
-        var cabins = await ServerApi.GetCabins(TestContext.Current.CancellationToken);
+        var cabins = await ServerApi.GetCabins(TestCt);
 
         Assert.NotNull(cabins);
         Assert.Equal(cabins.TotalCount, cabins.AssignedCount + cabins.AvailableCount);
@@ -81,7 +81,7 @@ public class CabinStrategyTests : TestBase
     [TestServer(Clients = 0)]
     public async Task CabinStack_AllCabinsAreHidden()
     {
-        var cabins = await ServerApi.GetCabins(TestContext.Current.CancellationToken);
+        var cabins = await ServerApi.GetCabins(TestCt);
 
         Assert.NotNull(cabins);
         Assert.Equal("CabinStack", cabins.Strategy);
@@ -137,25 +137,25 @@ public class CabinStrategyTests : TestBase
     public async Task CabinStack_AfterPlayerJoins_CabinReplenished()
     {
         // Record state before join
-        var cabinsBefore = await ServerApi.GetCabins(TestContext.Current.CancellationToken);
+        var cabinsBefore = await ServerApi.GetCabins(TestCt);
         Assert.NotNull(cabinsBefore);
         var availableBefore = cabinsBefore.AvailableCount;
         Log($"Before join: total={cabinsBefore.TotalCount}, available={availableBefore}");
 
         // Join and enter world (consumes one cabin slot via customization)
-        var client = await Farmers.ConnectNewAsync(ct: TestContext.Current.CancellationToken);
+        var client = await Farmers.ConnectNewAsync(ct: TestCt);
 
         // Disconnect and wait for the server to release the farmhand slot
         await Farmers.DisconnectAndWaitForSlotAsync(
             client.JoinResult.UniqueMultiplayerId,
             client.FarmerName,
-            TestContext.Current.CancellationToken
+            TestCt
         );
 
         // Rejoin world to trigger cabin replenishment. sendServerIntroduction (and thus
         // OnServerJoined -> EnsureAtLeastXCabins) only fires after farmhand slot selection,
         // not when merely reaching the farmhand screen. A full rejoin is required.
-        await Farmers.ReconnectAsync(client.FarmerName, ct: TestContext.Current.CancellationToken);
+        await Farmers.ReconnectAsync(client.FarmerName, ct: TestCt);
 
         // Poll until our farmer's cabin appears as assigned AND at least 1 available
         // (replenishment). Must check for our specific farmer; other tests on a shared
@@ -166,7 +166,7 @@ public class CabinStrategyTests : TestBase
             WaitName.Polling_CabinStrategy_OurCabinAssigned,
             async () =>
             {
-                cabinsAfter = await ServerApi.GetCabins(TestContext.Current.CancellationToken);
+                cabinsAfter = await ServerApi.GetCabins(TestCt);
                 ourCabin = cabinsAfter?.Cabins.FirstOrDefault(c =>
                     c.OwnerName.Equals(client.FarmerName, StringComparison.OrdinalIgnoreCase)
                     && c.IsAssigned
@@ -177,7 +177,7 @@ public class CabinStrategyTests : TestBase
                 return ourCabin != null && cabinsAfter?.AvailableCount >= 1;
             },
             TestTimings.CabinAssignmentTimeout,
-            cancellationToken: TestContext.Current.CancellationToken
+            cancellationToken: TestCt
         );
 
         Assert.True(
@@ -197,17 +197,14 @@ public class CabinStrategyTests : TestBase
     [Fact]
     public async Task CabinStack_PlayerJoin_CabinAssignedToPlayer()
     {
-        var client = await Farmers.ConnectNewAsync(ct: TestContext.Current.CancellationToken);
+        var client = await Farmers.ConnectNewAsync(ct: TestCt);
 
         // Poll until cabin ownership appears (server needs time to sync farmhand
         // isCustomized flag and Name after character creation)
-        var ownedCabin = await WaitForCabinAssignedAsync(
-            client.FarmerName,
-            TestContext.Current.CancellationToken
-        );
+        var ownedCabin = await WaitForCabinAssignedAsync(client.FarmerName, TestCt);
 
         // Log all cabins for diagnostics
-        var cabins = await ServerApi.GetCabins(TestContext.Current.CancellationToken);
+        var cabins = await ServerApi.GetCabins(TestCt);
         Log($"Cabins after join ({cabins!.Cabins.Count} total):");
         foreach (var c in cabins.Cabins)
         {
@@ -230,7 +227,7 @@ public class CabinStrategyTests : TestBase
     [Fact]
     public async Task Cabins_OurFarmerAppearsInBothEndpoints()
     {
-        var client = await Farmers.ConnectNewAsync(ct: TestContext.Current.CancellationToken);
+        var client = await Farmers.ConnectNewAsync(ct: TestCt);
 
         // Poll until our farmer appears in both /cabins and /farmhands
         CabinInfoResponse? ourCabin = null;
@@ -239,7 +236,7 @@ public class CabinStrategyTests : TestBase
             WaitName.Polling_CabinStrategy_FarmerSyncedCabinAndFarmhand,
             async () =>
             {
-                var cabins = await ServerApi.GetCabins(TestContext.Current.CancellationToken);
+                var cabins = await ServerApi.GetCabins(TestCt);
                 var farmhands = await ServerApi.GetFarmhands();
                 ourCabin = cabins?.Cabins.FirstOrDefault(c =>
                     c.OwnerName.Equals(client.FarmerName, StringComparison.OrdinalIgnoreCase)
@@ -252,7 +249,7 @@ public class CabinStrategyTests : TestBase
                 return ourCabin != null && ourFarmhand != null;
             },
             TestTimings.CabinAssignmentTimeout,
-            cancellationToken: TestContext.Current.CancellationToken
+            cancellationToken: TestCt
         );
 
         Assert.True(
@@ -271,17 +268,14 @@ public class CabinStrategyTests : TestBase
     public async Task Cabins_AfterDeletion_SlotIsFreed()
     {
         // Create, join, disconnect, and wait for persistence
-        var client = await Farmers.ConnectNewAsync(ct: TestContext.Current.CancellationToken);
-        await Farmers.DisconnectAndWaitForPersistenceAsync(
-            client.FarmerName,
-            TestContext.Current.CancellationToken
-        );
+        var client = await Farmers.ConnectNewAsync(ct: TestCt);
+        await Farmers.DisconnectAndWaitForPersistenceAsync(client.FarmerName, TestCt);
 
         // Delete the farmhand
         Log($"Deleting farmhand '{client.FarmerName}'...");
         var deleteResult = await ServerApi.WaitForFarmhandDeletedByNameAsync(
             client.FarmerName,
-            ct: TestContext.Current.CancellationToken
+            ct: TestCt
         );
         Assert.True(
             deleteResult?.Success,
@@ -300,7 +294,7 @@ public class CabinStrategyTests : TestBase
             WaitName.Polling_CabinStrategy_FarmerDeletionReflected,
             async () =>
             {
-                cabins = await ServerApi.GetCabins(TestContext.Current.CancellationToken);
+                cabins = await ServerApi.GetCabins(TestCt);
                 farmhands = await ServerApi.GetFarmhands();
                 if (cabins == null || farmhands == null)
                 {
@@ -314,7 +308,7 @@ public class CabinStrategyTests : TestBase
                 return ourFarmerGone && cabins.AvailableCount >= 1;
             },
             TestTimings.NetworkSyncTimeout,
-            cancellationToken: TestContext.Current.CancellationToken
+            cancellationToken: TestCt
         );
 
         var customizedCount = farmhands!.Farmhands.Count(f => f.IsCustomized);
@@ -341,6 +335,158 @@ public class CabinStrategyTests : TestBase
             cabins.AvailableCount >= 1,
             "After deletion, there should be at least 1 available cabin slot"
         );
+    }
+
+    /// <summary>
+    /// Item-1 coverage: under CabinStack a corrupt one-way farmhand↔cabin link (the cabin's
+    /// farmhandReference nulled while homeLocation still names it) is healed on rejoin by the
+    /// join-time repair. Pre-fix the CabinStack branch of OnLocationIntroductionMessage silently
+    /// did nothing when GetCabin returned null, so the player rejoined with their cabin hidden.
+    /// </summary>
+    [Fact]
+    public async Task CabinStack_OneWayCabinLink_RepairedOnRejoin()
+    {
+        var client = await Farmers.ConnectNewAsync(ct: TestCt);
+        var ownerId = client.JoinResult.UniqueMultiplayerId;
+        Assert.True(
+            await ServerApi.WaitForFarmhandByNameAsync(
+                client.FarmerName,
+                requireCustomized: true,
+                ct: TestCt
+            ),
+            $"Farmer '{client.FarmerName}' never customized before the link break"
+        );
+
+        // Disconnect and free the slot, then null the cabin→farmhand back-link on the offline slot
+        // so the one-way corruption survives to the next join.
+        await Farmers.DisconnectAndWaitForSlotAsync(ownerId, client.FarmerName, TestCt);
+        var broke = await ServerApi.BreakCabinLink(ownerId, ct: TestCt);
+        Assert.True(broke?.Success, $"break_cabin_link should succeed: {broke?.Error}");
+
+        var broken = await PollingHelper.WaitUntilAsync(
+            WaitName.Polling_CabinLink_Broken,
+            async () =>
+            {
+                var snapshot = await ServerApi.GetCabins(TestCt);
+                return snapshot != null && snapshot.Cabins.All(c => c.OwnerId != ownerId);
+            },
+            TestTimings.CabinAssignmentTimeout,
+            cancellationToken: TestCt
+        );
+        Assert.True(broken, "the cabin should resolve to no owner after its back-link is nulled");
+
+        // Rejoin: the CabinStack branch now routes through the shared repair helper and re-binds
+        // the cabin instead of silently doing nothing.
+        await Farmers.ReconnectAsync(client.FarmerName, ct: TestCt);
+        await ServerApi.WaitForFarmhandByNameAsync(
+            client.FarmerName,
+            requireCustomized: true,
+            ct: TestCt
+        );
+
+        var healed = await PollingHelper.WaitUntilAsync(
+            WaitName.Polling_CabinLink_Repaired,
+            async () =>
+            {
+                var snapshot = await ServerApi.GetCabins(TestCt);
+                return snapshot?.Cabins.Any(c => c.OwnerId == ownerId) == true;
+            },
+            TestTimings.CabinAssignmentTimeout,
+            cancellationToken: TestCt
+        );
+        Assert.True(
+            healed,
+            $"the one-way cabin link should be repaired on rejoin under CabinStack — a cabin owned "
+                + $"by {ownerId} must resolve again (pre-fix the branch silently did nothing)"
+        );
+
+        await Farmers.DisconnectAndWaitForSlotAsync(ownerId, client.FarmerName, TestCt);
+    }
+
+    /// <summary>
+    /// The placeholder-owner half of the one-way-link repair: a corrupt/imported save can home a
+    /// farmhand to a cabin whose farmhandReference points at a spurious UNCLAIMED PLACEHOLDER (not
+    /// the farmhand). GetCabin returns null while homeLocation still resolves — the join-time repair
+    /// must HEAL this (take the cabin for the owner, DELETING the placeholder cleanly via
+    /// AssignFarmhand) rather than decline (leaving the player cabin-less) or orphan the placeholder
+    /// (a bare farmhandReference write). Distinct from
+    /// FarmhouseStack_HomeOwnedByAnotherFarmhand_RepairDeclines, whose home cabin is owned by a REAL
+    /// customized farmhand and is correctly declined.
+    /// </summary>
+    [Fact]
+    public async Task CabinStack_HomeOwnedByPlaceholder_HealedOnRejoin()
+    {
+        var client = await Farmers.ConnectNewAsync(ct: TestCt);
+        var ownerId = client.JoinResult.UniqueMultiplayerId;
+        Assert.True(
+            await ServerApi.WaitForFarmhandByNameAsync(
+                client.FarmerName,
+                requireCustomized: true,
+                ct: TestCt
+            ),
+            $"Farmer '{client.FarmerName}' never customized before the link break"
+        );
+
+        // Disconnect + free the slot, then install a spurious unclaimed placeholder as the offline
+        // farmhand's own home cabin owner (home still resolves to that cabin) so the corruption
+        // survives to the next join.
+        await Farmers.DisconnectAndWaitForSlotAsync(ownerId, client.FarmerName, TestCt);
+        var broke = await ServerApi.BreakCabinLink(
+            ownerId,
+            makeHomeOwnerPlaceholder: true,
+            ct: TestCt
+        );
+        Assert.True(broke?.Success, $"break_cabin_link should succeed: {broke?.Error}");
+        var placeholderId = broke!.PlaceholderOwnerId;
+        Assert.True(placeholderId != 0, "a placeholder owner id should have been returned");
+
+        // The cabin now resolves to the placeholder, not the owner.
+        var broken = await PollingHelper.WaitUntilAsync(
+            WaitName.Polling_CabinLink_Broken,
+            async () =>
+            {
+                var snapshot = await ServerApi.GetCabins(TestCt);
+                return snapshot != null && snapshot.Cabins.All(c => c.OwnerId != ownerId);
+            },
+            TestTimings.CabinAssignmentTimeout,
+            cancellationToken: TestCt
+        );
+        Assert.True(
+            broken,
+            "the cabin should resolve to no owner (owned by the placeholder) after the break"
+        );
+
+        // Rejoin: the repair takes the cabin for the owner and deletes the placeholder.
+        await Farmers.ReconnectAsync(client.FarmerName, ct: TestCt);
+        await ServerApi.WaitForFarmhandByNameAsync(
+            client.FarmerName,
+            requireCustomized: true,
+            ct: TestCt
+        );
+
+        var healed = await PollingHelper.WaitUntilAsync(
+            WaitName.Polling_CabinLink_Repaired,
+            async () =>
+            {
+                var snapshot = await ServerApi.GetCabins(TestCt);
+                return snapshot?.Cabins.Any(c => c.OwnerId == ownerId) == true;
+            },
+            TestTimings.CabinAssignmentTimeout,
+            cancellationToken: TestCt
+        );
+        Assert.True(
+            healed,
+            $"the placeholder-owned home cabin should be healed on rejoin — a cabin owned by "
+                + $"{ownerId} must resolve again (pre-fix the branch declined and hid the cabin)"
+        );
+
+        // The placeholder was DELETED, not orphaned — the property that distinguishes the correct
+        // AssignFarmhand heal from a bare farmhandReference write. It must be gone from farmhandData.
+        var state = await ServerApi.GetDiagnosticsState(TestCt);
+        Assert.NotNull(state);
+        Assert.DoesNotContain(state!.FarmhandData, f => f.UniqueMultiplayerId == placeholderId);
+
+        await Farmers.DisconnectAndWaitForSlotAsync(ownerId, client.FarmerName, TestCt);
     }
 
     #endregion

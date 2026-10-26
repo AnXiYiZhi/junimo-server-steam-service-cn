@@ -2,6 +2,15 @@ name: Deploy Documentation
 
 on:
   workflow_call:
+    inputs:
+      latest_version:
+        description: 'Version deployed to the latest half, shown in the internal-ci notification (e.g. 1.4.1)'
+        required: false
+        type: string
+      preview_version:
+        description: 'Version deployed to the preview half, shown in the internal-ci notification (e.g. 1.5.0-preview.127)'
+        required: false
+        type: string
   workflow_dispatch:
     inputs:
       rebuild_latest:
@@ -60,8 +69,18 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
-      # Try to download from current workflow run first
-      # This works when called from build-release.yml/build-preview.yml which run build-docs first
+      # The Discord notify action must exist in the checked-out tree (`uses: ./…`); this job
+      # otherwise needs no checkout, so take just the action. Runs first: checkout cleans the
+      # workspace, which must not eat the downloaded artifacts below.
+      - name: Checkout notify action
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/actions/discord-notify
+          sparse-checkout-cone-mode: false
+
+      # Each half is sourced in order: this run's artifact → its primary build workflow →
+      # a prior manual rebuild. Present in this run when invoked by build-release.yml /
+      # build-preview.yml, which run build-docs first.
       - name: Download latest docs (current run)
         id: current-latest
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -78,12 +97,11 @@ jobs:
           path: dist/preview
         continue-on-error: true
 
-      # If not found in current run, fetch from previous workflow runs
-      # Try build-release.yml first (primary source for latest docs)
+      # Primary source for latest: the last build-release.yml run.
       - name: Download latest docs (from release workflow)
         id: release-latest
         if: steps.current-latest.outcome != 'success'
-        uses: dawidd6/action-download-artifact@b6e2e70617bc3265edd6dab6c906732b2f1ae151 # v21
+        uses: dawidd6/action-download-artifact@d63b86af1b34672e53c440b1b83979861906bad7 # v24
         with:
           workflow: build-release.yml
           name: docs-latest
@@ -92,10 +110,10 @@ jobs:
           allow_forks: false
         continue-on-error: true
 
-      # Fallback: check deploy-docs.yml for manually rebuilt latest docs
+      # Last resort: a manually-rebuilt artifact from a prior deploy-docs.yml run.
       - name: Download latest docs (from manual rebuild)
         if: steps.current-latest.outcome != 'success' && steps.release-latest.outcome != 'success'
-        uses: dawidd6/action-download-artifact@b6e2e70617bc3265edd6dab6c906732b2f1ae151 # v21
+        uses: dawidd6/action-download-artifact@d63b86af1b34672e53c440b1b83979861906bad7 # v24
         with:
           workflow: deploy-docs.yml
           name: docs-latest
@@ -103,11 +121,11 @@ jobs:
           if_no_artifact_found: warn
           allow_forks: false
 
-      # Try build-preview.yml first (primary source for preview docs)
+      # Primary source for preview: the last build-preview.yml run.
       - name: Download preview docs (from build-preview workflow)
         id: build-preview-artifact
         if: steps.current-preview.outcome != 'success'
-        uses: dawidd6/action-download-artifact@b6e2e70617bc3265edd6dab6c906732b2f1ae151 # v21
+        uses: dawidd6/action-download-artifact@d63b86af1b34672e53c440b1b83979861906bad7 # v24
         with:
           workflow: build-preview.yml
           name: docs-preview
@@ -116,10 +134,10 @@ jobs:
           allow_forks: false
         continue-on-error: true
 
-      # Fallback: check deploy-docs.yml for manually rebuilt preview docs
+      # Last resort: a manually-rebuilt artifact from a prior deploy-docs.yml run.
       - name: Download preview docs (from manual rebuild)
         if: steps.current-preview.outcome != 'success' && steps.build-preview-artifact.outcome != 'success'
-        uses: dawidd6/action-download-artifact@b6e2e70617bc3265edd6dab6c906732b2f1ae151 # v21
+        uses: dawidd6/action-download-artifact@d63b86af1b34672e53c440b1b83979861906bad7 # v24
         with:
           workflow: deploy-docs.yml
           name: docs-preview
@@ -127,37 +145,75 @@ jobs:
           if_no_artifact_found: warn
           allow_forks: false
 
-      # deploy-pages replaces the WHOLE site, so a half not rebuilt this run is restored from
-      # the currently-live site (the last github-pages artifact deploy-docs uploaded). The next
-      # step extracts the inner artifact.tar; ignore = tolerate it being absent/expired.
-      - name: Download live site snapshot
-        uses: dawidd6/action-download-artifact@b6e2e70617bc3265edd6dab6c906732b2f1ae151 # v21
-        with:
-          workflow: deploy-docs.yml
-          # Only runs on the default branch actually deploy to live Pages — a dispatch
-          # on a feature branch can leave a github-pages artifact that was never deployed.
-          branch: ${{ github.event.repository.default_branch }}
-          name: github-pages
-          path: live
-          if_no_artifact_found: ignore
-          allow_forks: false
+      # A half not rebuilt this run is restored from the currently-live site, snapshotted in R2
+      # (durable, no lifecycle rule) by "Persist live snapshot to R2". R2 deliberately off (all
+      # four vars empty) is tolerated — live/site stays empty, so only a single-half deploy refuses
+      # (in the decide step). A configured-but-broken R2 (partial config, unreachable, AccessDenied,
+      # or an uncertified snapshot) fails the job here rather than deploy against a bad snapshot.
+      - name: Restore live snapshot from R2
+        id: restore
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          # Bucket kept as a var, not a secret: the name has a hyphen and GitHub's secret
+          # masker would turn every `-` in the whole log into *** (see e2e-tests.yml).
+          R2_BUCKET: ${{ vars.R2_BUCKET_DOCS }}
+        run: |
+          # restore_status, read by the decide step: skipped (R2 deliberately off — all four vars
+          # empty) | ok (snapshot reflects live; an empty but readable bucket counts). Any
+          # configured-but-broken state (partial config, aws missing, read error, or a snapshot
+          # missing its .snapshot-complete marker) fails the job here — a silently stale snapshot
+          # is worse than a red deploy.
+          set -uo pipefail
+          mkdir -p live/site
+          endpoint="https://${R2_ACCOUNT_ID:-}.r2.cloudflarestorage.com"
+
+          # Count the four R2 settings (names are the github-pages env keys, for error messages).
+          n=0; missing=""
+          for pair in "R2_BUCKET_DOCS:${R2_BUCKET:-}" "R2_ACCESS_KEY_ID:${AWS_ACCESS_KEY_ID:-}" "R2_SECRET_ACCESS_KEY:${AWS_SECRET_ACCESS_KEY:-}" "R2_ACCOUNT_ID:${R2_ACCOUNT_ID:-}"; do
+            if [ -n "${pair#*:}" ]; then n=$((n+1)); else missing="$missing ${pair%%:*}"; fi
+          done
+
+          if [ "$n" -eq 0 ]; then
+            echo "::warning::R2 not configured — skipping snapshot restore. Single-half deploys will refuse until R2 is set up in the github-pages environment."
+            echo "restore_status=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$n" -lt 4 ]; then
+            echo "::error::R2 is partially configured — missing:${missing}. Set all four (R2_BUCKET_DOCS variable + R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY/R2_ACCOUNT_ID secrets) in the github-pages environment, or unset all four to disable R2."
+            exit 1
+          fi
+          if ! command -v aws >/dev/null 2>&1; then
+            echo "::error::aws CLI not found on the runner — cannot restore the R2 snapshot."
+            exit 1
+          fi
+          if ! err=$(aws s3 sync "s3://${R2_BUCKET}/" live/site/ --endpoint-url "$endpoint" --no-progress 2>&1); then
+            echo "$err"
+            echo "::error::R2 snapshot read failed for bucket '${R2_BUCKET}'. Verify the R2 token has Object Read & Write on this bucket and that R2_ACCOUNT_ID matches the bucket's account (see the aws error logged above)."
+            exit 1
+          fi
+          if [ -n "$(ls -A live/site 2>/dev/null)" ] && [ ! -f live/site/.snapshot-complete ]; then
+            echo "::error::R2 snapshot for '${R2_BUCKET}' has no .snapshot-complete marker — a prior persist was interrupted, so the snapshot may be truncated. Re-run with rebuild_latest=true and rebuild_preview=true to rebuild both halves and re-seed R2."
+            exit 1
+          fi
+          rm -f live/site/.snapshot-complete   # never let the marker leak into the deployed site
+          echo "restore_status=ok" >> "$GITHUB_OUTPUT"
 
       - name: Restore missing halves and decide deploy
         id: check
+        env:
+          RESTORE_STATUS: ${{ steps.restore.outputs.restore_status }}
         run: |
           set -euo pipefail
 
-          # Extract the live snapshot (upload-pages-artifact tars uncompressed: tar -cvf).
-          if [ -f live/artifact.tar ]; then
-            mkdir -p live/site && tar -xf live/artifact.tar -C live/site
-          fi
-
-          # A dir counts as having content only if it holds at least one entry.
+          # Assemble dist/: for each half keep what this run built, else restore it from
+          # live/site (the R2 snapshot), else none. Latest = site root; preview = dist/preview.
+          # has_* treat a dir as content only if it holds an entry.
           has_root() { [ -d dist ] && [ -n "$(ls -A dist 2>/dev/null | grep -v '^preview$')" ]; }
           has_dir()  { [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]; }
 
-          # Latest = site root (everything except preview/); preview = dist/preview/.
-          # Each half: keep what this run built, else restore it from the live snapshot, else none.
           if has_root; then
             LATEST_SRC=this-run
           elif has_dir live/site; then
@@ -183,75 +239,148 @@ jobs:
             PREVIEW_SRC=none
           fi
 
-          echo "latest=$LATEST_SRC preview=$PREVIEW_SRC"
           echo "latest_src=$LATEST_SRC" >> "$GITHUB_OUTPUT"
           echo "preview_src=$PREVIEW_SRC" >> "$GITHUB_OUTPUT"
 
-          # Latest (site root) is required: deploy-pages replaces the whole site, so deploying
-          # without it would wipe the live root. If it's neither built this run nor recoverable
-          # from the live snapshot (artifact expired after >14d quiet), fail loudly rather than
-          # publish an empty root — re-run with rebuild_latest=true to repopulate it.
+          # deploy-pages replaces the whole site, so never publish a half we can't fully obtain —
+          # that wipes it live. Ship a half only if built this run or restored from a readable
+          # snapshot. A broken R2 already failed the restore step, so RESTORE_STATUS here is only
+          # 'ok' (snapshot readable) or 'skipped' (R2 deliberately off).
           if [ "$LATEST_SRC" = none ]; then
-            echo "::error::Latest docs missing and not recoverable from the live site (artifact likely expired)."
-            echo "::error::Refusing to deploy — that would wipe the live root. Re-run with rebuild_latest=true."
+            if [ "${RESTORE_STATUS:-}" = skipped ]; then
+              echo "::error::Refusing deploy: 'latest' wasn't rebuilt this run and R2 is off, so the live copy can't be preserved — publishing now would wipe live 'latest'. Configure R2, or re-run with rebuild_latest=true."
+            else
+              echo "::error::Refusing deploy: 'latest' wasn't rebuilt this run and the R2 snapshot holds no 'latest' to preserve — publishing now would wipe live 'latest'. Re-run with rebuild_latest=true to seed it."
+            fi
             exit 1
           fi
           if [ "$PREVIEW_SRC" = none ]; then
-            echo "::warning::Deploying LATEST ONLY — dist/preview/ absent this deploy."
+            # LATEST-ONLY wipes any live preview, so ship it only when a readable snapshot (ok)
+            # confirmed the live site has no preview.
+            if [ "${RESTORE_STATUS:-}" != ok ]; then
+              echo "::error::Refusing latest-only deploy: R2 is off, so we can't confirm whether live 'preview' exists and publishing might silently wipe it. Configure R2, or re-run with rebuild_preview=true."
+              exit 1
+            fi
+            echo "::warning::Deploying latest-only — live 'preview' confirmed absent from the R2 snapshot, so nothing is wiped."
           fi
 
       - name: Setup Pages
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
 
-      # The backfill above re-downloads this artifact, so it must outlive a deploy gap.
-      # Default 1d is too short; 14d matches the docs-latest / docs-preview window.
+      # Consumed by deploy-pages within this run; durable cross-run recovery is R2, not this
+      # artifact, so default retention is fine.
       - name: Upload merged artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: dist
-          retention-days: 14
 
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
 
-      - name: Build summary
+      # Mirror the deployed site to R2 so the next run can restore the half it doesn't rebuild.
+      # success() ⇒ deploy-pages actually published (its github-pages env decides which refs may),
+      # so the snapshot always equals live — for both default-branch and release-tag deploys.
+      - name: Persist live snapshot to R2
+        if: success()
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ vars.R2_BUCKET_DOCS }}
         run: |
+          # Mirror the just-published site to R2 so a later single-half deploy can restore the half
+          # it doesn't rebuild. R2 deliberately off (all four vars empty) is tolerated; any
+          # configured-but-broken state fails the job — the site already published, but a silently
+          # stale snapshot would break the next single-half deploy with no warning.
+          set -uo pipefail
+          endpoint="https://${R2_ACCOUNT_ID:-}.r2.cloudflarestorage.com"
+
+          n=0; missing=""
+          for pair in "R2_BUCKET_DOCS:${R2_BUCKET:-}" "R2_ACCESS_KEY_ID:${AWS_ACCESS_KEY_ID:-}" "R2_SECRET_ACCESS_KEY:${AWS_SECRET_ACCESS_KEY:-}" "R2_ACCOUNT_ID:${R2_ACCOUNT_ID:-}"; do
+            if [ -n "${pair#*:}" ]; then n=$((n+1)); else missing="$missing ${pair%%:*}"; fi
+          done
+          if [ "$n" -eq 0 ]; then
+            echo "::warning::R2 not configured — snapshot not persisted; single-half deploys will refuse until it is."
+            exit 0
+          fi
+          if [ "$n" -lt 4 ]; then
+            echo "::error::R2 is partially configured — missing:${missing}. Set all four in the github-pages environment, or unset all four to disable R2."
+            exit 1
+          fi
+          command -v aws >/dev/null 2>&1 || { echo "::error::aws CLI not found on the runner — cannot persist the R2 snapshot."; exit 1; }
+
+          # The .snapshot-complete marker certifies a full mirror. Clear it first so an interrupted
+          # sync leaves the snapshot uncertified; mirror; write it last. (rm of a missing key exits 0.)
+          marker="s3://${R2_BUCKET}/.snapshot-complete"
+          if ! err=$(aws s3 rm "$marker" --endpoint-url "$endpoint" 2>&1); then
+            echo "$err"
+            echo "::error::Could not clear the R2 completion marker in '${R2_BUCKET}'. Verify the R2 token has Object Read & Write on this bucket and that R2_ACCOUNT_ID matches its account (see the aws error above)."
+            exit 1
+          fi
+          if ! err=$(aws s3 sync dist/ "s3://${R2_BUCKET}/" --endpoint-url "$endpoint" --no-progress --delete 2>&1); then
+            echo "$err"
+            echo "::error::R2 mirror (sync) to '${R2_BUCKET}' failed (see the aws error above)."
+            exit 1
+          fi
+          if ! err=$(printf 'ok' | aws s3 cp - "$marker" --endpoint-url "$endpoint" 2>&1); then
+            echo "$err"
+            echo "::error::R2 mirror completed but writing the .snapshot-complete marker failed, so the snapshot is uncertified and the next single-half deploy would refuse (see the aws error above)."
+            exit 1
+          fi
+          echo "Live snapshot updated in R2."
+
+      - name: Build summary and notification fields
+        id: labels
+        env:
+          LATEST_SRC: ${{ steps.check.outputs.latest_src }}
+          PREVIEW_SRC: ${{ steps.check.outputs.preview_src }}
+          LATEST_VERSION: ${{ inputs.latest_version }}
+          PREVIEW_VERSION: ${{ inputs.preview_version }}
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Single label definition for both the job summary and the Discord fields.
+          # *_src: this-run (built now) | live (preserved from last deploy) | none (omitted —
+          # preview only). A deployed half is version-prefixed when the calling build workflow
+          # passed its version (a manual dispatch rebuild has none).
+          label() { # $1 = src, $2 = version
+            case "$1" in
+              this-run) if [ -n "$2" ]; then echo "$2 — deployed"; else echo "deployed"; fi ;;
+              live) echo "preserved" ;;
+              *) echo "not included" ;;
+            esac
+          }
+          LATEST_LABEL=$(label "$LATEST_SRC" "$LATEST_VERSION")
+          PREVIEW_LABEL=$(label "$PREVIEW_SRC" "$PREVIEW_VERSION")
+
           echo "### Documentation Deployed" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Site URL:** ${{ steps.deployment.outputs.page_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Site URL:** $PAGE_URL" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Half | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
-          # *_src: this-run (built now) | live (preserved from last deploy) | none (omitted — preview only).
-          status() { case "$1" in this-run) echo "Deployed";; live) echo "Preserved from live site";; *) echo "Not included this deploy";; esac; }
-          echo "| Latest | $(status '${{ steps.check.outputs.latest_src }}') |" >> $GITHUB_STEP_SUMMARY
-          echo "| Preview | $(status '${{ steps.check.outputs.preview_src }}') |" >> $GITHUB_STEP_SUMMARY
+          echo "| Latest | $LATEST_LABEL |" >> $GITHUB_STEP_SUMMARY
+          echo "| Preview | $PREVIEW_LABEL |" >> $GITHUB_STEP_SUMMARY
+
+          jq -cn \
+            --arg latest "$LATEST_LABEL" \
+            --arg preview "$PREVIEW_LABEL" \
+            --arg run "$RUN_URL" \
+            '[
+              {name: "Latest", value: $latest, inline: true},
+              {name: "Preview", value: $preview, inline: true},
+              {name: "Run", value: "[view run](\($run))"}
+            ]' | sed 's/^/fields=/' >> "$GITHUB_OUTPUT"
 
       - name: Discord notification
         if: success()
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
-          LATEST_STATE: ${{ steps.check.outputs.latest_src }}
-          PREVIEW_STATE: ${{ steps.check.outputs.preview_src }}
-        run: |
-          if [ -n "$DISCORD_WEBHOOK" ]; then
-            # Same mapping as the job summary's status().
-            label() { case "$1" in this-run) echo "Deployed";; live) echo "Preserved from live site";; *) echo "Not included";; esac; }
-            jq -n \
-              --arg url "$PAGE_URL" \
-              --arg latest "$(label "$LATEST_STATE")" \
-              --arg preview "$(label "$PREVIEW_STATE")" \
-              '{
-                embeds: [{
-                  title: "Documentation Updated",
-                  color: 3447003,
-                  fields: [
-                    {name: "View Docs", value: "[stardew-valley-dedicated-server.github.io/server](\($url))"},
-                    {name: "Latest", value: $latest, inline: true},
-                    {name: "Preview", value: $preview, inline: true}
-                  ]
-                }]
-              }' | curl -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK"
-          fi
+        continue-on-error: true
+        uses: ./.github/actions/discord-notify
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_INTERNAL_CI }}
+          title: Docs deployed
+          url: ${{ steps.deployment.outputs.page_url }}
+          color: "9807270"
+          fields: ${{ steps.labels.outputs.fields }}

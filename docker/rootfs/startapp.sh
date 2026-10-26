@@ -9,25 +9,26 @@ MODS_DEST_DIR="/data/Mods"
 GAME_DEST_DIR="/data/game"
 GAME_EXECUTABLE="${GAME_DEST_DIR}/StardewValley"
 SMAPI_EXECUTABLE="${GAME_DEST_DIR}/StardewModdingAPI"
-STEAM_SDK_DIR="/root/.steam/sdk64"
+STEAM_SDK_DIR="${HOME}/.steam/sdk64"
+# Completion marker written by steam-auth only after the full depot download succeeds. Gate on it
+# rather than the StardewValley executable: the downloader pre-allocates every file at full size
+# up front, so the executable exists (zero-filled) mid-download — launching on it would run a
+# half-downloaded game. StardewValleyAppId is 413150 (see tools/steam-service/Program.cs).
+GAME_DOWNLOAD_MARKER="${GAME_DEST_DIR}/.download-manifest-413150"
+API_PORT="${API_PORT:-8080}"
+# Lifecycle phase served on the API port until the mod takes over:
+# "downloading" | "validating" | "starting".
+PHASE_FILE="/tmp/startup-phase"
+# SDVD_COMPOSE_REV of the docker-compose.yml this image ships with (validate-pr.yml keeps them
+# equal). Keep it a bare unindented assignment — validate-pr.yml greps this exact line.
+EXPECTED_COMPOSE_REV=4
 
 # Validate required environment variables
 validate_environment() {
     local has_warnings=false
 
-    # Security warnings
-    if [ -z "${VNC_PASSWORD:-}" ]; then
-        echo ""
-        echo -e "\e[33m╔═══════════════════════════════════════════════════════════════════════╗\e[0m"
-        echo -e "\e[33m║  WARNING: VNC_PASSWORD is not set!                                     ║\e[0m"
-        echo -e "\e[33m║                                                                       ║\e[0m"
-        echo -e "\e[33m║  The VNC web interface will be accessible without a password.          ║\e[0m"
-        echo -e "\e[33m║  Set VNC_PASSWORD in your .env file to secure it.                     ║\e[0m"
-        echo -e "\e[33m╚═══════════════════════════════════════════════════════════════════════╝\e[0m"
-        echo ""
-        has_warnings=true
-    fi
-
+    # Security warnings. VNC needs no check here: without VNC_PASSWORD its ports are unreachable from
+    # outside the container (see /etc/cont-init.d/15-vnc-gate.sh).
     if [ "${API_ENABLED:-true}" = "true" ] && [ -z "${API_KEY:-}" ]; then
         echo ""
         echo -e "\e[33m╔═══════════════════════════════════════════════════════════════════════╗\e[0m"
@@ -54,32 +55,33 @@ validate_environment() {
     fi
 }
 
+check_compose_revision() {
+    local actual="${SDVD_COMPOSE_REV:-unset}" url
+    [ "$actual" = "$EXPECTED_COMPOSE_REV" ] && return 0
+    # E2E containers start without compose.
+    [ "${SDVD_ENV:-}" = "test" ] && return 0
+    if [ "${SDVD_GIT_SHA:-unknown}" != "unknown" ]; then
+        url="https://raw.githubusercontent.com/stardew-valley-dedicated-server/server/${SDVD_GIT_SHA}/docker-compose.yml"
+    else
+        url="https://github.com/stardew-valley-dedicated-server/server/releases/latest"
+    fi
+    echo ""
+    echo -e "\e[33m╔═══════════════════════════════════════════════════════════════════════╗\e[0m"
+    echo -e "\e[33m║  WARNING: docker-compose.yml does not match this image!               ║\e[0m"
+    echo -e "\e[33m║                                                                       ║\e[0m"
+    printf "\e[33m║  %-69s║\e[0m\n" "Your file is revision ${actual}, this image expects revision ${EXPECTED_COMPOSE_REV}."
+    echo -e "\e[33m║  Replace it with the matching file, then run: docker compose up -d    ║\e[0m"
+    echo -e "\e[33m╚═══════════════════════════════════════════════════════════════════════╝\e[0m"
+    echo -e "\e[33m  Matching file: ${url}\e[0m"
+    echo ""
+}
+
 # Run validation before anything else
 validate_environment
+check_compose_revision
 
 print_error() {
     echo -e "\e[31m$1\e[0m"
-}
-
-init_time_sync() {
-    echo "Synchronizing system time..."
-
-    # Try hardware clock sync first (works with host in most cases)
-    if hwclock --hctosys 2>/dev/null; then
-        echo "Time synced from hardware clock"
-        return 0
-    fi
-
-    # Fallback to NTP sync (requires internet)
-    if ntpdate -u pool.ntp.org 2>/dev/null; then
-        echo "Time synced from NTP server"
-        return 0
-    fi
-
-    # If both fail, warn but continue (time might already be correct)
-    echo "Warning: Could not sync time automatically"
-    echo "Current time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-    echo "If Galaxy P2P disconnects occur after ~30 seconds, check system time sync"
 }
 
 init_xauthority() {
@@ -103,37 +105,160 @@ init_display_settings() {
     xset s noblank 2>/dev/null || true
 }
 
-init_stardew() {
-    # Installation check
-    if [ -e "${GAME_EXECUTABLE}" ]; then
-        echo "Game already initialized, skipping."
+# Mirrors the mod's API on the two points a client can observe: /status needs the API key when
+# one is set, and everything else gets 503 so /health keeps meaning "the mod's API is up".
+phase_response() {
+    local request_line line path name value scheme token="" deadline body status
+    # Lines over 8 KiB are dropped (connection closed), not parsed as several records.
+    IFS= read -r -n 8193 request_line || return 0
+    [ "${#request_line}" -le 8192 ] || return 0
+    path="${request_line#* }"
+    path="${path%% *}"
+    path="${path%%\?*}"
+    # The client is connected from here on and holds the only listener, so the rest of the
+    # request gets a 5s deadline instead of patience.
+    deadline=$((SECONDS + 5))
+    while [ $((deadline - SECONDS)) -gt 0 ] && IFS= read -r -t $((deadline - SECONDS)) -n 8193 line; do
+        [ "${#line}" -le 8192 ] || return 0
+        line="${line%$'\r'}"
+        [ -n "${line}" ] || break
+        name="${line%%:*}"
+        if [ "${name,,}" = "authorization" ]; then
+            value="${line#*:}"
+            value="${value#"${value%%[! ]*}"}"
+            scheme="${value:0:7}"
+            if [ "${scheme,,}" = "bearer " ]; then
+                token="${value:7}"
+            fi
+        fi
+    done
+
+    body="{\"isOnline\":false,\"phase\":\"$(cat "${PHASE_FILE}" 2>/dev/null || echo starting)\"}"
+    if [ -n "${API_KEY:-}" ] && [ "${token}" != "${API_KEY}" ]; then
+        status="401 Unauthorized"
+        body='{"error":"Unauthorized. Provide a valid Authorization header: Bearer <api-key>"}'
+    elif [ "${path}" = "/status" ]; then
+        status="200 OK"
+    else
+        status="503 Service Unavailable"
+    fi
+    printf 'HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s' \
+        "${status}" "${#body}" "${body}"
+}
+
+# Keeps /status answering while the game downloads and boots. bash + nc because the image has
+# nothing else. The mod stops it the moment it binds the port itself (ApiPortHandoff).
+start_phase_responder() {
+    if [ "${API_ENABLED:-true}" != "true" ]; then
         return
     fi
 
+    if [ -e "${GAME_DOWNLOAD_MARKER}" ]; then
+        echo "starting" > "${PHASE_FILE}"
+    else
+        echo "downloading" > "${PHASE_FILE}"
+    fi
+
+    local in_fifo="/tmp/phase-responder.in" out_fifo="/tmp/phase-responder.out"
+    rm -f "${in_fifo}" "${out_fifo}"
+    mkfifo "${in_fifo}" "${out_fifo}"
+
+    (
+        # The mod TERMs this loop and then asserts the port is free, so the trap has to take nc
+        # down too. Both ends run in the background: bash defers traps during a foreground
+        # command, but not during wait.
+        trap 'pkill -TERM -P $BASHPID || true; exit 0' TERM
+        while true; do
+            # -N makes nc exit when the client closes (Connection: close); -w 5 covers a client that
+            # never does. Each FIFO open blocks until the other end opens, so the two commands open
+            # them in opposite order to avoid a deadlock.
+            nc -l -N -w 5 "${API_PORT}" > "${in_fifo}" < "${out_fifo}" &
+            phase_response < "${in_fifo}" > "${out_fifo}" &
+            wait
+        done
+    ) &
+    # The mod kills this pid before binding; the healthcheck waits for the file to go.
+    echo "$!" > "${API_HANDOFF_PID_FILE}"
+    echo "Phase responder serving /status on port ${API_PORT} ($(cat "${PHASE_FILE}"))"
+}
+
+# Holds the game back while steam-auth's boot-time validation may still be rewriting corrupt
+# files on the shared game volume (GET /game/validate-status, tools/steam-service/Program.cs).
+# Only pending/running block; every terminal state releases the wait, because repair is
+# best-effort and must never keep the server down. An unreachable endpoint gets a short budget
+# rather than an immediate pass: `docker compose restart` brings both containers up at once, and
+# steam-auth binds HTTP only after its Steam logins.
+wait_for_content_validation() {
+    local url="${STEAM_AUTH_URL:-}" body status unreachable=0 held=false
+    [ -n "${url}" ] || return 0
+
+    while true; do
+        body="$(curl -fsS --max-time 5 "${url}/game/validate-status" 2>/dev/null || true)"
+        status="$(printf '%s' "${body}" | sed -n 's/.*"status":"\([a-z]*\)".*/\1/p')"
+        case "${status}" in
+            pending|running)
+                unreachable=0
+                if [ "${held}" = false ]; then
+                    held=true
+                    echo "validating" > "${PHASE_FILE}"
+                fi
+                echo "Waiting for steam-auth to finish validating the game files (${status})..."
+                sleep 5
+                ;;
+            failed)
+                echo "steam-auth could not validate the game files; starting anyway (see: docker compose logs steam-auth)."
+                break
+                ;;
+            "")
+                unreachable=$((unreachable + 1))
+                if [ "${unreachable}" -ge 12 ]; then
+                    echo "steam-auth did not answer at ${url}/game/validate-status; starting without the game file check."
+                    break
+                fi
+                echo "Waiting for steam-auth to report its game file check (${unreachable}/12)..."
+                sleep 5
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    if [ "${held}" = true ]; then
+        echo "starting" > "${PHASE_FILE}"
+    fi
+    return 0
+}
+
+init_stardew() {
     local STEAM_AUTH_GAME_DIR="/data/game"
-    local STEAM_AUTH_GAME_EXEC="${STEAM_AUTH_GAME_DIR}/StardewValley"
+
+    # Installation check
+    if [ -e "${GAME_DOWNLOAD_MARKER}" ]; then
+        echo "Game already initialized, skipping."
+        wait_for_content_validation
+        return
+    fi
 
     echo "Using steam-auth service for game files..."
 
-    # Check if game files exist in the shared volume
-    if [ ! -e "${STEAM_AUTH_GAME_EXEC}" ]; then
-        echo ""
-        echo -e "\e[33m╔═══════════════════════════════════════════════════════════════════════╗\e[0m"
-        echo -e "\e[33m║  Game files not found! Please run setup first:                        ║\e[0m"
-        echo -e "\e[33m║                                                                       ║\e[0m"
-        echo -e "\e[33m║  make setup                                                           ║\e[0m"
-        echo -e "\e[33m╚═══════════════════════════════════════════════════════════════════════╝\e[0m"
-        echo ""
-        echo "Waiting for game files to appear..."
-
-        # Poll until game files appear
-        while [ ! -e "${STEAM_AUTH_GAME_EXEC}" ]; do
-            sleep 5
-            echo "Still waiting for game files at ${STEAM_AUTH_GAME_DIR}..."
-        done
-
-        echo "Game files detected!"
+    # Game files but no marker (volume populated by hand, or before the marker existed). That looks
+    # identical to a half-finished download, so still wait — but say why, or it reads as a hang.
+    if [ -e "${GAME_EXECUTABLE}" ]; then
+        echo "Game files are present but the download-completion marker is missing."
+        echo "Waiting for steam-auth to re-verify them (it only writes the marker once the depot is complete)."
     fi
+
+    echo "Waiting for steam-auth to finish downloading the game files (see: docker compose logs -f steam-auth)..."
+
+    while [ ! -e "${GAME_DOWNLOAD_MARKER}" ]; do
+        sleep 5
+        echo "Still waiting for game files at ${STEAM_AUTH_GAME_DIR}..."
+    done
+
+    echo "Game files detected!"
+    wait_for_content_validation
+    echo "starting" > "${PHASE_FILE}"
 
     # Symlink the game directory to expected location
     if [ ! -e "${GAME_DEST_DIR}" ]; then
@@ -155,27 +280,52 @@ init_patch_dll() {
     fi
 }
 
+# The installer copies the bundle one entry at a time and exits 0 even when it fails, so a
+# launcher alone proves nothing; completeness is the launcher, the runtime files, and the last
+# entry the installer writes (a bundled mod's manifest). A reinstall clears these first (see
+# init_smapi) so the check can't pass on a stale copy the previous install left behind.
+SMAPI_PAYLOAD_MARKERS=(
+    "${SMAPI_EXECUTABLE}"
+    "${GAME_DEST_DIR}/StardewModdingAPI.dll"
+    "${GAME_DEST_DIR}/StardewModdingAPI.deps.json"
+    "${GAME_DEST_DIR}/Mods/ConsoleCommands/manifest.json"
+)
+
+smapi_install_complete() {
+    local f
+    for f in "${SMAPI_PAYLOAD_MARKERS[@]}"; do
+        [ -e "${f}" ] || return 1
+    done
+}
+
 init_smapi() {
-    # Installation check
-    if [ -e "${SMAPI_EXECUTABLE}" ]; then
-        echo "SMAPI already initialized, skipping."
-    else
-        echo "Installing SMAPI ${SMAPI_VERSION}..."
-
-        # Download
-        curl -L https://github.com/Pathoschild/SMAPI/releases/download/${SMAPI_VERSION}/SMAPI-${SMAPI_VERSION}-installer.zip -o /data/smapi.zip
-        unzip -q /data/smapi.zip -d /data/smapi/
-
-        # Install
-        printf "2\n\n" | "/data/smapi/SMAPI ${SMAPI_VERSION} installer/internal/linux/SMAPI.Installer" \
-            --install \
-            --game-path "${GAME_DEST_DIR}"
-
-        # Cleanup
-        rm -rf "/data/smapi" /data/smapi.zip
-
-        echo "SMAPI installed successfully!"
-    fi
+    # The image ships its own SMAPI build (/opt/smapi, built by the Dockerfile's smapi-builder stage
+    # from upstream + patches/smapi). The volume's install is keyed on that build's id, so a new
+    # image reinstalls over whatever the volume holds. Test clients install into this volume too,
+    # so check-and-install is serialized on a lock in the volume.
+    local want stamp
+    want="$(cat /opt/smapi/BUILD_ID)"
+    stamp="${GAME_DEST_DIR}/smapi-internal/.sdvd-smapi-build"
+    (
+        flock 9
+        if smapi_install_complete && [ "$(cat "${stamp}" 2>/dev/null)" = "${want}" ]; then
+            echo "SMAPI ${want} already installed, skipping."
+        else
+            echo "Installing SMAPI ${want}..."
+            # Clear every completeness marker first. The installer can exit 0 after a partial
+            # copy, so markers left from a prior install would let the post-install check pass on
+            # an incomplete one; wiping them means the check — and the stamp — only pass if this
+            # install rewrote all of them, and a failed install retries next boot.
+            rm -f "${SMAPI_PAYLOAD_MARKERS[@]}"
+            /opt/smapi/internal/linux/SMAPI.Installer --no-prompt --install --game-path "${GAME_DEST_DIR}"
+            if ! smapi_install_complete; then
+                print_error "SMAPI install failed: the SMAPI files in ${GAME_DEST_DIR} are incomplete"
+                exit 1
+            fi
+            echo "${want}" > "${stamp}"
+            echo "SMAPI installed successfully!"
+        fi
+    ) 9> "${GAME_DEST_DIR}/.smapi-install.lock"
 
     # Always override the config file so we can update the one that is stored inside a volume
     echo "Applying SMAPI runtime overrides..."
@@ -207,9 +357,10 @@ init_mods() {
 }
 
 init_permissions() {
+    # Ownership is set by the root cont-init hook (etc/cont-init.d/50-server-init.sh) before
+    # this script runs as the non-root app user; here we only ensure the game binary is
+    # executable (the app user owns it by now, so this succeeds without root).
     chmod +x "${GAME_EXECUTABLE}"
-    chmod -R 755 "${GAME_DEST_DIR}"
-    chown -R 1000:1000 "${GAME_DEST_DIR}"
 }
 
 init_steam_sdk() {
@@ -232,6 +383,10 @@ init_steam_sdk() {
         echo "Steam SDK already linked"
     fi
 
+    # Ensure the SDK's own dlopen("steamclient.so") resolves on the first (bare)
+    # attempt, so the loader skips the "dlopen failed" fallback probe on startup.
+    export LD_LIBRARY_PATH="${STEAM_SDK_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
     # Create steam_appid.txt with Stardew Valley's AppID
     # The SDK defaults to 480 (Spacewar) which causes SDR connection failures
     echo "413150" > "${GAME_DEST_DIR}/steam_appid.txt"
@@ -240,7 +395,7 @@ init_steam_sdk() {
 echo "Initializing SMAPI..."
 
 # Prepare
-init_time_sync
+start_phase_responder
 init_xauthority
 init_display_settings
 init_stardew
@@ -253,22 +408,25 @@ init_permissions
 
 # Run the game through SMAPI (with FIFO to pipe commands via CLI).
 LOG_FILE="/tmp/server-output.log"
-INPUT_FIFO="/tmp/smapi-input"
+# Not directly in /tmp: with fs.protected_fifos set on the host, root (attach-cli, toggle-rendering)
+# cannot write to a FIFO owned by the app user inside a sticky world-writable dir.
+FIFO_DIR="/tmp/junimo"
+INPUT_FIFO="${FIFO_DIR}/smapi-input"
 
 # Ensure log file exists
 touch "${LOG_FILE}"
 
 # Ensure FIFO pipe exists
+mkdir -p "${FIFO_DIR}"
 rm -f "${INPUT_FIFO}"
 mkfifo "${INPUT_FIFO}"
 
-# Start SMAPI, piping stdin from FIFO and output to log file + stdout
-# Using `script` to create a PTY so SMAPI prints colored output (make it think it's a terminal)
-# Using `tail -f` on the FIFO to keep it open and avoid blocking
-# Note: `script` writes to both stdout (for docker logs) and the typescript file simultaneously
-# Caveat: the PTY covers stdout only, and the FIFO only ever delivers \n-terminated lines — SMAPI
-# prompts that read a raw keystroke (Console.ReadKey: crash/update markers, PressAnyKeyToExit)
-# can't be answered through this channel; prevent them upstream (see clear_smapi_marker_prompts)
+# Start SMAPI with stdin from the FIFO. `script` gives it a PTY so it prints colors and copies
+# output to both stdout (docker logs) and LOG_FILE (tailed by attach-cli). `tail -f` keeps the
+# FIFO open between writers.
+# The FIFO only delivers newline-terminated lines, so prompts that read a raw keystroke
+# (Console.ReadKey: crash/update markers, PressAnyKeyToExit) cannot be answered here. They are
+# prevented upstream in clear_smapi_marker_prompts.
 echo "Starting SMAPI..."
 script -q -f --return -c "tail -f \"${INPUT_FIFO}\" | \"${SMAPI_EXECUTABLE}\"" "${LOG_FILE}" &
 SMAPI_PID=$!

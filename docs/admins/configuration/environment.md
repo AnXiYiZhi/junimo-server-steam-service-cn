@@ -8,9 +8,8 @@ These must be set for the server to function:
 
 | Variable | Description |
 |----------|-------------|
-| `STEAM_USERNAME` | Steam account username |
-| `STEAM_PASSWORD` | Steam account password |
-| `VNC_PASSWORD` | Password for VNC web interface |
+| `STEAM_USERNAME` | Steam account username. Set alone (no password), it selects that account's saved login from `setup` |
+| `STEAM_PASSWORD` | Steam account password. Required for the first login; optional once `setup` has saved a login for `STEAM_USERNAME` |
 
 ## Runtime Variables
 
@@ -18,10 +17,20 @@ These must be set for the server to function:
 |----------|-------------|---------|
 | `GAME_PORT` | UDP port for multiplayer connections | `24642` |
 | `QUERY_PORT` | UDP port for Steam query protocol | `27015` |
-| `VNC_PORT` | TCP port for VNC web interface | `5800` |
+| `VNC_PORT` | TCP port for VNC web UI | `5800` |
+| `VNC_PASSWORD` | Password for the VNC web UI (max 8 characters) | (empty = VNC disabled) |
 | `API_PORT` | Port for the HTTP REST API | `8080` |
 | `API_ENABLED` | Enable HTTP API for external tools | `true` |
+| `PUBLIC_HOST` | Public IP or domain of the [HTTPS proxy](/admins/operations/reverse-proxy); when set, `VNC_PORT` and `API_PORT` bind to loopback | - |
+| `SERVER_NAME` | Display name shown as the Discord bot nickname and on status widgets | (farm name) |
+| `SERVER_URL_NAME` | This server's name in its URL behind the proxy | `server` |
+| `PROXY_ROUTING` | `path` (`https://HOST/NAME/`) or `subdomain` (`https://NAME.HOST/`) | `path` |
+| `COMPOSE_PROFILES` | `proxy` starts the bundled HTTPS proxy; leave unset to use your own | - |
 | `SERVER_FPS` | Render rate: `0` = rendering disabled, `N > 0` = render at N fps | `0` |
+| `SERVER_TPS` | Simulation ticks per second (`1`–`60`); lower cuts CPU use | `60` |
+| `SDVD_TPS_AGNOSTIC_PACING` | Keep fades and NPC/monster/projectile movement at wall-clock speed regardless of `SERVER_TPS`; `false` restores vanilla per-tick pacing | `true` |
+| `CROP_SAVER_LIGHTNING_IMMUNITY` | Managed crops survive lightning strikes | `true` |
+| `STEAM_KEEP_LANGUAGES` | Comma-separated language codes whose fonts to keep in the game download (e.g. `ru-RU,ja-JP`); empty keeps English only | (English only) |
 | `VERBOSE_LOGGING` | Override verbose logging setting | - |
 
 ## Security Variables
@@ -33,15 +42,47 @@ These must be set for the server to function:
 | `MAX_LOGIN_ATTEMPTS` | Failed login attempts before kick | `3` |
 | `AUTH_TIMEOUT_SECONDS` | Seconds before unauthenticated players are kicked | `120` |
 | `API_KEY` | API key for authenticating write requests | (empty = disabled) |
-| `ALLOW_INSECURE_SETUP` | Allow startup when `VNC_PASSWORD` or `API_KEY` is empty | `false` |
+| `ALLOW_INSECURE_SETUP` | Start without `API_KEY`, and keep VNC reachable without `VNC_PASSWORD` | `false` |
+
+## Host / Permissions
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `USER_ID` | User ID (UID) the game runs as inside the container | `1000` |
+| `GROUP_ID` | Group ID (GID) of that user | `1000` |
+
+The game runs as a normal user inside the container rather than as root, so a misbehaving mod cannot
+touch anything outside the game's own files. The container starts as root only long enough to
+prepare the server's files and assign their ownership.
+
+On Linux, files written to `.local-container/settings` and `diagnostics` are owned by this UID/GID
+on the host as well, so set them to your own user and group to access those files normally.
+
+- **Windows and macOS:** no configuration required. Docker Desktop handles file ownership for you.
+- **Linux:** set both values to your user and group IDs. If both commands print `1000`, the defaults
+  are already correct.
+
+  ```sh
+  id -u   # USER_ID
+  id -g   # GROUP_ID
+  ```
+
+- **Rootless Docker:** set both to `0`. In rootless Docker, UID/GID `0` inside the container maps to
+  your host user.
+- **Root:** setting both to `0` on regular Docker runs the game as root inside the container. Not
+  needed; on Linux the two folders above are then owned by root on the host.
+
+You can change the values later. On the next start, the container updates the ownership of the
+server's files to match.
 
 ## Discord Integration
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `DISCORD_BOT_TOKEN` | Discord bot token | - |
-| `DISCORD_BOT_NICKNAME` | Custom bot nickname | (farm name) |
-| `DISCORD_CHAT_CHANNEL_ID` | Channel ID for chat relay | - |
+| `DISCORD_CHAT_CHANNEL` | Chat relay channel, by name or ID | - |
+| `STATUS_DASHBOARD_CHANNEL` | Status dashboard channel, by name or ID | - |
+| `STATUS_DASHBOARD_REFRESH_RATE` | Dashboard update interval in seconds, minimum 20 | `30` |
 
 See [Discord Integration](/admins/configuration/discord) for setup instructions.
 
@@ -68,7 +109,8 @@ VNC_PASSWORD=your_secure_password
 
 # ===== Discord (optional) =====
 # DISCORD_BOT_TOKEN=your_bot_token
-# DISCORD_CHAT_CHANNEL_ID=123456789012345678
+# DISCORD_CHAT_CHANNEL=farm-chat
+# STATUS_DASHBOARD_CHANNEL=farm-status
 
 # ===== CI/Automation (optional) =====
 # STEAM_REFRESH_TOKEN=your_refresh_token
@@ -126,7 +168,7 @@ When `true`, the REST API is available for external tools and monitoring. See [R
 
 ### API_KEY
 
-When set, all API endpoints require an `Authorization: Bearer <api-key>` header (except `/health` and `/docs`).
+When set, API endpoints require an `Authorization: Bearer <api-key>` header. The [API reference](/developers/api/introduction) marks which endpoints are public.
 
 Generate a secure key:
 
@@ -134,29 +176,25 @@ Generate a secure key:
 openssl rand -base64 32
 ```
 
-::: tip When do I need this?
-Currently, only the Discord bot uses the API. If you:
-- **Use the Discord bot**: Set the same `API_KEY` for both server and bot
-- **Don't use the Discord bot**: You can skip `API_KEY` if the API port (8080) is not exposed externally
-- **Build custom integrations** (web dashboard, monitoring, etc.): Set `API_KEY` and include it in your requests
-:::
-
-::: warning
-Without `API_KEY`, anyone with network access to port 8080 can read server data and control your server. Always set this if the API is accessible from untrusted networks.
+::: tip Who needs the key
+- **Discord bot**: set the same `API_KEY` for the server and the bot.
+- **`diagnostics` command**: reads the key from the container environment.
+- **Your own integrations**: send the `Authorization` header.
 :::
 
 ### ALLOW_INSECURE_SETUP
 
-By default the server aborts startup when `VNC_PASSWORD` is empty or (with `API_ENABLED=true`) `API_KEY` is empty — leaving the VNC interface or HTTP API exposed without authentication. Set `ALLOW_INSECURE_SETUP=true` to override the abort on closed networks where the affected ports are not reachable from untrusted clients.
+The server refuses to start without `API_KEY` while `API_ENABLED=true`, and without `VNC_PASSWORD` it keeps the VNC web UI (port 5800) and the VNC port (5900) unreachable from outside the container. Set `ALLOW_INSECURE_SETUP=true` to start anyway and to leave VNC reachable without a password. Only do this on networks where the VNC and API ports are not reachable by untrusted clients.
 
 ## Port Summary
 
 | Port | Protocol | Purpose | Expose Externally? |
 |------|----------|---------|-------------------|
-| 24642 | UDP | Game (Steam SDR) | No (relay handles NAT) |
+| 24642 | UDP | Game (Steam relay) | No (relay handles NAT) |
 | 27015 | UDP | Steam query | No (relay handles NAT) |
-| 5800 | TCP | VNC web interface | Only for remote access |
+| 5800 | TCP | VNC web UI | Only for remote access |
 | 8080 | TCP | REST API | Only for external tools |
+| 80, 443 | TCP | HTTPS proxy (optional) | Only with the `proxy` profile |
 | 3001 | TCP | Steam auth (internal) | No |
 
 ## Changing Ports
@@ -168,7 +206,7 @@ VNC_PORT=5801
 API_PORT=8081
 ```
 
-The internal container ports remain unchanged; only the host mapping changes.
+The VNC container port stays fixed; only its host mapping changes. `API_PORT` changes the API port both on the host and inside the container, so the server, its health check, and the Discord bot all follow it.
 
 ## Advanced Variables
 
@@ -179,6 +217,8 @@ These are rarely needed but available for advanced use cases:
 | `HEALTH_CHECK_SECONDS` | Interval for internal health checks | `300` |
 | `ENABLE_MOD_INCOMPATIBLE_OPTIMIZATIONS` | Enable performance optimizations that may break some mods | `true` |
 | `FORCE_NEW_DEBUG_GAME` | Force creation of a new debug game on startup | `false` |
+| `AUTO_SLEEP_GRACE_SECONDS` | Wall-clock seconds an empty server waits past 1:00 AM in-game before the host sleeps and closes the day | `300` |
+| `VALIDATE_ON_BOOT` | Verify the installed game files on every steam-auth start and re-download corrupt pieces before the server boots; `false` skips the check | `true` |
 
 ::: warning
 These variables are for advanced users. Changing them may cause unexpected behavior.

@@ -37,6 +37,36 @@ public class CropSaver : ModService
                 nameof(CropSaverOverrides.KillCrop_Prefix)
             )
         );
+        // HoeDirt.dayUpdate's winter branch destroys out-of-season crops without calling
+        // Crop.Kill, bypassing the prefix above. Capture/restore managed crops around it
+        // so they overwinter under CropSaver's own death-date rules (OnDayEnd).
+        harmony.Patch(
+            original: AccessTools.Method(typeof(HoeDirt), nameof(HoeDirt.dayUpdate)),
+            prefix: new HarmonyMethod(
+                typeof(CropSaverOverrides),
+                nameof(CropSaverOverrides.DayUpdate_Prefix)
+            ),
+            postfix: new HarmonyMethod(
+                typeof(CropSaverOverrides),
+                nameof(CropSaverOverrides.DayUpdate_Postfix)
+            )
+        );
+
+        // Lightning-context flag around Utility.performLightningUpdate, so
+        // KillCrop_Prefix can distinguish a lightning kill (opt-out via
+        // CROP_SAVER_LIGHTNING_IMMUNITY=false) from other kill paths. The finalizer
+        // clears the flag even when the strike throws.
+        harmony.Patch(
+            original: AccessTools.Method(typeof(Utility), nameof(Utility.performLightningUpdate)),
+            prefix: new HarmonyMethod(
+                typeof(CropSaverOverrides),
+                nameof(CropSaverOverrides.LightningUpdate_Prefix)
+            ),
+            finalizer: new HarmonyMethod(
+                typeof(CropSaverOverrides),
+                nameof(CropSaverOverrides.LightningUpdate_Finalizer)
+            )
+        );
 
         helper.Events.GameLoop.Saving += OnSaving;
         helper.Events.GameLoop.SaveLoaded += OnSaveLoaded;
@@ -181,8 +211,16 @@ public class CropSaver : ModService
             return SDate.Now();
         }
 
+        // Mirrors Crop.newDay / HoeDirt.dayUpdate: an unwatered crop only loses a growth day
+        // when its data needs watering (missing data counts as needing it), and a paddy crop
+        // near water is force-watered (paddyWaterCheck) before newDay runs. paddyWaterCheck
+        // dereferences dirt.Location, so skip it for an anomalous location-less dirt.
         var extraDayForUnwatered = 1;
-        if (dirt.state.Value == HoeDirt.watered)
+        if (
+            dirt.state.Value == HoeDirt.watered
+            || crop.GetData()?.NeedsWatering == false
+            || (dirt.Location != null && dirt.paddyWaterCheck(forceUpdate: true))
+        )
         {
             extraDayForUnwatered = 0;
         }

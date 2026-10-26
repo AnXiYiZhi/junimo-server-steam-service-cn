@@ -1,6 +1,4 @@
-using System;
 using System.Linq;
-using JunimoServer.Services.CabinManager;
 using JunimoServer.Services.GameCreator;
 using JunimoServer.Services.GameLoader;
 using JunimoServer.Services.PersistentOption;
@@ -19,6 +17,36 @@ internal static class SettingsCommand
     private static PersistentOptions _options;
     private static ServerSettingsLoader _settings;
 
+    private static readonly CommandDescriptor Descriptor = new()
+    {
+        Name = "settings",
+        Description = "Server settings and game creation. Run 'settings' for subcommands.",
+        Subcommands =
+        {
+            new SubcommandDescriptor
+            {
+                Name = "show",
+                Description = "Show current configuration from server-settings.json",
+            },
+            new SubcommandDescriptor
+            {
+                Name = "newgame",
+                Description = "Create a new game",
+                Flags = { "--confirm" },
+            },
+            new SubcommandDescriptor
+            {
+                Name = "validate",
+                Description = "Run configuration and state validation",
+            },
+            new SubcommandDescriptor
+            {
+                Name = "verbose",
+                Description = "Show or set verbose logging [on|off]",
+            },
+        },
+    };
+
     public static void Register(
         IModHelper helper,
         IMonitor monitor,
@@ -32,11 +60,7 @@ internal static class SettingsCommand
         _options = options;
         _settings = settings;
 
-        helper.ConsoleCommands.Add(
-            "settings",
-            "Server settings and game creation. Run 'settings' for subcommands.",
-            (cmd, args) => HandleCommand(args)
-        );
+        helper.ConsoleCommands.Register(Descriptor, (cmd, args) => HandleCommand(args));
     }
 
     private static void HandleCommand(string[] args)
@@ -72,20 +96,10 @@ internal static class SettingsCommand
 
     private static void ShowHelp()
     {
-        _monitor.Log("Available subcommands:", LogLevel.Info);
-        _monitor.Log(
-            "  settings show       -- Show current configuration from server-settings.json",
-            LogLevel.Info
-        );
-        _monitor.Log("  settings newgame    -- Create a new game", LogLevel.Info);
-        _monitor.Log(
-            "  settings validate   -- Run configuration and state validation",
-            LogLevel.Info
-        );
-        _monitor.Log(
-            "  settings verbose    -- Show or set verbose logging [on|off]",
-            LogLevel.Info
-        );
+        foreach (var line in Descriptor.HelpLines())
+        {
+            _monitor.Log(line, LogLevel.Info);
+        }
     }
 
     #region Show Config
@@ -143,6 +157,7 @@ internal static class SettingsCommand
             LogLevel.Info
         );
         _monitor.Log($"  SeparateWallets      = {_settings.SeparateWallets}", LogLevel.Info);
+        _monitor.Log($"  AllowCabinRelocation = {_settings.AllowCabinRelocation}", LogLevel.Info);
         _monitor.Log($"  ExistingCabinBehavior = {_settings.ExistingCabinBehavior}", LogLevel.Info);
         _monitor.Log($"  VerboseLogging       = {_settings.VerboseLogging}", LogLevel.Info);
     }
@@ -164,6 +179,7 @@ internal static class SettingsCommand
             _monitor.Log($"  Farm Type:        {FarmTypeLabel(config.WhichFarm)}", LogLevel.Info);
             _monitor.Log($"  Max Players:      {config.MaxPlayers}", LogLevel.Info);
             _monitor.Log($"  Cabin Strategy:   {config.CabinStrategy}", LogLevel.Info);
+            _monitor.Log($"  Cabin Relocation: {config.AllowCabinRelocation}", LogLevel.Info);
             _monitor.Log($"  Separate Wallets: {config.UseSeparateWallets}", LogLevel.Info);
             _monitor.Log($"  Profit Margin:    {config.ProfitMargin}", LogLevel.Info);
             _monitor.Log($"  Starting Cabins:  {config.StartingCabins}", LogLevel.Info);
@@ -232,41 +248,8 @@ internal static class SettingsCommand
             );
         }
 
-        // CabinStrategy valid
-        total++;
-        if (Enum.IsDefined(typeof(CabinStrategy), _settings.CabinStrategy))
-        {
-            _monitor.Log(
-                $"  [PASS] CabinStrategy={_settings.CabinStrategy} is valid",
-                LogLevel.Info
-            );
-            passed++;
-        }
-        else
-        {
-            _monitor.Log(
-                $"  [FAIL] CabinStrategy={_settings.CabinStrategy} is invalid",
-                LogLevel.Error
-            );
-        }
-
-        // ExistingCabinBehavior valid
-        total++;
-        if (Enum.IsDefined(typeof(ExistingCabinBehavior), _settings.ExistingCabinBehavior))
-        {
-            _monitor.Log(
-                $"  [PASS] ExistingCabinBehavior={_settings.ExistingCabinBehavior} is valid",
-                LogLevel.Info
-            );
-            passed++;
-        }
-        else
-        {
-            _monitor.Log(
-                $"  [FAIL] ExistingCabinBehavior={_settings.ExistingCabinBehavior} is invalid",
-                LogLevel.Error
-            );
-        }
+        // CabinStrategy and ExistingCabinBehavior are typed enums, always defined here — an invalid
+        // file value is warned and defaulted at load (TolerantEnumConverter), nothing to validate here.
 
         // ProfitMargin range
         total++;

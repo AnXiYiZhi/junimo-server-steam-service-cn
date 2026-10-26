@@ -7,7 +7,7 @@ namespace JunimoServer.Tests;
 
 /// <summary>
 /// Integration tests for farmhand management via the server API.
-/// Verifies farmhand listing, customization state, and deletion behavior.
+/// Verifies farmhand listing and deletion behavior.
 ///
 /// Uses TestBase which provides:
 /// - Automatic retry on connection failures
@@ -20,73 +20,22 @@ public class FarmhandManagementTests : TestBase
     public FarmhandManagementTests() { }
 
     /// <summary>
-    /// Verifies that GET /farmhands (server API) correctly reflects which farmhand
-    /// slots are customized vs uncustomized after a player creates a character.
-    /// </summary>
-    [Fact(
-        Skip = "Redundant: IsCustomized verified by DeleteFarmhand tests via Farmers.DisconnectAndWaitForPersistenceAsync"
-    )]
-    public async Task ServerFarmhands_ReflectCustomizationState()
-    {
-        var client = await Farmers.ConnectNewAsync(ct: TestContext.Current.CancellationToken);
-
-        // Check server-side farmhand list (poll until name syncs and customized flag is set)
-        var found = await ServerApi.WaitForFarmhandByNameAsync(
-            client.FarmerName,
-            requireCustomized: true,
-            ct: TestContext.Current.CancellationToken
-        );
-
-        Assert.True(
-            found,
-            $"Farmhand '{client.FarmerName}' should appear in /farmhands within timeout"
-        );
-        var farmhands = await ServerApi.GetFarmhands(TestContext.Current.CancellationToken);
-        Assert.NotNull(farmhands);
-        Assert.NotEmpty(farmhands.Farmhands);
-
-        Log($"Server reports {farmhands.Farmhands.Count} farmhand(s):");
-        foreach (var fh in farmhands.Farmhands)
-        {
-            Log($"  Name='{fh.Name}', IsCustomized={fh.IsCustomized}, Id={fh.Id}");
-        }
-
-        // Our farmer should be listed as customized
-        var ourFarmhand = farmhands.Farmhands.FirstOrDefault(f =>
-            f.Name.Equals(client.FarmerName, StringComparison.OrdinalIgnoreCase)
-        );
-        Assert.NotNull(ourFarmhand);
-        Assert.True(
-            ourFarmhand.IsCustomized,
-            $"Farmhand '{client.FarmerName}' should be marked as customized"
-        );
-
-        // There should be at least one uncustomized slot (the default cabins)
-        var uncustomized = farmhands.Farmhands.Where(f => !f.IsCustomized).ToList();
-        Assert.NotEmpty(uncustomized);
-        Log($"Found {uncustomized.Count} uncustomized slot(s) as expected");
-    }
-
-    /// <summary>
     /// Verifies that deleting an offline farmhand via DELETE /farmhands?name=X
     /// succeeds and the farmhand no longer appears in the list.
     /// </summary>
     [Fact]
     public async Task DeleteFarmhand_WhenOffline_Succeeds()
     {
-        var client = await Farmers.ConnectNewAsync(ct: TestContext.Current.CancellationToken);
+        var client = await Farmers.ConnectFastAsync(ct: TestCt);
 
         // Disconnect and wait for persistence
-        await Farmers.DisconnectAndWaitForPersistenceAsync(
-            client.FarmerName,
-            TestContext.Current.CancellationToken
-        );
+        await Farmers.DisconnectAndWaitForPersistenceAsync(client.FarmerName, TestCt);
 
         // Delete the farmhand
         Log($"Deleting offline farmhand '{client.FarmerName}'...");
         var deleteResult = await ServerApi.WaitForFarmhandDeletedByNameAsync(
             client.FarmerName,
-            ct: TestContext.Current.CancellationToken
+            ct: TestCt
         );
 
         Assert.True(
@@ -106,8 +55,9 @@ public class FarmhandManagementTests : TestBase
                         !f.Name.Equals(client.FarmerName, StringComparison.OrdinalIgnoreCase)
                     ) == true;
             },
-            TestTimings.FarmerDeleteTimeout,
-            cancellationToken: TestContext.Current.CancellationToken
+            // Delete already confirmed at :87; this only waits a tick for /farmhands to reflect it.
+            TestTimings.FarmerRemovalBudget,
+            cancellationToken: TestCt
         );
         Assert.True(
             isGone,
@@ -120,26 +70,43 @@ public class FarmhandManagementTests : TestBase
     }
 
     /// <summary>
-    /// Verifies that after deleting an offline farmhand, the slot becomes available
-    /// and a new player can join using that freed slot.
-    /// This tests the full create → delete → reuse cycle.
+    /// Verifies that deleting a farmhand frees its cabin for reuse. Runs on a dedicated
+    /// single-cabin server: <c>CabinStrategy=None</c> caps the pool at
+    /// <c>min(designated positions, MaxPlayers) = 1</c> and <c>EnsureAtLeastXCabins</c> can't grow
+    /// it, so once that cabin is customized the freed slot is the only way a later farmer can join.
+    /// The default strategy always keeps a spare cabin, so a second join would succeed without
+    /// reusing anything. Exclusive so no sibling test churns the capped pool.
     /// </summary>
     [Fact]
+    [TestServer(Exclusive = true, CabinStrategy = "None", MaxPlayers = 1)]
     public async Task DeleteFarmhand_SlotBecomesReusable()
     {
-        // Create first farmer, disconnect, and wait for persistence
-        var client1 = await Farmers.ConnectNewAsync(ct: TestContext.Current.CancellationToken);
-        await Farmers.DisconnectAndWaitForPersistenceAsync(
-            client1.FarmerName,
-            TestContext.Current.CancellationToken
+        // Fill the single-cabin pool: a customized farmhand leaves it with no available slot.
+        var client1 = await Farmers.ConnectFastAsync(ct: TestCt);
+        CabinsResponse? cabins = null;
+        var poolFull = await PollingHelper.WaitUntilAsync(
+            WaitName.Polling_FarmhandManagement_SingleCabinFull,
+            async () =>
+            {
+                cabins = await ServerApi.GetCabins(TestCt);
+                return cabins is { TotalCount: 1, AvailableCount: 0 };
+            },
+            TestTimings.CabinAssignmentTimeout,
+            cancellationToken: TestCt
         );
-        Log($"After first join: farmer '{client1.FarmerName}' exists");
+        Assert.True(
+            poolFull,
+            "Capped pool should be full (1 cabin, 0 available) after the first farmer customizes; "
+                + $"got total={cabins?.TotalCount}, available={cabins?.AvailableCount}"
+        );
 
-        // Delete farmer1 (poll until server processes disconnect)
+        await Farmers.DisconnectAndWaitForPersistenceAsync(client1.FarmerName, TestCt);
+
+        // Delete the only farmhand. DELETE runs EnsureAtLeastXCabins, which rebuilds the freed cabin.
         Log($"Deleting farmhand '{client1.FarmerName}'...");
         var deleteResult = await ServerApi.WaitForFarmhandDeletedByNameAsync(
             client1.FarmerName,
-            ct: TestContext.Current.CancellationToken
+            ct: TestCt
         );
         Assert.True(
             deleteResult?.Success,
@@ -147,28 +114,18 @@ public class FarmhandManagementTests : TestBase
         );
         Farmers.CreatedFarmers.RemoveAll(f => f.Uid == client1.JoinResult.UniqueMultiplayerId);
 
-        // Verify slot is available (uncustomized)
-        var afterDelete = await ServerApi.GetFarmhands(TestContext.Current.CancellationToken);
-        Assert.NotNull(afterDelete);
-        var uncustomizedSlots = afterDelete.Farmhands.Count(f => !f.IsCustomized);
-        Assert.True(
-            uncustomizedSlots >= 1,
-            "Should have at least 1 uncustomized slot after deletion"
-        );
-        Log($"After delete: {uncustomizedSlots} uncustomized slot(s) available");
-
-        // Create second farmer using the freed slot
-        var client2 = await Farmers.ConnectNewAsync(ct: TestContext.Current.CancellationToken);
-
-        // Verify farmer2 exists (poll until name syncs)
+        // The pool was full and can't grow, so a second farmer can join only by reusing the freed slot.
+        var client2 = await Farmers.ConnectNewAsync(ct: TestCt);
         var farmer2Found = await ServerApi.WaitForFarmhandByNameAsync(
             client2.FarmerName,
             requireCustomized: true,
-            ct: TestContext.Current.CancellationToken
+            ct: TestCt
         );
-
-        Assert.True(farmer2Found, $"Farmer '{client2.FarmerName}' should exist after reusing slot");
-        Log($"Slot reuse successful: farmer '{client2.FarmerName}' joined using freed slot");
+        Assert.True(
+            farmer2Found,
+            $"Farmer '{client2.FarmerName}' should join by reusing the one freed slot"
+        );
+        Log($"Slot reuse successful: farmer '{client2.FarmerName}' joined using the freed slot");
     }
 
     /// <summary>
@@ -178,7 +135,7 @@ public class FarmhandManagementTests : TestBase
     [Fact]
     public async Task DeleteFarmhand_WhenOnline_Fails()
     {
-        var client = await Farmers.ConnectNewAsync(ct: TestContext.Current.CancellationToken);
+        var client = await Farmers.ConnectFastAsync(ct: TestCt);
 
         // Try to delete while still connected - should fail. Use the UID overload
         // because fresh joiners may not have name-synced yet.
@@ -187,7 +144,7 @@ public class FarmhandManagementTests : TestBase
         );
         var deleteResult = await ServerApi.DeleteFarmhandById(
             client.JoinResult.UniqueMultiplayerId,
-            TestContext.Current.CancellationToken
+            TestCt
         );
         Assert.NotNull(deleteResult);
         Assert.False(deleteResult.Success, "Delete should fail for an online farmhand");
@@ -196,10 +153,7 @@ public class FarmhandManagementTests : TestBase
         Log($"Delete correctly refused: {deleteResult.Error}");
 
         // Verify the farmhand still exists (poll until name syncs)
-        var stillFound = await ServerApi.WaitForFarmhandByNameAsync(
-            client.FarmerName,
-            ct: TestContext.Current.CancellationToken
-        );
+        var stillFound = await ServerApi.WaitForFarmhandByNameAsync(client.FarmerName, ct: TestCt);
 
         Assert.True(
             stillFound,

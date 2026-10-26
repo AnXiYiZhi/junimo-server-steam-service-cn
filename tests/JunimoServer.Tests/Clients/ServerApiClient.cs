@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json.Serialization;
 using JunimoServer.Tests.Helpers;
@@ -9,7 +10,7 @@ namespace JunimoServer.Tests.Clients;
 /// Server status data returned by the /status endpoint.
 /// Mirrors the ServerStatus class from ApiService.
 /// </summary>
-public class ServerStatus
+public class ServerStatus : ISequencedSnapshot
 {
     [JsonPropertyName("playerCount")]
     public int PlayerCount { get; set; }
@@ -17,17 +18,36 @@ public class ServerStatus
     [JsonPropertyName("maxPlayers")]
     public int MaxPlayers { get; set; }
 
-    [JsonPropertyName("steamInviteCode")]
-    public string? SteamInviteCode { get; set; }
+    /// <summary>
+    /// The invite code to hand to players: the universal S-code. Never the G-code — a readiness gate
+    /// keyed on this must wait for the S-code, not pass on a GOG code (which breaks Steam clients).
+    /// Null until a Galaxy lobby exists.
+    /// </summary>
+    [JsonPropertyName("inviteCode")]
+    public string? InviteCode { get; set; }
 
-    [JsonPropertyName("gogInviteCode")]
-    public string? GogInviteCode { get; set; }
+    /// <summary>Whether Steam clients can join using the code yet (the Galaxy lobby carries the relay stamp).</summary>
+    [JsonPropertyName("steamRelayReady")]
+    public bool SteamRelayReady { get; set; }
+
+    /// <summary>Galaxy lobby state: "connected" | "recovering" | "down". Null when Steam auth is not configured.</summary>
+    [JsonPropertyName("galaxyLobbyState")]
+    public string? GalaxyLobbyState { get; set; }
+
+    /// <summary>Steam GameServer session state: "connected" | "lost".</summary>
+    [JsonPropertyName("steamSessionState")]
+    public string? SteamSessionState { get; set; }
+
+    /// <summary>Sidecar auth/token health: "unknown" | "ok" | "expiring" | "unavailable". Null when Steam auth is not configured.</summary>
+    [JsonPropertyName("authReadiness")]
+    public string? AuthReadiness { get; set; }
 
     /// <summary>
-    /// Gets the preferred invite code (Steam if available, otherwise GOG).
+    /// Whether the invite code is usable and by whom: "ready" | "steamRelayPending" | "reconnecting" |
+    /// "starting" | "steamSessionDown" | "inviteUnavailable".
     /// </summary>
-    [JsonIgnore]
-    public string InviteCode => SteamInviteCode ?? GogInviteCode ?? string.Empty;
+    [JsonPropertyName("connectionStatusCode")]
+    public string? ConnectionStatusCode { get; set; }
 
     [JsonPropertyName("serverVersion")]
     public string ServerVersion { get; set; } = string.Empty;
@@ -39,7 +59,7 @@ public class ServerStatus
     public bool IsReady { get; set; }
 
     // Day-transition machinery done (newDaySync + save + map load), ignoring post-transition
-    // festival/wedding — see ApiService.ComputeDayTransitionComplete. Equals IsReady on an ordinary day.
+    // festival/wedding — see GameManagerService.IsDayTransitionComplete. Equals IsReady on an ordinary day.
     [JsonPropertyName("dayTransitionComplete")]
     public bool DayTransitionComplete { get; set; }
 
@@ -70,11 +90,11 @@ public class ServerStatus
     public bool IsPaused { get; set; }
 
     /// <summary>
-    /// Monotonic snapshot version. Pass back as <c>?since=N</c> on
+    /// Monotonic snapshot sequence. Pass back as <c>?since=N</c> on
     /// <c>/wait/status</c> long-poll requests to wait for a newer snapshot.
     /// </summary>
-    [JsonPropertyName("version")]
-    public long Version { get; set; }
+    [JsonPropertyName("sequence")]
+    public long Sequence { get; set; }
 }
 
 /// <summary>
@@ -90,34 +110,32 @@ public class PlayerInfo
 
     [JsonPropertyName("isOnline")]
     public bool IsOnline { get; set; }
+
+    /// <summary>Unique name of the location the server sees the player in (or arriving in).</summary>
+    [JsonPropertyName("location")]
+    public string Location { get; set; } = string.Empty;
+}
+
+/// <summary>Lets a long-poll wait ask only for snapshots newer than the last it saw.</summary>
+public interface ISequencedSnapshot
+{
+    long Sequence { get; }
 }
 
 /// <summary>
 /// Response from the /players endpoint.
 /// </summary>
-public class PlayersResponse
+public class PlayersResponse : ISequencedSnapshot
 {
     [JsonPropertyName("players")]
     public List<PlayerInfo> Players { get; set; } = new();
 
     /// <summary>
-    /// Monotonic snapshot version. Pass back as <c>?since=N</c> on
+    /// Monotonic snapshot sequence. Pass back as <c>?since=N</c> on
     /// <c>/wait/players</c> long-poll requests to wait for a newer snapshot.
     /// </summary>
-    [JsonPropertyName("version")]
-    public long Version { get; set; }
-}
-
-/// <summary>
-/// Response from the /invite-code endpoint.
-/// </summary>
-public class InviteCodeResponse
-{
-    [JsonPropertyName("inviteCode")]
-    public string? InviteCode { get; set; }
-
-    [JsonPropertyName("error")]
-    public string? Error { get; set; }
+    [JsonPropertyName("sequence")]
+    public long Sequence { get; set; }
 }
 
 /// <summary>
@@ -186,6 +204,12 @@ public class DiagnosticsStateResponse
     [JsonPropertyName("farmHouseFurnitureCount")]
     public int FarmHouseFurnitureCount { get; set; }
 
+    [JsonPropertyName("farmHouseHasPlayerBed")]
+    public bool FarmHouseHasPlayerBed { get; set; }
+
+    [JsonPropertyName("hostLocation")]
+    public string HostLocation { get; set; } = "";
+
     [JsonPropertyName("farmHouseFridgeItemCount")]
     public int FarmHouseFridgeItemCount { get; set; }
 
@@ -242,10 +266,18 @@ public class DiagnosticsCabinState
 
     /// <summary>Whether the owner has a platform ID (Steam/GOG) stamped; true with
     /// OwnerIsCustomized=false is the abandoned-claim state. Resolved via cabin.owner, so it
-    /// reflects the live otherFarmers copy while the owner is connected. A bool, not the raw ID
-    /// (/diagnostics/state is unauthenticated).</summary>
+    /// reflects the live otherFarmers copy while the owner is connected.</summary>
     [JsonPropertyName("ownerHasUserId")]
     public bool OwnerHasUserId { get; set; }
+
+    /// <summary>Whether the cabin owner has a server-side ownership record (join-gate recorder
+    /// or save-import bind).</summary>
+    [JsonPropertyName("ownerHasOwner")]
+    public bool OwnerHasOwner { get; set; }
+
+    /// <summary>Platform tag of the cabin owner's ownership record ("steam"/"galaxy"), or "".</summary>
+    [JsonPropertyName("ownerPlatform")]
+    public string OwnerPlatform { get; set; } = "";
 
     [JsonPropertyName("homeLocationOfOwner")]
     public string HomeLocationOfOwner { get; set; } = "";
@@ -287,10 +319,23 @@ public class DiagnosticsFarmhandState
     public string LastSleepLocation { get; set; } = "";
 
     /// <summary>Whether a platform ID (Steam/GOG) is stamped on this slot; true with
-    /// IsCustomized=false is the abandoned-claim state. A bool, not the raw ID
-    /// (/diagnostics/state is unauthenticated).</summary>
+    /// IsCustomized=false is the abandoned-claim state.</summary>
     [JsonPropertyName("hasUserId")]
     public bool HasUserId { get; set; }
+
+    /// <summary>Whether this slot has a server-side ownership record (join-gate recorder or
+    /// save-import bind).</summary>
+    [JsonPropertyName("hasOwner")]
+    public bool HasOwner { get; set; }
+
+    /// <summary>Platform tag of the ownership record ("steam"/"galaxy"), or "" when unowned.</summary>
+    [JsonPropertyName("ownerPlatform")]
+    public string OwnerPlatform { get; set; } = "";
+
+    /// <summary>Whether the slot is operator-released: claimable by any transport, first
+    /// successful claim becomes the owner.</summary>
+    [JsonPropertyName("released")]
+    public bool Released { get; set; }
 }
 
 public class ReadyCheckState
@@ -342,6 +387,22 @@ public class HealthResponse
 
     [JsonPropertyName("gameAvailable")]
     public bool? GameAvailable { get; set; }
+
+    // Body-only joinability summary (does not affect Status / the HTTP status code).
+    [JsonPropertyName("steamSessionState")]
+    public string? SteamSessionState { get; set; }
+
+    [JsonPropertyName("galaxyLobbyState")]
+    public string? GalaxyLobbyState { get; set; }
+
+    [JsonPropertyName("steamRelayReady")]
+    public bool SteamRelayReady { get; set; }
+
+    [JsonPropertyName("inviteCodePresent")]
+    public bool InviteCodePresent { get; set; }
+
+    [JsonPropertyName("authReadiness")]
+    public string? AuthReadiness { get; set; }
 }
 
 /// <summary>
@@ -377,13 +438,13 @@ public class ServerFarmhandInfo
 /// <summary>
 /// Response from /farmhands endpoint.
 /// </summary>
-public class ServerFarmhandsResponse
+public class ServerFarmhandsResponse : ISequencedSnapshot
 {
     [JsonPropertyName("farmhands")]
     public List<ServerFarmhandInfo> Farmhands { get; set; } = new();
 
-    [JsonPropertyName("version")]
-    public long Version { get; set; }
+    [JsonPropertyName("sequence")]
+    public long Sequence { get; set; }
 }
 
 /// <summary>
@@ -460,8 +521,14 @@ public class ClockSpeedResponse
 /// </summary>
 public class TestCrop
 {
+    /// <summary>Display location name (e.g. "Farm"; every cabin interior reads "Cabin").</summary>
     [JsonPropertyName("locationName")]
     public string LocationName { get; set; } = "";
+
+    /// <summary>Unique location name (NameOrUniqueName) — the CropSaver entry key; pass it
+    /// as locationName to <see cref="ServerApiClient.SetSaverCrop"/>.</summary>
+    [JsonPropertyName("uniqueLocationName")]
+    public string UniqueLocationName { get; set; } = "";
 
     [JsonPropertyName("tileX")]
     public int TileX { get; set; }
@@ -529,6 +596,19 @@ public class TestFarmersResponse
     public string? Error { get; set; }
 }
 
+/// <summary>Response from /test/object_at_tile GET endpoint (test-only). Mirrors the server-side DTO.</summary>
+public class TestObjectAtTileResponse
+{
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("present")]
+    public bool Present { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+}
+
 /// <summary>
 /// Response from /test/festival_state GET endpoint (test-only). Mirrors the server-side
 /// TestFestivalStateResponse DTO — a direct read of the host's festival state.
@@ -564,6 +644,9 @@ public class TestFestivalStateResponse
 
     [JsonPropertyName("timeOfDay")]
     public int TimeOfDay { get; set; }
+
+    [JsonPropertyName("luauIridiumStarfruitCount")]
+    public int LuauIridiumStarfruitCount { get; set; }
 }
 
 /// <summary>
@@ -603,10 +686,23 @@ public class TestWeddingStateResponse
     [JsonPropertyName("hostLocationIsTemporary")]
     public bool HostLocationIsTemporary { get; set; }
 
-    // The host's current location name. After the last wedding the host must be back in its FarmHouse,
-    // not left on the open Farm map where the wedding exit warp drops it.
+    // The host's current location name. After the last wedding the host must end parked on the Farm
+    // (its standard park spot), not left in the FarmHouse or on a temporary ceremony map.
     [JsonPropertyName("hostCurrentLocation")]
     public string? HostCurrentLocation { get; set; }
+
+    // The host's current tile — diagnostics for a failed park assertion.
+    [JsonPropertyName("hostTileX")]
+    public int HostTileX { get; set; }
+
+    [JsonPropertyName("hostTileY")]
+    public int HostTileY { get; set; }
+
+    // True when the host stands exactly on the Farm default warp tile (the canonical park spot). The
+    // vanilla wedding exit warp also lands on the Farm — at the farmhouse porch — so this, not
+    // HostCurrentLocation, proves the post-wedding park normalization ran.
+    [JsonPropertyName("hostAtFarmParkSpot")]
+    public bool HostAtFarmParkSpot { get; set; }
 }
 
 /// <summary>
@@ -631,6 +727,59 @@ public class TestSetDateResponse
 }
 
 /// <summary>
+/// Response from POST /test/pacing_probe_spawn (test-only).
+/// </summary>
+public class PacingProbeSpawnResponse
+{
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+
+    [JsonPropertyName("locationName")]
+    public string? LocationName { get; set; }
+
+    [JsonPropertyName("count")]
+    public int Count { get; set; }
+}
+
+/// <summary>
+/// Response from GET /test/pacing_probe_state (test-only). Only the field(s) matching the spawned kind
+/// are meaningful.
+/// </summary>
+public class PacingProbeStateResponse
+{
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+
+    [JsonPropertyName("count")]
+    public int Count { get; set; }
+
+    /// <summary>Game1.ticks at the read, atomic with the entity fields — see the mod-side DTO.</summary>
+    [JsonPropertyName("serverTicks")]
+    public int ServerTicks { get; set; }
+
+    [JsonPropertyName("projectileTravelDistance")]
+    public float ProjectileTravelDistance { get; set; }
+
+    [JsonPropertyName("debrisChunksAtRest")]
+    public int DebrisChunksAtRest { get; set; }
+
+    [JsonPropertyName("debrisChunkCount")]
+    public int DebrisChunkCount { get; set; }
+
+    [JsonPropertyName("monsterDisplacement")]
+    public float MonsterDisplacement { get; set; }
+
+    [JsonPropertyName("monsterSpeed")]
+    public float MonsterSpeed { get; set; }
+}
+
+/// <summary>
 /// Response from /test/farmevent POST endpoint (test-only).
 /// </summary>
 public class TestFarmEventResponse
@@ -645,11 +794,27 @@ public class TestFarmEventResponse
     public string? Type { get; set; }
 }
 
+/// <summary>Response from GET /test/farmevent_state. Mirrors the server-side TestFarmEventStateResponse DTO.</summary>
+public class TestFarmEventStateResponse
+{
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+
+    [JsonPropertyName("active")]
+    public bool Active { get; set; }
+
+    [JsonPropertyName("type")]
+    public string? Type { get; set; }
+}
+
 /// <summary>
-/// Response from /test/house_upgrade POST endpoint (test-only). Mirrors the server-side
-/// TestHouseUpgradeResponse DTO.
+/// Response from /test/debug_command POST endpoint (test-only). Mirrors the server-side
+/// TestDebugCommandResponse DTO.
 /// </summary>
-public class TestHouseUpgradeResponse
+public class TestDebugCommandResponse
 {
     [JsonPropertyName("success")]
     public bool Success { get; set; }
@@ -659,6 +824,28 @@ public class TestHouseUpgradeResponse
 
     [JsonPropertyName("hostHouseUpgradeLevel")]
     public int HostHouseUpgradeLevel { get; set; }
+
+    [JsonPropertyName("hostLocation")]
+    public string HostLocation { get; set; } = "";
+}
+
+/// <summary>
+/// Response from /test/host_farmhouse_bed POST endpoint (test-only). Mirrors the server-side
+/// TestHostFarmhouseBedResponse DTO.
+/// </summary>
+public class TestHostFarmhouseBedResponse
+{
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+
+    [JsonPropertyName("farmHouseHasPlayerBed")]
+    public bool FarmHouseHasPlayerBed { get; set; }
+
+    [JsonPropertyName("farmHouseFurnitureCount")]
+    public int FarmHouseFurnitureCount { get; set; }
 }
 
 /// <summary>
@@ -682,6 +869,73 @@ public class TestStampClaimResponse
 
     [JsonPropertyName("homeLocation")]
     public string HomeLocation { get; set; } = "";
+
+    /// <summary>Whether a synthetic ownership record was also written (withOwner=true).</summary>
+    [JsonPropertyName("stampedOwner")]
+    public bool StampedOwner { get; set; }
+}
+
+/// <summary>
+/// One slot pre-customized by /test/precustomize_farmhand. Mirrors the server-side
+/// TestPrecustomizedFarmhand DTO.
+/// </summary>
+public class TestPrecustomizedFarmhand
+{
+    [JsonPropertyName("uid")]
+    public long Uid { get; set; }
+
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = "";
+
+    [JsonPropertyName("homeLocation")]
+    public string HomeLocation { get; set; } = "";
+}
+
+/// <summary>
+/// Response from /test/precustomize_farmhand POST endpoint (test-only). Mirrors the server-side
+/// TestPrecustomizeFarmhandResponse DTO.
+/// </summary>
+public class TestPrecustomizeFarmhandResponse
+{
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+
+    /// <summary>Slots customized, in request order; on failure, the ones completed before the error.</summary>
+    [JsonPropertyName("farmhands")]
+    public List<TestPrecustomizedFarmhand> Farmhands { get; set; } = new();
+}
+
+/// <summary>
+/// Response from /test/break_cabin_link POST endpoint (test-only). Mirrors the server-side
+/// TestBreakCabinLinkResponse DTO. Nulls a cabin's farmhandReference to manufacture the one-way
+/// farmhand↔cabin link the join-time repair heals (or declines, with a home redirect).
+/// </summary>
+public class TestBreakCabinLinkResponse
+{
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+
+    [JsonPropertyName("brokenCabinName")]
+    public string BrokenCabinName { get; set; } = "";
+
+    [JsonPropertyName("homeLocation")]
+    public string HomeLocation { get; set; } = "";
+
+    [JsonPropertyName("redirected")]
+    public bool Redirected { get; set; }
+
+    /// <summary>
+    /// UniqueMultiplayerID of the spurious placeholder installed as the home cabin's owner
+    /// (makeHomeOwnerPlaceholder mode), or 0. The repair must delete it — assert it is gone.
+    /// </summary>
+    [JsonPropertyName("placeholderOwnerId")]
+    public long PlaceholderOwnerId { get; set; }
 }
 
 /// <summary>
@@ -897,6 +1151,44 @@ public class TestForceSaveResponse
     public string SaveFolderName { get; set; } = "";
 }
 
+/// <summary>Response from /test/fail_next_newgame (test-only).</summary>
+public class TestFailNextNewGameResponse
+{
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+}
+
+/// <summary>Response from /test/set_ip_connections (test-only).</summary>
+public class TestSetIpConnectionsResponse
+{
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+
+    /// <summary>The applied state of Game1.options.ipConnectionsEnabled.</summary>
+    [JsonPropertyName("enabled")]
+    public bool Enabled { get; set; }
+}
+
+/// <summary>Response from /test/host_menu (test-only). Mirrors the server-side DTO.</summary>
+public class TestHostMenuResponse
+{
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+
+    /// <summary>Whether a host menu is open after the requested operation.</summary>
+    [JsonPropertyName("menuOpen")]
+    public bool MenuOpen { get; set; }
+}
+
 /// <summary>Body for /test/import_save (test-only). Mirrors the server-side DTO.</summary>
 public class TestImportSaveRequest
 {
@@ -1001,6 +1293,30 @@ public class TestSaverCropResponse
 }
 
 /// <summary>
+/// Response from /test/lightning_strike POST endpoint (test-only).
+/// </summary>
+public class TestLightningStrikeResponse
+{
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+
+    /// <summary>True iff a crop was found at the requested (location, tile).</summary>
+    [JsonPropertyName("found")]
+    public bool Found { get; set; }
+
+    /// <summary>True iff the crop is still alive after the strike.</summary>
+    [JsonPropertyName("cropAliveAfter")]
+    public bool CropAliveAfter { get; set; }
+
+    /// <summary>True iff CropSaver still tracks the tile after the strike.</summary>
+    [JsonPropertyName("isManagedAfter")]
+    public bool IsManagedAfter { get; set; }
+}
+
+/// <summary>
 /// Response from /roles/admin POST endpoint.
 /// </summary>
 public class RoleGrantResponse
@@ -1070,6 +1386,9 @@ public class ServerRuntimeSettingsInfo
 
     [JsonPropertyName("existingCabinBehavior")]
     public string ExistingCabinBehavior { get; set; } = string.Empty;
+
+    [JsonPropertyName("allowCabinRelocation")]
+    public bool AllowCabinRelocation { get; set; }
 }
 
 /// <summary>
@@ -1133,6 +1452,75 @@ public class CabinsResponse
 
     [JsonPropertyName("savedPositionPlayerIds")]
     public List<long> SavedPositionPlayerIds { get; set; } = new();
+
+    /// <summary>
+    /// Active staged strategy migration ('cabins migrate'), or null when none is staged.
+    /// The old strategy stays live (in <see cref="Strategy"/>) until commit.
+    /// </summary>
+    [JsonPropertyName("migration")]
+    public CabinMigrationInfoResponse? Migration { get; set; }
+
+    /// <summary>
+    /// The CabinStack shared stack spot, or null when the active strategy is not CabinStack.
+    /// </summary>
+    [JsonPropertyName("stackSpot")]
+    public StackSpotInfoResponse? StackSpot { get; set; }
+
+    /// <summary>
+    /// The main farmhouse's front-door entry tile; null when no game is loaded. Under
+    /// FarmhouseStack a stacked cabin's exit warp lands here.
+    /// </summary>
+    [JsonPropertyName("mainFarmHouseEntry")]
+    public TilePointResponse? MainFarmHouseEntry { get; set; }
+}
+
+/// <summary>A tile coordinate on <see cref="CabinsResponse"/>.</summary>
+public class TilePointResponse
+{
+    [JsonPropertyName("x")]
+    public int X { get; set; }
+
+    [JsonPropertyName("y")]
+    public int Y { get; set; }
+}
+
+/// <summary>
+/// The CabinStack shared stack spot on <see cref="CabinsResponse"/>.
+/// </summary>
+public class StackSpotInfoResponse
+{
+    [JsonPropertyName("tileX")]
+    public int TileX { get; set; }
+
+    [JsonPropertyName("tileY")]
+    public int TileY { get; set; }
+
+    /// <summary>True when an admin-set override is active (vs the map default).</summary>
+    [JsonPropertyName("isOverride")]
+    public bool IsOverride { get; set; }
+
+    /// <summary>True when a cabin footprint at the spot currently fails placement validation.</summary>
+    [JsonPropertyName("isObstructed")]
+    public bool IsObstructed { get; set; }
+}
+
+/// <summary>
+/// Staged strategy-migration status on <see cref="CabinsResponse"/>.
+/// </summary>
+public class CabinMigrationInfoResponse
+{
+    [JsonPropertyName("fromStrategy")]
+    public string FromStrategy { get; set; } = string.Empty;
+
+    [JsonPropertyName("toStrategy")]
+    public string ToStrategy { get; set; } = string.Empty;
+
+    [JsonPropertyName("placedCount")]
+    public int PlacedCount { get; set; }
+
+    /// <summary>Placements still required before commit, computed live server-side.</summary>
+    [JsonPropertyName("remainingCount")]
+    public int RemainingCount { get; set; }
 }
 
 /// <summary>
@@ -1191,18 +1579,24 @@ public class ServerApiClient : IDisposable
     /// when a forward is re-opened on a new port); <paramref name="healAsync"/> re-opens
     /// the forward on a forward-scoped fault. Both null ⇒ a plain client (local hosts /
     /// tests that pass a bare URL) — behaves exactly as before.
+    /// <paramref name="hostId"/> scopes the healing handler's owned-action window to the
+    /// server's Docker host.
     /// </summary>
     public ServerApiClient(
         string baseUrl,
         Func<string>? liveBaseUrl,
-        Func<CancellationToken, Task<bool>>? healAsync
+        Func<CancellationToken, Task<bool>>? healAsync,
+        string? hostId = null
     )
     {
         _baseUrl = baseUrl;
         HttpMessageHandler inner = new HttpClientHandler();
         if (liveBaseUrl != null && healAsync != null)
         {
-            inner = new ForwardHealingHandler(liveBaseUrl, healAsync) { InnerHandler = inner };
+            inner = new ForwardHealingHandler(liveBaseUrl, healAsync, hostId)
+            {
+                InnerHandler = inner,
+            };
         }
         var handler = new TracingHandler("server") { InnerHandler = inner };
         _httpClient = new HttpClient(handler)
@@ -1215,17 +1609,158 @@ public class ServerApiClient : IDisposable
     }
 
     /// <summary>
+    /// GET is read-only on every server endpoint, so a transport-level re-send after a
+    /// forward drop is always safe: each GET goes out marked for <see cref="ForwardHealingHandler"/>.
+    /// </summary>
+    private Task<HttpResponseMessage> GetRetrySafeAsync(string path, CancellationToken ct) =>
+        _httpClient.SendAsync(new HttpRequestMessage(HttpMethod.Get, path).Mark(), ct);
+
+    /// <summary>
+    /// One <c>/wait/*</c> round trip: appends the server-side <c>?timeout=</c>
+    /// (default <see cref="DefaultWaitServerTimeout"/>), issues the GET, and maps
+    /// 408 (no match within the server timeout) to <c>null</c>. The public
+    /// <c>WaitFor*Async</c> adapters only build the filter query.
+    /// </summary>
+    private async Task<T?> WaitEndpointAsync<T>(
+        string path,
+        List<string> query,
+        TimeSpan? timeout,
+        CancellationToken ct
+    )
+        where T : class
+    {
+        // The server treats timeout=0 as "use the 10s cap", so a sub-millisecond
+        // remaining budget must not truncate to 0 and block for the full cap.
+        var serverTimeoutMs = Math.Max(
+            1,
+            (long)(timeout?.TotalMilliseconds ?? DefaultWaitServerTimeout.TotalMilliseconds)
+        );
+        query.Add($"timeout={serverTimeoutMs}");
+        var url = path + "?" + string.Join("&", query);
+
+        var response = await GetRetrySafeAsync(url, ct);
+        if (response.StatusCode == HttpStatusCode.RequestTimeout)
+        {
+            return null;
+        }
+
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<T>(ct);
+    }
+
+    /// <summary>
+    /// Retryable-fault filter for the wait/poll loops: connection errors and non-success
+    /// statuses (<see cref="HttpRequestException"/>), the per-request timeout
+    /// (<see cref="OperationCanceledException"/>), and a connection dropped mid-response
+    /// (<c>HttpIOException</c>, an <see cref="IOException"/>, not an
+    /// <see cref="HttpRequestException"/>). Anything else, notably a <c>JsonException</c>
+    /// from a malformed body, is a bug and propagates so the wait reports it instead of
+    /// retrying to the deadline. Distinct from <c>TransportFaultClassifier</c>, which
+    /// decides host poisoning and ignores most of these.
+    /// </summary>
+    private static bool IsRetryableRequestFault(Exception ex) =>
+        ex is HttpRequestException or IOException or OperationCanceledException;
+
+    /// <summary>
+    /// Snapshot poll against a fast endpoint. Each <paramref name="probe"/> call receives a
+    /// token bounded by <see cref="TestTimings.PollingRequestTimeout"/> (the client's own
+    /// timeout is 5 min, so an unbounded request could outlive the poll); a transport fault
+    /// on one iteration counts as "not yet".
+    /// </summary>
+    private Task<bool> PollSnapshotAsync(
+        WaitName name,
+        Func<CancellationToken, Task<bool>> probe,
+        TimeSpan timeout,
+        CancellationToken ct,
+        Func<Task<object?>>? onTimeoutAsync
+    )
+    {
+        return PollingHelper.WaitUntilAsync(
+            name,
+            async () =>
+            {
+                using var reqCts = Cts.LinkedTimeout(ct, TestTimings.PollingRequestTimeout);
+                return await probe(reqCts.Token);
+            },
+            timeout,
+            cancellationToken: ct,
+            onTimeoutAsync: onTimeoutAsync,
+            isRetryable: IsRetryableRequestFault
+        );
+    }
+
+    /// <summary>
+    /// Long-poll over a <c>/wait/*</c> endpoint. <paramref name="fetch"/> receives the
+    /// <c>since</c> cursor, the server timeout to request, and a request token, and returns
+    /// <c>null</c> on 408. The server timeout is the remaining outer budget capped at
+    /// <see cref="DefaultWaitServerTimeout"/>; the request is bounded at that plus
+    /// <see cref="TestTimings.PollingRequestTimeout"/> so a healthy server wait is never
+    /// client-aborted mid-block. A non-null response matches when <paramref name="matches"/>
+    /// is null (the server already applied the filter) or returns true; otherwise the cursor
+    /// advances to its sequence. A transport fault leaves the cursor unchanged.
+    /// </summary>
+    private Task<bool> LongPollSnapshotAsync<T>(
+        WaitName name,
+        Func<long, TimeSpan, CancellationToken, Task<T?>> fetch,
+        TimeSpan timeout,
+        CancellationToken ct,
+        Func<Task<object?>>? onTimeoutAsync,
+        Func<T, bool>? matches = null
+    )
+        where T : class, ISequencedSnapshot
+    {
+        return PollingHelper.LongPollAsync(
+            name,
+            async (since, remaining) =>
+            {
+                var serverTimeout =
+                    remaining < DefaultWaitServerTimeout ? remaining : DefaultWaitServerTimeout;
+                using var reqCts = Cts.LinkedTimeout(
+                    ct,
+                    serverTimeout + TestTimings.PollingRequestTimeout
+                );
+                var response = await fetch(since, serverTimeout, reqCts.Token);
+                if (response == null)
+                {
+                    // 408: no newer snapshot within the server timeout.
+                    return new PollingHelper.LongPollResult(false, since);
+                }
+
+                var matched = matches == null || matches(response);
+                return new PollingHelper.LongPollResult(matched, response.Sequence);
+            },
+            timeout,
+            cancellationToken: ct,
+            onTimeoutAsync: onTimeoutAsync,
+            isRetryable: IsRetryableRequestFault
+        );
+    }
+
+    /// <summary>
+    /// Timeout collector for the wait helpers: dumps <see cref="FailureContext"/>
+    /// against this client. The dump runs after the poll has already failed, so it
+    /// deliberately does not take the caller's token.
+    /// </summary>
+    private Func<Task<object?>> DumpOnTimeout(
+        string reason,
+        IReadOnlyDictionary<string, object?>? extras = null
+    ) => async () => await FailureContext.DumpAsync(this, reason, extras);
+
+    /// <summary>
     /// Sends an HTTP request with automatic retry on 503 (Service Unavailable).
     /// The server returns 503 when the game thread is blocked during day transitions
     /// or saves. These are transient and resolve within seconds. Only mutating
     /// endpoints (POST /time, DELETE /farmhands, etc.) can return 503; read-only
-    /// endpoints use a periodic snapshot and call _httpClient directly.
+    /// endpoints use a periodic snapshot and go through <see cref="GetRetrySafeAsync"/>.
+    /// <paramref name="retrySafe"/> declares that a transport-level re-send after a forward
+    /// drop is harmless (an idempotent setter); see <see cref="RetrySafeRequest"/>.
     /// </summary>
     private async Task<HttpResponseMessage> SendWithRetryAsync(
         HttpMethod method,
         string path,
         CancellationToken ct,
-        Func<HttpContent>? contentFactory = null
+        Func<HttpContent>? contentFactory = null,
+        bool retrySafe = false
     )
     {
         for (var attempt = 1; ; attempt++)
@@ -1236,10 +1771,15 @@ public class ServerApiClient : IDisposable
                 request.Content = contentFactory();
             }
 
+            if (retrySafe)
+            {
+                request.Mark();
+            }
+
             var response = await _httpClient.SendAsync(request, ct);
 
             if (
-                response.StatusCode != System.Net.HttpStatusCode.ServiceUnavailable
+                response.StatusCode != HttpStatusCode.ServiceUnavailable
                 || attempt >= TestTimings.GameThreadRetryMaxAttempts
             )
             {
@@ -1276,14 +1816,14 @@ public class ServerApiClient : IDisposable
     /// </summary>
     public async Task<ServerStatus?> GetStatus(CancellationToken ct = default)
     {
-        var response = await _httpClient.GetAsync("/status", ct);
+        var response = await GetRetrySafeAsync("/status", ct);
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<ServerStatus>(ct);
     }
 
     /// <summary>
     /// Long-poll variant of <see cref="GetStatus"/>. Server blocks until the
-    /// snapshot version exceeds <paramref name="since"/> AND the requested
+    /// snapshot sequence exceeds <paramref name="since"/> AND the requested
     /// filters (<paramref name="isReady"/>, <paramref name="isPaused"/>,
     /// <paramref name="day"/>, <paramref name="playerCount"/>) match. Returns
     /// the matching status or <c>null</c> on 408 (no match within the
@@ -1332,25 +1872,52 @@ public class ServerApiClient : IDisposable
             query.Add($"playerCount={pc}");
         }
 
-        var serverTimeoutMs = (long)(
-            timeout?.TotalMilliseconds ?? DefaultWaitServerTimeout.TotalMilliseconds
+        return await WaitEndpointAsync<ServerStatus>("/wait/status", query, timeout, ct);
+    }
+
+    /// <summary>
+    /// Long-polls <c>/wait/status</c> until a snapshot passes the server-side filters
+    /// (the same optional arguments as <see cref="WaitForStatusAsync"/>) and
+    /// <paramref name="matches"/>, or <paramref name="timeout"/> expires. Use the
+    /// server filters wherever the field is filterable; <paramref name="matches"/>
+    /// covers the rest (a changed <c>TimeOfDay</c>, a non-empty <c>InviteCode</c>).
+    /// Returns whether a match was observed.
+    /// </summary>
+    public Task<bool> WaitForStatusMatchAsync(
+        WaitName name,
+        TimeSpan timeout,
+        Func<ServerStatus, bool>? matches = null,
+        bool? isReady = null,
+        bool? dayTransitionComplete = null,
+        bool? isPaused = null,
+        int? day = null,
+        int? playerCount = null,
+        CancellationToken ct = default
+    )
+    {
+        return LongPollSnapshotAsync(
+            name,
+            (since, serverTimeout, token) =>
+                WaitForStatusAsync(
+                    since,
+                    isReady,
+                    dayTransitionComplete,
+                    isPaused,
+                    day,
+                    playerCount,
+                    serverTimeout,
+                    token
+                ),
+            timeout,
+            ct,
+            onTimeoutAsync: null,
+            matches
         );
-        query.Add($"timeout={serverTimeoutMs}");
-        var url = "/wait/status?" + string.Join("&", query);
-
-        var response = await _httpClient.GetAsync(url, ct);
-        if (response.StatusCode == System.Net.HttpStatusCode.RequestTimeout)
-        {
-            return null;
-        }
-
-        response.EnsureSuccessStatusCode();
-        return await response.Content.ReadFromJsonAsync<ServerStatus>(ct);
     }
 
     /// <summary>
     /// Long-poll variant of <see cref="GetPlayers"/>. Server blocks until the
-    /// snapshot version exceeds <paramref name="since"/> AND
+    /// snapshot sequence exceeds <paramref name="since"/> AND
     /// <paramref name="playerId"/> (when set) is present in the players list.
     /// Returns the matching players response or <c>null</c> on 408.
     /// </summary>
@@ -1367,20 +1934,7 @@ public class ServerApiClient : IDisposable
             query.Add($"playerId={pid}");
         }
 
-        var serverTimeoutMs = (long)(
-            timeout?.TotalMilliseconds ?? DefaultWaitServerTimeout.TotalMilliseconds
-        );
-        query.Add($"timeout={serverTimeoutMs}");
-        var url = "/wait/players?" + string.Join("&", query);
-
-        var response = await _httpClient.GetAsync(url, ct);
-        if (response.StatusCode == System.Net.HttpStatusCode.RequestTimeout)
-        {
-            return null;
-        }
-
-        response.EnsureSuccessStatusCode();
-        return await response.Content.ReadFromJsonAsync<PlayersResponse>(ct);
+        return await WaitEndpointAsync<PlayersResponse>("/wait/players", query, timeout, ct);
     }
 
     /// <summary>
@@ -1390,7 +1944,7 @@ public class ServerApiClient : IDisposable
     /// </summary>
     public async Task<PlayersResponse?> GetPlayers(CancellationToken ct = default)
     {
-        var response = await _httpClient.GetAsync("/players", ct);
+        var response = await GetRetrySafeAsync("/players", ct);
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<PlayersResponse>(ct);
     }
@@ -1438,20 +1992,9 @@ public class ServerApiClient : IDisposable
             query.Count == 0
                 ? "/diagnostics/state"
                 : "/diagnostics/state?" + string.Join("&", query);
-        var response = await _httpClient.GetAsync(path, ct);
+        var response = await GetRetrySafeAsync(path, ct);
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<DiagnosticsStateResponse>(ct);
-    }
-
-    /// <summary>
-    /// Gets the current invite code.
-    /// GET /invite-code
-    /// </summary>
-    public async Task<InviteCodeResponse?> GetInviteCode(CancellationToken ct = default)
-    {
-        var response = await _httpClient.GetAsync("/invite-code", ct);
-        response.EnsureSuccessStatusCode();
-        return await response.Content.ReadFromJsonAsync<InviteCodeResponse>(ct);
     }
 
     /// <summary>
@@ -1460,7 +2003,7 @@ public class ServerApiClient : IDisposable
     /// </summary>
     public async Task<HealthResponse?> GetHealth(CancellationToken ct = default)
     {
-        var response = await _httpClient.GetAsync("/health", ct);
+        var response = await GetRetrySafeAsync("/health", ct);
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<HealthResponse>(ct);
     }
@@ -1491,20 +2034,7 @@ public class ServerApiClient : IDisposable
             query.Add("ready=true");
         }
 
-        var serverTimeoutMs = (long)(
-            timeout?.TotalMilliseconds ?? DefaultWaitServerTimeout.TotalMilliseconds
-        );
-        query.Add($"timeout={serverTimeoutMs}");
-        var url = "/wait/health" + (query.Count > 0 ? "?" + string.Join("&", query) : "");
-
-        var response = await _httpClient.GetAsync(url, ct);
-        if (response.StatusCode == System.Net.HttpStatusCode.RequestTimeout)
-        {
-            return null;
-        }
-
-        response.EnsureSuccessStatusCode();
-        return await response.Content.ReadFromJsonAsync<HealthResponse>(ct);
+        return await WaitEndpointAsync<HealthResponse>("/wait/health", query, timeout, ct);
     }
 
     /// <summary>
@@ -1513,7 +2043,7 @@ public class ServerApiClient : IDisposable
     /// </summary>
     public async Task<string> GetOpenApiSpec(CancellationToken ct = default)
     {
-        var response = await _httpClient.GetAsync("/swagger/v1/swagger.json", ct);
+        var response = await GetRetrySafeAsync("/swagger/v1/swagger.json", ct);
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadAsStringAsync(ct);
     }
@@ -1525,7 +2055,7 @@ public class ServerApiClient : IDisposable
     /// </summary>
     public async Task<AuthStatusResponse?> GetAuthStatus(CancellationToken ct = default)
     {
-        var response = await _httpClient.GetAsync("/auth", ct);
+        var response = await GetRetrySafeAsync("/auth", ct);
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<AuthStatusResponse>(ct);
     }
@@ -1542,7 +2072,8 @@ public class ServerApiClient : IDisposable
         var response = await SendWithRetryAsync(
             HttpMethod.Post,
             $"/auth/timeout?value={seconds}",
-            ct
+            ct,
+            retrySafe: true
         );
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<AuthTimeoutResponse>(ct);
@@ -1554,7 +2085,7 @@ public class ServerApiClient : IDisposable
     /// </summary>
     public async Task<SettingsResponse?> GetSettings(CancellationToken ct = default)
     {
-        var response = await _httpClient.GetAsync("/settings", ct);
+        var response = await GetRetrySafeAsync("/settings", ct);
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<SettingsResponse>(ct);
     }
@@ -1573,7 +2104,7 @@ public class ServerApiClient : IDisposable
     /// </summary>
     public async Task<CabinsResponse?> GetCabins(CancellationToken ct = default)
     {
-        var response = await _httpClient.GetAsync("/cabins", ct);
+        var response = await GetRetrySafeAsync("/cabins", ct);
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<CabinsResponse>(ct);
     }
@@ -1591,14 +2122,14 @@ public class ServerApiClient : IDisposable
     /// </summary>
     public async Task<ServerFarmhandsResponse?> GetFarmhands(CancellationToken ct = default)
     {
-        var response = await _httpClient.GetAsync("/farmhands", ct);
+        var response = await GetRetrySafeAsync("/farmhands", ct);
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<ServerFarmhandsResponse>(ct);
     }
 
     /// <summary>
     /// Long-poll variant of <see cref="GetFarmhands"/>. Server blocks until the
-    /// snapshot version exceeds <paramref name="since"/> AND the requested
+    /// snapshot sequence exceeds <paramref name="since"/> AND the requested
     /// filters match. Returns the matching farmhands response or <c>null</c>
     /// on 408.
     /// </summary>
@@ -1627,20 +2158,12 @@ public class ServerApiClient : IDisposable
             query.Add($"requireCustomized={rc.ToString().ToLowerInvariant()}");
         }
 
-        var serverTimeoutMs = (long)(
-            timeout?.TotalMilliseconds ?? DefaultWaitServerTimeout.TotalMilliseconds
+        return await WaitEndpointAsync<ServerFarmhandsResponse>(
+            "/wait/farmhands",
+            query,
+            timeout,
+            ct
         );
-        query.Add($"timeout={serverTimeoutMs}");
-        var url = "/wait/farmhands?" + string.Join("&", query);
-
-        var response = await _httpClient.GetAsync(url, ct);
-        if (response.StatusCode == System.Net.HttpStatusCode.RequestTimeout)
-        {
-            return null;
-        }
-
-        response.EnsureSuccessStatusCode();
-        return await response.Content.ReadFromJsonAsync<ServerFarmhandsResponse>(ct);
     }
 
     /// <summary>
@@ -1688,7 +2211,7 @@ public class ServerApiClient : IDisposable
     /// </summary>
     public async Task<RenderingStatusResponse?> GetRendering(CancellationToken ct = default)
     {
-        var response = await _httpClient.GetAsync("/rendering", ct);
+        var response = await GetRetrySafeAsync("/rendering", ct);
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<RenderingStatusResponse>(ct);
     }
@@ -1699,7 +2222,7 @@ public class ServerApiClient : IDisposable
     /// </summary>
     public async Task<ScreenshotResponse?> GetScreenshot(CancellationToken ct = default)
     {
-        var response = await SendWithRetryAsync(HttpMethod.Get, "/screenshot", ct);
+        var response = await SendWithRetryAsync(HttpMethod.Get, "/screenshot", ct, retrySafe: true);
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<ScreenshotResponse>(ct);
     }
@@ -1710,7 +2233,12 @@ public class ServerApiClient : IDisposable
     /// </summary>
     public async Task<RenderingSetResponse?> SetServerFps(int fps, CancellationToken ct = default)
     {
-        var response = await SendWithRetryAsync(HttpMethod.Post, $"/rendering?fps={fps}", ct);
+        var response = await SendWithRetryAsync(
+            HttpMethod.Post,
+            $"/rendering?fps={fps}",
+            ct,
+            retrySafe: true
+        );
         // Safe to add: server returns 200 with Success=false for validation errors (e.g., missing param).
         // Only 503 (game thread blocked) triggers EnsureSuccessStatusCode to throw.
         response.EnsureSuccessStatusCode();
@@ -1723,7 +2251,12 @@ public class ServerApiClient : IDisposable
     /// </summary>
     public async Task<TimeSetResponse?> SetTime(int value, CancellationToken ct = default)
     {
-        var response = await SendWithRetryAsync(HttpMethod.Post, $"/time?value={value}", ct);
+        var response = await SendWithRetryAsync(
+            HttpMethod.Post,
+            $"/time?value={value}",
+            ct,
+            retrySafe: true
+        );
         // Safe to add: server returns 200 with Success=false for invalid time values.
         // Only 503 (game thread blocked) triggers EnsureSuccessStatusCode to throw.
         response.EnsureSuccessStatusCode();
@@ -1737,7 +2270,7 @@ public class ServerApiClient : IDisposable
     /// </summary>
     public async Task<TestCropsResponse?> GetAllCrops(CancellationToken ct = default)
     {
-        var response = await _httpClient.GetAsync("/test/crops", ct);
+        var response = await GetRetrySafeAsync("/test/crops", ct);
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<TestCropsResponse>(ct);
     }
@@ -1751,7 +2284,7 @@ public class ServerApiClient : IDisposable
     /// </summary>
     public async Task<TestFestivalStateResponse?> GetFestivalState(CancellationToken ct = default)
     {
-        var response = await _httpClient.GetAsync("/test/festival_state", ct);
+        var response = await GetRetrySafeAsync("/test/festival_state", ct);
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<TestFestivalStateResponse>(ct);
     }
@@ -1773,7 +2306,8 @@ public class ServerApiClient : IDisposable
         {
             query += $"?farmhandId={farmhandId.Value}&npc={Uri.EscapeDataString(npc)}";
         }
-        var response = await _httpClient.GetAsync(query, ct);
+
+        var response = await GetRetrySafeAsync(query, ct);
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<TestWeddingStateResponse>(ct);
     }
@@ -1796,38 +2330,70 @@ public class ServerApiClient : IDisposable
         CancellationToken ct = default
     )
     {
-        return await Helpers.PollingHelper.WaitUntilAsync(
-            Helpers.WaitName.Polling_ServerApi_WaitForFarmerServerTile,
-            async () =>
+        return await PollSnapshotAsync(
+            WaitName.Polling_ServerApi_WaitForFarmerServerTile,
+            async token =>
             {
-                try
-                {
-                    // Bound each request well under the outer budget: _httpClient.Timeout is 5
-                    // min, so an unbounded request could outlive the poll and hang.
-                    using var reqCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    reqCts.CancelAfter(Helpers.TestTimings.PollingRequestTimeout);
-                    var response = await _httpClient.GetAsync("/test/farmers", reqCts.Token);
-                    response.EnsureSuccessStatusCode();
-                    var farmers = await response.Content.ReadFromJsonAsync<TestFarmersResponse>(
-                        reqCts.Token
-                    );
-                    var f = farmers?.Farmers.FirstOrDefault(x => x.Id == farmerId);
-                    return f != null && f.TileX == tileX && f.TileY == tileY;
-                }
-                catch (Exception ex)
-                    when (ex
-                            is HttpRequestException
-                                or TaskCanceledException
-                                or OperationCanceledException
-                        && !ct.IsCancellationRequested
-                    )
-                {
-                    // Per-request timeout or connection error, retry.
-                    return false;
-                }
+                var response = await GetRetrySafeAsync("/test/farmers", token);
+                response.EnsureSuccessStatusCode();
+                var farmers = await response.Content.ReadFromJsonAsync<TestFarmersResponse>(token);
+                var f = farmers?.Farmers.FirstOrDefault(x => x.Id == farmerId);
+                return f != null && f.TileX == tileX && f.TileY == tileY;
             },
-            timeout ?? Helpers.TestTimings.NetworkSyncTimeout,
-            cancellationToken: ct
+            timeout ?? TestTimings.NetworkSyncTimeout,
+            ct,
+            DumpOnTimeout(
+                "WaitForFarmerServerTileAsync_timeout",
+                new Dictionary<string, object?>
+                {
+                    ["farmerId"] = farmerId,
+                    ["tileX"] = tileX,
+                    ["tileY"] = tileY,
+                }
+            )
+        );
+    }
+
+    /// <summary>
+    /// Test-only: poll until an Object is present at (<paramref name="tileX"/>,<paramref name="tileY"/>)
+    /// in <paramref name="location"/>, via the same <c>getObjectAtTile</c> lookup CabinPlacementValidator
+    /// reads. A placed Object replicates from the placing client's Game1 to the server over several
+    /// ticks (the cross-process gap <see cref="WaitForFarmerServerTileAsync"/> covers for a farmer); a
+    /// test forcing a rejection must await THIS before the placement command, else the validator sees a
+    /// clear footprint and wrongly ACCEPTS the move. GET /test/object_at_tile.
+    /// </summary>
+    public async Task<bool> WaitForObjectAtServerTileAsync(
+        int tileX,
+        int tileY,
+        string location = "Farm",
+        TimeSpan? timeout = null,
+        CancellationToken ct = default
+    )
+    {
+        var url =
+            $"/test/object_at_tile?location={Uri.EscapeDataString(location)}&x={tileX}&y={tileY}";
+        return await PollSnapshotAsync(
+            WaitName.Polling_ServerApi_WaitForObjectAtServerTile,
+            async token =>
+            {
+                var response = await GetRetrySafeAsync(url, token);
+                response.EnsureSuccessStatusCode();
+                var body = await response.Content.ReadFromJsonAsync<TestObjectAtTileResponse>(
+                    token
+                );
+                return body?.Present == true;
+            },
+            timeout ?? TestTimings.NetworkSyncTimeout,
+            ct,
+            DumpOnTimeout(
+                "WaitForObjectAtServerTileAsync_timeout",
+                new Dictionary<string, object?>
+                {
+                    ["location"] = location,
+                    ["tileX"] = tileX,
+                    ["tileY"] = tileY,
+                }
+            )
         );
     }
 
@@ -1861,6 +2427,47 @@ public class ServerApiClient : IDisposable
     }
 
     /// <summary>
+    /// Test-only: spawn a per-tick-physics probe entity (projectile/debris/monster) in the host's
+    /// location, which the server simulates. Paired with <see cref="GetPacingProbeState"/> to measure
+    /// wall-clock pacing with the TPS-agnostic patches on vs off. POST /test/pacing_probe_spawn
+    /// </summary>
+    public async Task<PacingProbeSpawnResponse?> SpawnPacingProbe(
+        string kind,
+        CancellationToken ct = default
+    )
+    {
+        var response = await SendWithRetryAsync(
+            HttpMethod.Post,
+            "/test/pacing_probe_spawn",
+            ct,
+            () => JsonContent.Create(new { kind })
+        );
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<PacingProbeSpawnResponse>(ct);
+    }
+
+    /// <summary>
+    /// Test-only: read the current state of the spawned pacing-probe entity of the given kind.
+    /// GET /test/pacing_probe_state?kind=...
+    /// </summary>
+    public async Task<PacingProbeStateResponse?> GetPacingProbeState(
+        string kind,
+        CancellationToken ct = default
+    )
+    {
+        // Retry on 503: this endpoint marshals onto the game thread and is read once (not polled), so a
+        // transient game-thread-busy has no self-healing poll to fall back on.
+        var response = await SendWithRetryAsync(
+            HttpMethod.Get,
+            $"/test/pacing_probe_state?kind={Uri.EscapeDataString(kind)}",
+            ct,
+            retrySafe: true
+        );
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<PacingProbeStateResponse>(ct);
+    }
+
+    /// <summary>
     /// Test-only: queue an overnight FarmEvent (e.g. the Mr. Qi mystery box) for the next night.
     /// POST /test/farmevent?type=qiplane
     /// </summary>
@@ -1879,23 +2486,54 @@ public class ServerApiClient : IDisposable
     }
 
     /// <summary>
-    /// Test-only: run a vanilla debug house-upgrade command on the host (via parseDebugInput, so the
-    /// HostFarmhouseUpgradeGuard Harmony prefix is exercised) and return the host's resulting
-    /// HouseUpgradeLevel. Used to pin that the host farmhouse cannot be upgraded (stays 0).
-    /// POST /test/house_upgrade?command=...
+    /// Test-only: whether an overnight FarmEvent is currently up on the host. Distinguishes a
+    /// completed event from one frozen mid-play, which the day counter and pause flag cannot.
+    /// GET /test/farmevent_state
     /// </summary>
-    public async Task<TestHouseUpgradeResponse?> RunDebugHouseUpgrade(
+    public async Task<TestFarmEventStateResponse?> GetFarmEventState(CancellationToken ct = default)
+    {
+        var response = await GetRetrySafeAsync("/test/farmevent_state", ct);
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<TestFarmEventStateResponse>(ct);
+    }
+
+    /// <summary>
+    /// Test-only: run a vanilla debug command on the host via parseDebugInput and return the host's
+    /// HouseUpgradeLevel + location afterwards. A warp command only arms the warp; poll
+    /// <c>/diagnostics/state</c> for arrival.
+    /// POST /test/debug_command?command=...
+    /// </summary>
+    public async Task<TestDebugCommandResponse?> RunDebugCommand(
         string command,
         CancellationToken ct = default
     )
     {
         var response = await SendWithRetryAsync(
             HttpMethod.Post,
-            $"/test/house_upgrade?command={Uri.EscapeDataString(command)}",
+            $"/test/debug_command?command={Uri.EscapeDataString(command)}",
             ct
         );
         response.EnsureSuccessStatusCode();
-        return await response.Content.ReadFromJsonAsync<TestHouseUpgradeResponse>(ct);
+        return await response.Content.ReadFromJsonAsync<TestDebugCommandResponse>(ct);
+    }
+
+    /// <summary>
+    /// Test-only: replace every bed in the host farmhouse with the given bed item (e.g. "2052", the
+    /// Double bed) on the DefaultBedPosition tile.
+    /// POST /test/host_farmhouse_bed?bedId=...
+    /// </summary>
+    public async Task<TestHostFarmhouseBedResponse?> SetHostFarmhouseBed(
+        string bedId,
+        CancellationToken ct = default
+    )
+    {
+        var response = await SendWithRetryAsync(
+            HttpMethod.Post,
+            $"/test/host_farmhouse_bed?bedId={Uri.EscapeDataString(bedId)}",
+            ct
+        );
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<TestHostFarmhouseBedResponse>(ct);
     }
 
     /// <summary>
@@ -1905,11 +2543,78 @@ public class ServerApiClient : IDisposable
     /// persist such a claim to disk for a sweep test.
     /// POST /test/stamp_claim
     /// </summary>
-    public async Task<TestStampClaimResponse?> StampClaim(CancellationToken ct = default)
+    public async Task<TestStampClaimResponse?> StampClaim(CancellationToken ct = default) =>
+        await StampClaim(withOwner: false, ct);
+
+    /// <summary>
+    /// As <see cref="StampClaim(CancellationToken)"/>; <paramref name="withOwner"/> also writes a
+    /// synthetic ownership record so sweep tests can assert the heal clears map + stamp together.
+    /// </summary>
+    public async Task<TestStampClaimResponse?> StampClaim(
+        bool withOwner,
+        CancellationToken ct = default
+    )
     {
-        var response = await SendWithRetryAsync(HttpMethod.Post, "/test/stamp_claim", ct);
+        var query = withOwner ? "?withOwner=true" : "";
+        var response = await SendWithRetryAsync(HttpMethod.Post, $"/test/stamp_claim{query}", ct);
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<TestStampClaimResponse>(ct);
+    }
+
+    /// <summary>
+    /// Test-only: pre-customize spare farmhand slots server-side (isCustomized + name, no userID)
+    /// so a subsequent join by that name takes the already-customized fast path — no character
+    /// menu. POST /test/precustomize_farmhand
+    /// </summary>
+    public async Task<TestPrecustomizeFarmhandResponse?> PrecustomizeFarmhands(
+        IReadOnlyList<string> names,
+        CancellationToken ct = default
+    )
+    {
+        var response = await SendWithRetryAsync(
+            HttpMethod.Post,
+            "/test/precustomize_farmhand",
+            ct,
+            () => JsonContent.Create(new { names })
+        );
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<TestPrecustomizeFarmhandResponse>(ct);
+    }
+
+    /// <summary>
+    /// Test-only: manufacture a one-way farmhand↔cabin link by nulling a cabin's farmhandReference
+    /// (the cabin→farmhand direction) while leaving the farmhand's homeLocation naming a Cabin. Used
+    /// to verify the join-time link repair on rejoin. With <paramref name="redirectHomeToOwnerId"/>
+    /// set, the farmhand's home is repointed at that other owner's cabin, producing the unrecoverable
+    /// shape (home owned by someone else) the repair must decline rather than steal. With
+    /// <paramref name="makeHomeOwnerPlaceholder"/> set, a fresh unclaimed placeholder is installed as
+    /// the farmhand's own home cabin's owner — the recoverable shape the repair must heal by DELETING
+    /// the placeholder (its id is returned as <c>PlaceholderOwnerId</c>) and re-homing the owner.
+    /// POST /test/break_cabin_link
+    /// </summary>
+    public async Task<TestBreakCabinLinkResponse?> BreakCabinLink(
+        long ownerId,
+        long? redirectHomeToOwnerId = null,
+        bool makeHomeOwnerPlaceholder = false,
+        CancellationToken ct = default
+    )
+    {
+        var query = $"?ownerId={ownerId}";
+        if (redirectHomeToOwnerId.HasValue)
+        {
+            query += $"&redirectHomeToOwner={redirectHomeToOwnerId.Value}";
+        }
+        if (makeHomeOwnerPlaceholder)
+        {
+            query += "&makeHomeOwnerPlaceholder=true";
+        }
+        var response = await SendWithRetryAsync(
+            HttpMethod.Post,
+            $"/test/break_cabin_link{query}",
+            ct
+        );
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<TestBreakCabinLinkResponse>(ct);
     }
 
     /// <summary>
@@ -1941,7 +2646,12 @@ public class ServerApiClient : IDisposable
         CancellationToken ct = default
     )
     {
-        var response = await SendWithRetryAsync(HttpMethod.Get, "/test/npc_sprite_integrity", ct);
+        var response = await SendWithRetryAsync(
+            HttpMethod.Get,
+            "/test/npc_sprite_integrity",
+            ct,
+            retrySafe: true
+        );
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<TestNpcSpriteIntegrityResponse>(ct);
     }
@@ -2088,6 +2798,42 @@ public class ServerApiClient : IDisposable
     }
 
     /// <summary>
+    /// Test-only: flip the LAN/IP door (Game1.options.ipConnectionsEnabled) at runtime, so the
+    /// shared steam server can exercise the production IP-off posture without a config fork.
+    /// POST /test/set_ip_connections?enabled=...
+    /// </summary>
+    public async Task<TestSetIpConnectionsResponse?> SetIpConnections(
+        bool enabled,
+        CancellationToken ct = default
+    )
+    {
+        var response = await SendWithRetryAsync(
+            HttpMethod.Post,
+            $"/test/set_ip_connections?enabled={(enabled ? "true" : "false")}",
+            ct,
+            retrySafe: true
+        );
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<TestSetIpConnectionsResponse>(ct);
+    }
+
+    /// <summary>
+    /// Test-only: open or close an inert host menu (Game1.activeClickableMenu) to exercise the
+    /// festival leave-end gate. POST /test/host_menu?open=...
+    /// </summary>
+    public async Task<TestHostMenuResponse?> SetHostMenu(bool open, CancellationToken ct = default)
+    {
+        var response = await SendWithRetryAsync(
+            HttpMethod.Post,
+            $"/test/host_menu?open={(open ? "true" : "false")}",
+            ct,
+            retrySafe: true
+        );
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<TestHostMenuResponse>(ct);
+    }
+
+    /// <summary>
     /// Test-only: whether a leftover <c>.tmp</c> remains next to the save's main file (no-junk
     /// assertion after a successful import).
     /// GET /test/save_tmp_exists?saveName=...
@@ -2100,7 +2846,8 @@ public class ServerApiClient : IDisposable
         var response = await SendWithRetryAsync(
             HttpMethod.Get,
             $"/test/save_tmp_exists?saveName={Uri.EscapeDataString(saveName)}",
-            ct
+            ct,
+            retrySafe: true
         );
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<TestSaveFileOpResponse>(ct);
@@ -2109,9 +2856,12 @@ public class ServerApiClient : IDisposable
     /// <summary>
     /// Test-only: mutate an existing CropSaver tracking entry. Used by E2E
     /// tests to pre-arm <c>extraDays</c> past <c>OnDayEnd</c>'s
-    /// branch-1 floor without simulating many real day-transitions. All
-    /// optional parameters are skipped (left at their existing values) when
-    /// null. Returns <c>Found=false</c> if no SaverCrop exists at the tile.
+    /// branch-1 floor without simulating many real day-transitions.
+    /// <paramref name="locationName"/> must be the entry key — the unique
+    /// location name (<see cref="TestCrop.UniqueLocationName"/> from
+    /// /test/crops). All optional parameters are skipped (left at their
+    /// existing values) when null. Returns <c>Found=false</c> if no SaverCrop
+    /// exists at the (unique name, tile).
     /// POST /test/saver_crop
     /// </summary>
     public async Task<TestSaverCropResponse?> SetSaverCrop(
@@ -2158,6 +2908,38 @@ public class ServerApiClient : IDisposable
     }
 
     /// <summary>
+    /// Test-only: run a deterministic lightning strike against the crop at a tile —
+    /// vanilla's crop-strike (<c>HoeDirt.performToolAction</c> with lightning damage)
+    /// inside the CropSaver lightning context, bypassing the RNG target roll of
+    /// <c>Utility.performLightningUpdate</c>.
+    /// POST /test/lightning_strike
+    /// </summary>
+    public async Task<TestLightningStrikeResponse?> LightningStrike(
+        string locationName,
+        int tileX,
+        int tileY,
+        CancellationToken ct = default
+    )
+    {
+        var response = await SendWithRetryAsync(
+            HttpMethod.Post,
+            "/test/lightning_strike",
+            ct,
+            () =>
+                JsonContent.Create(
+                    new
+                    {
+                        locationName,
+                        tileX,
+                        tileY,
+                    }
+                )
+        );
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<TestLightningStrikeResponse>(ct);
+    }
+
+    /// <summary>
     /// Adjusts the game clock speed by the given multiplier.
     /// POST /clock-speed?multiplier=N
     /// </summary>
@@ -2170,7 +2952,8 @@ public class ServerApiClient : IDisposable
         var response = await SendWithRetryAsync(
             HttpMethod.Post,
             $"/clock-speed?multiplier={multiplierStr}",
-            ct
+            ct,
+            retrySafe: true
         );
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<ClockSpeedResponse>(ct);
@@ -2190,7 +2973,8 @@ public class ServerApiClient : IDisposable
         var response = await SendWithRetryAsync(
             HttpMethod.Post,
             $"/roles/admin?name={Uri.EscapeDataString(playerName)}",
-            ct
+            ct,
+            retrySafe: true
         );
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<RoleGrantResponse>(ct);
@@ -2209,7 +2993,8 @@ public class ServerApiClient : IDisposable
         var response = await SendWithRetryAsync(
             HttpMethod.Post,
             $"/roles/admin?playerId={playerId}",
-            ct
+            ct,
+            retrySafe: true
         );
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<RoleGrantResponse>(ct);
@@ -2226,17 +3011,16 @@ public class ServerApiClient : IDisposable
     }
 
     /// <summary>
-    /// Waits for the server to come online and be ready.
+    /// Long-polls <c>/wait/status</c> until the server is online and ready. Unlike the other
+    /// waits, swallows every fault and returns <c>null</c> on timeout or cancellation.
     /// </summary>
-    /// <param name="timeout">Maximum time to wait</param>
-    /// <param name="pollInterval">Time between status checks</param>
-    /// <param name="cancellationToken">Cancellation token for early abort (e.g., on server error)</param>
-    /// <param name="onProgress">Optional callback for progress reporting (attempt count, detail message)</param>
-    /// <param name="requireInviteCode">If true, also waits for a non-empty invite code (Steam/Galaxy). LAN-only servers should pass false.</param>
-    /// <returns>The server status once online, or null if timeout/cancelled</returns>
+    /// <param name="cancellationToken">Early abort, for example on a server error.</param>
+    /// <param name="onProgress">Progress callback (attempt count, last reason).</param>
+    /// <param name="requireInviteCode">Also wait for a non-empty invite code (Steam/Galaxy).
+    /// Servers without Steam auth should pass false.</param>
+    /// <returns>The matching status, or <c>null</c> on timeout or cancellation.</returns>
     public Task<ServerStatus?> WaitForServerOnline(
         TimeSpan timeout,
-        TimeSpan? pollInterval = null,
         CancellationToken cancellationToken = default,
         Action<string>? onProgress = null,
         bool requireInviteCode = true
@@ -2247,7 +3031,6 @@ public class ServerApiClient : IDisposable
             () =>
                 WaitForServerOnlineCoreAsync(
                     timeout,
-                    pollInterval,
                     cancellationToken,
                     onProgress,
                     requireInviteCode
@@ -2259,20 +3042,15 @@ public class ServerApiClient : IDisposable
 
     private async Task<ServerStatus?> WaitForServerOnlineCoreAsync(
         TimeSpan timeout,
-        TimeSpan? pollInterval,
         CancellationToken cancellationToken,
         Action<string>? onProgress,
         bool requireInviteCode
     )
     {
-        // Long-poll path: each iteration calls /wait/status?isReady=true with a
-        // server-side hard cap of 10s. The server blocks until a newer snapshot
-        // satisfies the filter, so a healthy server returns immediately on the
-        // first poll. The legacy 1s pollInterval is unused on this path —
-        // server-side blocking replaces client-side throttling. We still keep
-        // an outer loop so the requireInviteCode path can advance `since` and
-        // re-poll when the snapshot has refreshed but invite codes are still
-        // missing (invite code is read from a file, not from the snapshot).
+        // Each iteration calls /wait/status?isReady=true under the server's 10s cap, so a
+        // healthy server returns on the first poll. The outer loop serves the
+        // requireInviteCode path: the invite code is read from a file, not the snapshot, so
+        // `since` must advance and re-poll when the snapshot refreshed without a code.
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var deadline = DateTime.UtcNow + timeout;
         long since = 0;
@@ -2314,7 +3092,7 @@ public class ServerApiClient : IDisposable
 
                     if (status == null)
                     {
-                        // 408 — server-side timeout. Try again under our deadline.
+                        // 408: no newer snapshot within the server timeout, re-issue under our deadline.
                         lastReason = "server-side timeout (408)";
                     }
                     else
@@ -2338,7 +3116,7 @@ public class ServerApiClient : IDisposable
                         // Snapshot advanced but conditions still unmet (e.g., invite
                         // code missing). Update `since` so the next /wait/status
                         // doesn't return immediately on the same snapshot.
-                        since = status.Version;
+                        since = status.Sequence;
                         lastReason = requireInviteCode
                             ? $"IsOnline={status.IsOnline}, IsReady={status.IsReady}, InviteCode='{status.InviteCode ?? "(null)"}'"
                             : $"IsOnline={status.IsOnline}, IsReady={status.IsReady}";
@@ -2374,7 +3152,7 @@ public class ServerApiClient : IDisposable
                     iterations = attempt,
                     durationMs = sw.ElapsedMilliseconds,
                     timeoutMs = (long)timeout.TotalMilliseconds,
-                    snapshotVersionAtMatch = (long?)matchedStatus?.Version,
+                    snapshotSequenceAtMatch = (long?)matchedStatus?.Sequence,
                     error = lastException?.Message,
                     ctCancelled = cancellationToken.IsCancellationRequested,
                 }
@@ -2395,6 +3173,7 @@ public class ServerApiClient : IDisposable
         string? cabinStrategy = null,
         int? maxPlayers = null,
         bool? allowIpConnections = null,
+        bool? allowCabinRelocation = null,
         CancellationToken ct = default
     )
     {
@@ -2429,10 +3208,68 @@ public class ServerApiClient : IDisposable
             body["allowIpConnections"] = allowIpConnections.Value;
         }
 
+        if (allowCabinRelocation.HasValue)
+        {
+            body["allowCabinRelocation"] = allowCabinRelocation.Value;
+        }
+
         var content = JsonContent.Create(body);
         var response = await _httpClient.PostAsync("/newgame", content, ct);
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<NewGameResponse>(ct);
+    }
+
+    /// <summary>
+    /// POST /newgame with the server's configured defaults, returning the status code and body
+    /// instead of throwing on a non-2xx, so a test can assert the 409/500 rejections directly.
+    /// Runs to completion (up to the server's 120 s creation timeout) on a 200.
+    /// </summary>
+    public async Task<(HttpStatusCode StatusCode, NewGameResponse? Body)> TryCreateNewGameAsync(
+        CancellationToken ct = default
+    )
+    {
+        var response = await _httpClient.PostAsync("/newgame", JsonContent.Create(new { }), ct);
+        return (response.StatusCode, await ReadBodyOrNullAsync<NewGameResponse>(response, ct));
+    }
+
+    /// <summary>
+    /// POST /reload, returning the status code and body instead of throwing on a non-2xx.
+    /// Not retried on 503: the caller asserts the exact status.
+    /// </summary>
+    public async Task<(HttpStatusCode StatusCode, NewGameResponse? Body)> TryReloadAsync(
+        CancellationToken ct = default
+    )
+    {
+        var response = await _httpClient.PostAsync("/reload", null, ct);
+        return (response.StatusCode, await ReadBodyOrNullAsync<NewGameResponse>(response, ct));
+    }
+
+    private static async Task<T?> ReadBodyOrNullAsync<T>(
+        HttpResponseMessage response,
+        CancellationToken ct
+    )
+        where T : class
+    {
+        try
+        {
+            return await response.Content.ReadFromJsonAsync<T>(ct);
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Test-only: makes the server's next new-game creation throw, so a test can drive the
+    /// failed-creation recovery path.
+    /// POST /test/fail_next_newgame
+    /// </summary>
+    public async Task<TestFailNextNewGameResponse?> FailNextNewGame(CancellationToken ct = default)
+    {
+        var response = await SendWithRetryAsync(HttpMethod.Post, "/test/fail_next_newgame", ct);
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<TestFailNextNewGameResponse>(ct);
     }
 
     /// <summary>
@@ -2446,15 +3283,17 @@ public class ServerApiClient : IDisposable
         // Reload runs during title/save transitions, where the game thread is most
         // likely busy and the server returns a transient 503. Go through the retry
         // helper so those are retried transparently like every other mutating call.
-        var response = await SendWithRetryAsync(HttpMethod.Post, "/reload", ct);
+        var response = await SendWithRetryAsync(HttpMethod.Post, "/reload", ct, retrySafe: true);
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<NewGameResponse>(ct);
     }
 
     /// <summary>
-    /// Polls GET /players until a player with the given name appears.
-    /// Prefer <see cref="WaitForPlayerByIdAsync"/> for fresh joiners: Name can lag
-    /// 1-18 s behind peer-add while the character XML round-trips.
+    /// Long-polls /wait/players until a player with the given name appears. The
+    /// server filters only by id, so the name is matched client-side on every
+    /// newer snapshot. Prefer <see cref="WaitForPlayerByIdAsync"/> for fresh
+    /// joiners: Name can lag 1-18 s behind peer-add while the character XML
+    /// round-trips.
     /// </summary>
     public async Task<bool> WaitForPlayerByNameAsync(
         string name,
@@ -2462,46 +3301,26 @@ public class ServerApiClient : IDisposable
         CancellationToken ct = default
     )
     {
-        return await Helpers.PollingHelper.WaitUntilAsync(
-            Helpers.WaitName.Polling_ServerApi_WaitForPlayerByName,
-            async () =>
-            {
-                try
-                {
-                    using var reqCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    reqCts.CancelAfter(Helpers.TestTimings.PollingRequestTimeout);
-                    var players = await GetPlayers(reqCts.Token);
-                    return players?.Players?.Any(p =>
-                            p.Name.Equals(name, StringComparison.OrdinalIgnoreCase)
-                        ) == true;
-                }
-                catch (Exception ex)
-                    when (ex
-                            is HttpRequestException
-                                or TaskCanceledException
-                                or OperationCanceledException
-                        && !ct.IsCancellationRequested
-                    )
-                {
-                    // Request timeout or connection error during server boot, retry
-                    return false;
-                }
-            },
-            timeout ?? Helpers.TestTimings.NetworkSyncTimeout,
-            cancellationToken: ct,
-            onTimeoutAsync: async () =>
-                await Helpers.FailureContext.DumpAsync(
-                    this,
-                    reason: "WaitForPlayerByNameAsync_timeout",
-                    extras: new Dictionary<string, object?> { ["name"] = name }
-                )
+        return await LongPollSnapshotAsync(
+            WaitName.Polling_ServerApi_WaitForPlayerByName,
+            (since, serverTimeout, token) =>
+                WaitForPlayersAsync(since: since, timeout: serverTimeout, ct: token),
+            timeout ?? TestTimings.NetworkSyncTimeout,
+            ct,
+            DumpOnTimeout(
+                "WaitForPlayerByNameAsync_timeout",
+                new Dictionary<string, object?> { ["name"] = name }
+            ),
+            matches: players =>
+                players.Players?.Any(p => p.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+                == true
         );
     }
 
     /// <summary>
-    /// Polls GET /players until a player with the given UniqueMultiplayerID appears.
-    /// Preferred for fresh joiners: UID is assigned at peer-add, while Name lags the
-    /// character XML round-trip (1-18 s under load).
+    /// Long-polls /wait/players until a player with the given UniqueMultiplayerID
+    /// appears. Preferred for fresh joiners: UID is assigned at peer-add, while
+    /// Name lags the character XML round-trip (1-18 s under load).
     /// </summary>
     public async Task<bool> WaitForPlayerByIdAsync(
         long playerId,
@@ -2509,103 +3328,69 @@ public class ServerApiClient : IDisposable
         CancellationToken ct = default
     )
     {
-        // Long-poll path: each iteration calls /wait/players?playerId=N. The
-        // server blocks until a newer snapshot contains the player or the
-        // server-side hard cap (10s) expires. The outer LongPollAsync loop is
-        // bounded by the caller's timeout and emits long_poll_completed on
-        // exit. onTimeoutAsync still runs the failure-context dump on miss.
-        return await Helpers.PollingHelper.LongPollAsync(
-            Helpers.WaitName.Polling_ServerApi_WaitForPlayerById,
-            async (since, remaining) =>
+        return await LongPollSnapshotAsync(
+            WaitName.Polling_ServerApi_WaitForPlayerById,
+            (since, serverTimeout, token) =>
+                WaitForPlayersAsync(
+                    since: since,
+                    playerId: playerId,
+                    timeout: serverTimeout,
+                    ct: token
+                ),
+            timeout ?? TestTimings.NetworkSyncTimeout,
+            ct,
+            DumpOnTimeout(
+                "WaitForPlayerByIdAsync_timeout",
+                new Dictionary<string, object?> { ["playerId"] = playerId }
+            )
+        );
+    }
+
+    /// <summary>
+    /// Polls GET /players until no player whose <paramref name="keyOf"/> is in
+    /// <paramref name="keys"/> remains.
+    /// </summary>
+    private Task<bool> WaitForPlayersRemovedAsync<TKey>(
+        WaitName name,
+        HashSet<TKey> keys,
+        Func<PlayerInfo, TKey> keyOf,
+        string reason,
+        string extrasKey,
+        TimeSpan? timeout,
+        CancellationToken ct
+    )
+    {
+        return PollSnapshotAsync(
+            name,
+            async token =>
             {
-                try
-                {
-                    using var reqCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    reqCts.CancelAfter(Helpers.TestTimings.PollingRequestTimeout);
-                    var players = await WaitForPlayersAsync(
-                        since: since,
-                        playerId: playerId,
-                        timeout: remaining,
-                        ct: reqCts.Token
-                    );
-                    if (players == null)
-                    {
-                        // 408 — server-side timeout, no newer snapshot observed.
-                        return new Helpers.PollingHelper.LongPollResult(false, since);
-                    }
-                    return new Helpers.PollingHelper.LongPollResult(true, players.Version);
-                }
-                catch (Exception) when (!ct.IsCancellationRequested)
-                {
-                    // Connection error or per-request timeout during server boot.
-                    // Cursor is unchanged; the next iteration retries from `since`.
-                    return new Helpers.PollingHelper.LongPollResult(false, since);
-                }
+                var players = await GetPlayers(token);
+                return players?.Players != null
+                    && !players.Players.Any(p => keys.Contains(keyOf(p)));
             },
-            timeout ?? Helpers.TestTimings.NetworkSyncTimeout,
-            cancellationToken: ct,
-            onTimeoutAsync: async () =>
-            {
-                // On timeout, pull live ground-truth. The poll is already failed;
-                // this is just enrichment. Don't propagate the original ct so
-                // cancellation by the outer timeout still lets us dump state.
-                return await Helpers.FailureContext.DumpAsync(
-                    this,
-                    reason: "WaitForPlayerByIdAsync_timeout",
-                    extras: new Dictionary<string, object?> { ["playerId"] = playerId }
-                );
-            }
+            timeout ?? TestTimings.PlayerRemovalTimeout,
+            ct,
+            DumpOnTimeout(reason, new Dictionary<string, object?> { [extrasKey] = keys.ToArray() })
         );
     }
 
     /// <summary>
     /// Polls GET /players until none of the named players remain.
     /// </summary>
-    public async Task<bool> WaitForPlayersRemovedByNameAsync(
+    public Task<bool> WaitForPlayersRemovedByNameAsync(
         IEnumerable<string> names,
         TimeSpan? timeout = null,
         CancellationToken ct = default
-    )
-    {
-        var nameSet = names.ToHashSet(StringComparer.OrdinalIgnoreCase);
-        return await Helpers.PollingHelper.WaitUntilAsync(
-            Helpers.WaitName.Polling_ServerApi_WaitForPlayersRemovedByName,
-            async () =>
-            {
-                try
-                {
-                    using var reqCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    reqCts.CancelAfter(Helpers.TestTimings.PollingRequestTimeout);
-                    var players = await GetPlayers(reqCts.Token);
-                    if (players?.Players == null)
-                    {
-                        return false;
-                    }
-
-                    return !players.Players.Any(p => nameSet.Contains(p.Name));
-                }
-                catch (Exception ex)
-                    when (ex
-                            is HttpRequestException
-                                or TaskCanceledException
-                                or OperationCanceledException
-                        && !ct.IsCancellationRequested
-                    )
-                {
-                    // Request timeout or connection error during server boot, retry
-                    return false;
-                }
-            },
-            timeout ?? Helpers.TestTimings.FarmerDeleteTimeout,
-            cancellationToken: ct,
-            onTimeoutAsync: async () =>
-                await Helpers.FailureContext.DumpAsync(
-                    this,
-                    reason: "WaitForPlayersRemovedByNameAsync_timeout",
-                    extras: new Dictionary<string, object?> { ["names"] = nameSet.ToArray() }
-                )
+    ) =>
+        WaitForPlayersRemovedAsync(
+            WaitName.Polling_ServerApi_WaitForPlayersRemovedByName,
+            names.ToHashSet(StringComparer.OrdinalIgnoreCase),
+            p => p.Name,
+            "WaitForPlayersRemovedByNameAsync_timeout",
+            "names",
+            timeout,
+            ct
         );
-    }
 
     /// <summary>
     /// Polls GET /players until the named player is no longer present.
@@ -2619,50 +3404,20 @@ public class ServerApiClient : IDisposable
     /// <summary>
     /// Polls GET /players until none of the players with the given UniqueMultiplayerIDs remain.
     /// </summary>
-    public async Task<bool> WaitForPlayersRemovedByIdAsync(
+    public Task<bool> WaitForPlayersRemovedByIdAsync(
         IEnumerable<long> playerIds,
         TimeSpan? timeout = null,
         CancellationToken ct = default
-    )
-    {
-        var idSet = playerIds.ToHashSet();
-        return await Helpers.PollingHelper.WaitUntilAsync(
-            Helpers.WaitName.Polling_ServerApi_WaitForPlayersRemovedById,
-            async () =>
-            {
-                try
-                {
-                    using var reqCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    reqCts.CancelAfter(Helpers.TestTimings.PollingRequestTimeout);
-                    var players = await GetPlayers(reqCts.Token);
-                    if (players?.Players == null)
-                    {
-                        return false;
-                    }
-
-                    return !players.Players.Any(p => idSet.Contains(p.Id));
-                }
-                catch (Exception ex)
-                    when (ex
-                            is HttpRequestException
-                                or TaskCanceledException
-                                or OperationCanceledException
-                        && !ct.IsCancellationRequested
-                    )
-                {
-                    return false;
-                }
-            },
-            timeout ?? Helpers.TestTimings.FarmerDeleteTimeout,
-            cancellationToken: ct,
-            onTimeoutAsync: async () =>
-                await Helpers.FailureContext.DumpAsync(
-                    this,
-                    reason: "WaitForPlayersRemovedByIdAsync_timeout",
-                    extras: new Dictionary<string, object?> { ["playerIds"] = idSet.ToArray() }
-                )
+    ) =>
+        WaitForPlayersRemovedAsync(
+            WaitName.Polling_ServerApi_WaitForPlayersRemovedById,
+            playerIds.ToHashSet(),
+            p => p.Id,
+            "WaitForPlayersRemovedByIdAsync_timeout",
+            "playerIds",
+            timeout,
+            ct
         );
-    }
 
     /// <summary>
     /// Polls GET /players until the player with the given UniqueMultiplayerID is no longer present.
@@ -2674,7 +3429,107 @@ public class ServerApiClient : IDisposable
     ) => WaitForPlayersRemovedByIdAsync(new[] { playerId }, timeout, ct);
 
     /// <summary>
-    /// Polls GET /farmhands until a farmhand with the given name exists.
+    /// Polls GET /players until no player remains registered server-side. For cleanup paths
+    /// that don't track individual uids (class disposers): DisconnectAsync settles the
+    /// client only, and a reset /newgame 409s against any still-registered player.
+    /// </summary>
+    public async Task<bool> WaitForAllPlayersRemovedAsync(
+        TimeSpan? timeout = null,
+        CancellationToken ct = default
+    )
+    {
+        return await PollSnapshotAsync(
+            WaitName.Polling_ServerApi_WaitForAllPlayersRemoved,
+            async token =>
+            {
+                var players = await GetPlayers(token);
+                return players?.Players != null && players.Players.Count == 0;
+            },
+            timeout ?? TestTimings.PlayerRemovalTimeout,
+            ct,
+            DumpOnTimeout("WaitForAllPlayersRemovedAsync_timeout")
+        );
+    }
+
+    /// <summary>
+    /// Polls /cabins until a cabin owned by the given player UID appears.
+    /// Prefer this over the name-based variant: OwnerId (UMI) is set immediately
+    /// at AssignFarmhand and avoids the customization-sync race that delays both
+    /// OwnerName and IsAssigned for several seconds after a fresh customization.
+    /// Returns the cabin, or <c>null</c> on timeout (after a <see cref="FailureContext"/> dump).
+    /// </summary>
+    public Task<CabinInfoResponse?> WaitForCabinAssignedByIdAsync(
+        long playerId,
+        TimeSpan? timeout = null,
+        CancellationToken ct = default
+    ) =>
+        WaitForCabinAssignedAsync(
+            WaitName.Polling_TestBase_WaitForCabinAssignedById,
+            c => c.OwnerId == playerId,
+            "playerId",
+            playerId,
+            timeout,
+            ct
+        );
+
+    /// <summary>
+    /// Polls /cabins until an assigned cabin owned by the given farmer name appears.
+    /// Use the UID variant when possible: name lookup races with the customization
+    /// sync (OwnerName can be empty briefly after fresh joins).
+    /// Returns the cabin, or <c>null</c> on timeout (after a <see cref="FailureContext"/> dump).
+    /// </summary>
+    public Task<CabinInfoResponse?> WaitForCabinAssignedByNameAsync(
+        string farmerName,
+        TimeSpan? timeout = null,
+        CancellationToken ct = default
+    ) =>
+        WaitForCabinAssignedAsync(
+            WaitName.Polling_TestBase_WaitForCabinAssignedByName,
+            c => c.OwnerName.Equals(farmerName, StringComparison.OrdinalIgnoreCase) && c.IsAssigned,
+            "farmerName",
+            farmerName,
+            timeout,
+            ct
+        );
+
+    private async Task<CabinInfoResponse?> WaitForCabinAssignedAsync(
+        WaitName name,
+        Func<CabinInfoResponse, bool> isMatch,
+        string extrasKey,
+        object extrasValue,
+        TimeSpan? timeout,
+        CancellationToken ct
+    )
+    {
+        CabinInfoResponse? result = null;
+        // Captured so the timeout dump can show the last snapshot the poll saw.
+        CabinsResponse? lastCabins = null;
+        await PollSnapshotAsync(
+            name,
+            async token =>
+            {
+                lastCabins = await GetCabins(token);
+                result = lastCabins?.Cabins.FirstOrDefault(isMatch);
+                return result != null;
+            },
+            timeout ?? TestTimings.CabinAssignmentTimeout,
+            ct,
+            async () =>
+                await FailureContext.DumpAsync(
+                    this,
+                    reason: "WaitForCabinAssignedAsync_timeout",
+                    extras: new Dictionary<string, object?>
+                    {
+                        [extrasKey] = extrasValue,
+                        ["lastCabinsSnapshot"] = lastCabins?.Cabins,
+                    }
+                )
+        );
+        return result;
+    }
+
+    /// <summary>
+    /// Long-polls /wait/farmhands until a farmhand with the given name exists.
     /// Intended for tests that verify name/customization behavior specifically;
     /// name sync is the whole point of such assertions.
     /// </summary>
@@ -2685,50 +3540,33 @@ public class ServerApiClient : IDisposable
         CancellationToken ct = default
     )
     {
-        return await Helpers.PollingHelper.LongPollAsync(
-            Helpers.WaitName.Polling_ServerApi_WaitForFarmhandByName,
-            async (since, remaining) =>
-            {
-                try
+        return await LongPollSnapshotAsync(
+            WaitName.Polling_ServerApi_WaitForFarmhandByName,
+            (since, serverTimeout, token) =>
+                WaitForFarmhandsAsync(
+                    since: since,
+                    hasFarmhand: name,
+                    requireCustomized: requireCustomized ? true : null,
+                    timeout: serverTimeout,
+                    ct: token
+                ),
+            timeout ?? TestTimings.CabinAssignmentTimeout,
+            ct,
+            DumpOnTimeout(
+                "WaitForFarmhandByNameAsync_timeout",
+                new Dictionary<string, object?>
                 {
-                    using var reqCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    reqCts.CancelAfter(Helpers.TestTimings.PollingRequestTimeout);
-                    var farmhands = await WaitForFarmhandsAsync(
-                        since: since,
-                        hasFarmhand: name,
-                        requireCustomized: requireCustomized ? true : null,
-                        timeout: remaining,
-                        ct: reqCts.Token
-                    );
-                    if (farmhands == null)
-                    {
-                        return new Helpers.PollingHelper.LongPollResult(false, since);
-                    }
-
-                    return new Helpers.PollingHelper.LongPollResult(true, farmhands.Version);
+                    ["name"] = name,
+                    ["requireCustomized"] = requireCustomized,
                 }
-                catch (Exception) when (!ct.IsCancellationRequested)
-                {
-                    return new Helpers.PollingHelper.LongPollResult(false, since);
-                }
-            },
-            timeout ?? Helpers.TestTimings.FarmerDeleteTimeout,
-            cancellationToken: ct,
-            onTimeoutAsync: async () =>
-                await Helpers.FailureContext.DumpAsync(
-                    this,
-                    reason: "WaitForFarmhandByNameAsync_timeout",
-                    extras: new Dictionary<string, object?>
-                    {
-                        ["name"] = name,
-                        ["requireCustomized"] = requireCustomized,
-                    }
-                )
+            )
         );
     }
 
     /// <summary>
-    /// Retries DELETE /farmhands?name=X until Success == true.
+    /// Polls DELETE /farmhands?name=X until the farmhand is gone: a DELETE that reports
+    /// Success, or, after a DELETE that faulted in transit, a "not found" confirmed by the
+    /// name's absence from /farmhands. Everything else retries to the deadline.
     /// </summary>
     public async Task<FarmhandOperationResponse?> WaitForFarmhandDeletedByNameAsync(
         string name,
@@ -2737,33 +3575,64 @@ public class ServerApiClient : IDisposable
     )
     {
         FarmhandOperationResponse? result = null;
-        await Helpers.PollingHelper.WaitUntilAsync(
-            Helpers.WaitName.Polling_ServerApi_WaitForFarmhandDeletedByName,
-            async () =>
+        var deleteWasAmbiguous = false;
+        await PollSnapshotAsync(
+            WaitName.Polling_ServerApi_WaitForFarmhandDeletedByName,
+            async token =>
             {
                 try
                 {
-                    using var reqCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    reqCts.CancelAfter(Helpers.TestTimings.PollingRequestTimeout);
-                    result = await DeleteFarmhandByName(name, reqCts.Token);
-                    return result?.Success == true;
+                    result = await DeleteFarmhandByName(name, token);
                 }
-                catch (Exception ex)
-                    when (ex
-                            is HttpRequestException
-                                or TaskCanceledException
-                                or OperationCanceledException
-                        && !ct.IsCancellationRequested
-                    )
+                catch (Exception ex) when (IsRetryableRequestFault(ex))
                 {
-                    // 503 (game thread blocked) or request timeout, retry
+                    deleteWasAmbiguous = true;
+                    throw;
+                }
+
+                if (result?.Success == true)
+                {
+                    return true;
+                }
+
+                // A "not found" proves deletion only after a DELETE faulted in transit: the
+                // server commits on a 15s game-thread budget (ApiService.HandleDeleteFarmhandAsync)
+                // that outlives the client's per-request timeout, so while the game thread is
+                // blocked (day transition, save sync) the committing DELETE surfaces here as a
+                // transport fault and the next one reports "not found". Without a prior fault,
+                // "not found" means the name was never persisted; "not ready" / "online" /
+                // "save in progress" are unambiguous. Both retry.
+                if (
+                    !deleteWasAmbiguous
+                    || result?.Error?.Contains("not found", StringComparison.OrdinalIgnoreCase)
+                        != true
+                )
+                {
                     return false;
                 }
+
+                var farmhands = await GetFarmhands(token);
+                var stillPresent =
+                    farmhands?.Farmhands.Any(f =>
+                        string.Equals(f.Name, name, StringComparison.OrdinalIgnoreCase)
+                    )
+                    ?? true;
+                if (!stillPresent)
+                {
+                    result = new FarmhandOperationResponse
+                    {
+                        Success = true,
+                        Message = $"Farmhand '{name}' confirmed absent after ambiguous delete",
+                    };
+                    return true;
+                }
+
+                return false;
             },
-            timeout ?? Helpers.TestTimings.FarmerDeleteTimeout,
-            cancellationToken: ct,
-            onTimeoutAsync: async () =>
-                await Helpers.FailureContext.DumpAsync(
+            timeout ?? TestTimings.FarmerDeleteTimeout,
+            ct,
+            async () =>
+                await FailureContext.DumpAsync(
                     this,
                     reason: "WaitForFarmhandDeletedByNameAsync_timeout",
                     extras: new Dictionary<string, object?>

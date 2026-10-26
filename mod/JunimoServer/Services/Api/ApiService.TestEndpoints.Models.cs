@@ -13,8 +13,14 @@ namespace JunimoServer.Services.Api;
 /// </summary>
 public class TestCrop
 {
-    /// <summary>Internal location name where the crop lives (e.g. "Farm", "Greenhouse", "IslandWest").</summary>
+    /// <summary>Display location name (e.g. "Farm", "Greenhouse"). Shared by building
+    /// interiors — every cabin interior reads "Cabin".</summary>
     public string LocationName { get; set; } = "";
+
+    /// <summary>Unique location name (NameOrUniqueName, e.g. "Cabin{GUID}" for a cabin
+    /// interior; equals <see cref="LocationName"/> for root locations). This is the
+    /// CropSaver entry key — pass it as locationName to /test/saver_crop.</summary>
+    public string UniqueLocationName { get; set; } = "";
 
     /// <summary>Tile X coordinate (terrain HoeDirt tile, or pot's TileLocation).</summary>
     public int TileX { get; set; }
@@ -70,6 +76,19 @@ public class TestFarmersResponse
 }
 
 /// <summary>
+/// Response from /test/object_at_tile (test-only). Whether a placed Object sits on a
+/// (location, tile) server-side, via the same getObjectAtTile lookup CabinPlacementValidator
+/// reaches — so a test can gate a placement command on the obstacle being server-visible,
+/// which the periodic snapshots don't carry.
+/// </summary>
+public class TestObjectAtTileResponse
+{
+    public bool Success { get; set; }
+    public bool Present { get; set; }
+    public string? Error { get; set; }
+}
+
+/// <summary>
 /// Response from /test/set_date (test-only date jump).
 /// </summary>
 public class TestSetDateResponse
@@ -101,11 +120,22 @@ public class TestFarmEventResponse
     public string? Type { get; set; }
 }
 
+/// <summary>Response for GET /test/farmevent_state: whether an overnight FarmEvent is up on the host.</summary>
+public class TestFarmEventStateResponse
+{
+    public bool Success { get; set; }
+    public string? Error { get; set; }
+    public bool Active { get; set; }
+    public string? Type { get; set; }
+}
+
 /// <summary>
 /// Body for POST /test/saver_crop. Mutates an existing CropSaver entry in
-/// place. Optional fields are skipped when null. Used by E2E tests to
-/// pre-arm extraDays past CropSaver.OnDayEnd's branch-1 floor without
-/// having to simulate many real day-transitions.
+/// place. LocationName must be the entry key — the unique location name
+/// (TestCrop.UniqueLocationName from /test/crops). Optional fields are
+/// skipped when null. Used by E2E tests to pre-arm extraDays past
+/// CropSaver.OnDayEnd's branch-1 floor without having to simulate many
+/// real day-transitions.
 /// </summary>
 public class TestSaverCropRequest
 {
@@ -132,18 +162,68 @@ public class TestSaverCropResponse
 }
 
 /// <summary>
-/// Response from POST /test/house_upgrade (test-only). Runs a vanilla debug house-upgrade
-/// command through parseDebugInput (exercising the HostFarmhouseUpgradeGuard Harmony prefix) and
-/// reports the host's resulting HouseUpgradeLevel, so a test can pin "the host farmhouse can't be
-/// upgraded" (it must stay 0).
+/// Body for POST /test/lightning_strike. Names the crop tile to strike (terrain
+/// HoeDirt, or a Garden Pot's inner dirt).
 /// </summary>
-public class TestHouseUpgradeResponse
+public class TestLightningStrikeRequest
+{
+    public string? LocationName { get; set; }
+    public int TileX { get; set; }
+    public int TileY { get; set; }
+}
+
+/// <summary>
+/// Response from POST /test/lightning_strike (test-only). Runs vanilla's lightning
+/// crop-strike (HoeDirt.performToolAction with lightning damage) on a chosen tile,
+/// inside the CropSaver lightning context — a deterministic stand-in for the
+/// RNG-gated Utility.performLightningUpdate.
+/// </summary>
+public class TestLightningStrikeResponse
 {
     public bool Success { get; set; }
     public string? Error { get; set; }
 
-    /// <summary>The host farmer's HouseUpgradeLevel after the debug command ran (expected 0).</summary>
+    /// <summary>True if a crop was found at the requested (location, tile).</summary>
+    public bool Found { get; set; }
+
+    /// <summary>True if the crop is still alive after the strike (immunity suppressed the kill).</summary>
+    public bool CropAliveAfter { get; set; }
+
+    /// <summary>True if CropSaver still tracks the tile after the strike.</summary>
+    public bool IsManagedAfter { get; set; }
+}
+
+/// <summary>
+/// Response from POST /test/debug_command (test-only). Runs a vanilla debug command through
+/// parseDebugInput (so Harmony prefixes on the handlers, e.g. HostFarmhouseUpgradeGuard, are
+/// exercised) and reports host state a test pins afterwards.
+/// </summary>
+public class TestDebugCommandResponse
+{
+    public bool Success { get; set; }
+    public string? Error { get; set; }
+
+    /// <summary>The host farmer's HouseUpgradeLevel after the command ran (the upgrade guard keeps it 0).</summary>
     public int HostHouseUpgradeLevel { get; set; }
+
+    /// <summary>The host's location right after the command ran (a warp is still pending here).</summary>
+    public string HostLocation { get; set; } = "";
+}
+
+/// <summary>
+/// Response from POST /test/host_farmhouse_bed (test-only). Replaces every bed in the host
+/// farmhouse with the given bed item on the DefaultBedPosition tile.
+/// </summary>
+public class TestHostFarmhouseBedResponse
+{
+    public bool Success { get; set; }
+    public string? Error { get; set; }
+
+    /// <summary>Whether <c>FarmHouse.GetPlayerBed()</c> finds a bed afterwards.</summary>
+    public bool FarmHouseHasPlayerBed { get; set; }
+
+    /// <summary>Furniture count in the host farmhouse afterwards.</summary>
+    public int FarmHouseFurnitureCount { get; set; }
 }
 
 /// <summary>
@@ -183,6 +263,18 @@ public class TestFestivalStateResponse
 
     /// <summary>Current in-game time (HHMM). Jumps to the festival's reset cutoff once it ends.</summary>
     public int TimeOfDay { get; set; }
+
+    public int LuauIridiumStarfruitCount { get; set; }
+}
+
+/// <summary>Response from POST /test/host_menu (test-only). Reports whether a host menu is open.</summary>
+public class TestHostMenuResponse
+{
+    public bool Success { get; set; }
+    public string? Error { get; set; }
+
+    /// <summary>Whether a host menu is open after the requested operation.</summary>
+    public bool MenuOpen { get; set; }
 }
 
 /// <summary>
@@ -206,6 +298,38 @@ public class TestStampClaimResponse
 
     /// <summary>The slot's homeLocation after stamping (must resolve to a Cabin for the homed-path test).</summary>
     public string HomeLocation { get; set; } = "";
+
+    /// <summary>Whether a synthetic ownership record was also written (<c>?withOwner=true</c>),
+    /// so sweep tests can prove the heal clears the map alongside the stamp.</summary>
+    public bool StampedOwner { get; set; }
+}
+
+/// <summary>
+/// Response from POST /test/break_cabin_link (test-only). Nulls a cabin's farmhandReference to
+/// manufacture the one-way farmhand↔cabin link the join-time repair heals — or, with
+/// <c>?redirectHomeToOwner</c>, points the farmhand's home at another player's cabin to produce the
+/// unrecoverable shape the repair must decline.
+/// </summary>
+public class TestBreakCabinLinkResponse
+{
+    public bool Success { get; set; }
+    public string? Error { get; set; }
+
+    /// <summary>Interior name of the cabin whose farmhandReference back-link was nulled.</summary>
+    public string BrokenCabinName { get; set; } = "";
+
+    /// <summary>The farmhand's homeLocation after the break (still resolves to a Cabin).</summary>
+    public string HomeLocation { get; set; } = "";
+
+    /// <summary>True when the farmhand's home was repointed at another player's cabin (decline case).</summary>
+    public bool Redirected { get; set; }
+
+    /// <summary>
+    /// UniqueMultiplayerID of the spurious unclaimed placeholder installed as the home cabin's
+    /// owner (makeHomeOwnerPlaceholder mode), or 0. The join-time repair must DELETE this
+    /// placeholder while re-homing the owner — a caller asserts it is gone from farmhandData.
+    /// </summary>
+    public long PlaceholderOwnerId { get; set; }
 }
 
 /// <summary>
@@ -352,6 +476,23 @@ public class TestForceSaveResponse
     public string SaveFolderName { get; set; } = "";
 }
 
+/// <summary>Response from POST /test/fail_next_newgame (test-only).</summary>
+public class TestFailNextNewGameResponse
+{
+    public bool Success { get; set; }
+    public string? Error { get; set; }
+}
+
+/// <summary>Response from POST /test/set_ip_connections (test-only).</summary>
+public class TestSetIpConnectionsResponse
+{
+    public bool Success { get; set; }
+    public string? Error { get; set; }
+
+    /// <summary>The applied state of Game1.options.ipConnectionsEnabled.</summary>
+    public bool Enabled { get; set; }
+}
+
 /// <summary>
 /// Body for POST /test/import_save (test-only). Clones a source save folder under a new name, then
 /// runs saves-import on the clone (ExecuteImport rejects importing the active save, so the clone is
@@ -410,11 +551,21 @@ public class TestWeddingStateResponse
     /// Stuck-true after a wedding = the host never warped off the ceremony location.</summary>
     public bool HostLocationIsTemporary { get; set; }
 
-    /// <summary>The host's current location name. After the day's last wedding the host must be returned
-    /// to its FarmHouse idle spot — not left standing on the open Farm map where the wedding exit warp
-    /// drops it (the exit targets getHomeOfFarmer(Game1.player)'s porch). Lets a test assert the host
-    /// ended at home rather than just "not on a temporary map".</summary>
+    /// <summary>The host's current location name. After the day's last wedding the host must end parked
+    /// on the Farm — its standard park spot (HideHostActivity warps it there on every day start), which
+    /// the wedding automation re-establishes after the exit warp drops the host at the farmhouse-porch
+    /// tile. Lets a test assert the host ended parked rather than just "not on a temporary map".</summary>
     public string? HostCurrentLocation { get; set; }
+
+    /// <summary>The host's current tile — diagnostics for a failed park assertion.</summary>
+    public int HostTileX { get; set; }
+    public int HostTileY { get; set; }
+
+    /// <summary>True when the host stands exactly on the Farm default warp tile (the canonical park
+    /// spot). The vanilla wedding exit warp also lands on the Farm — at the farmhouse porch — so this,
+    /// not <see cref="HostCurrentLocation"/>, is the signal that the post-wedding park normalization
+    /// actually ran.</summary>
+    public bool HostAtFarmParkSpot { get; set; }
 }
 
 /// <summary>Body for POST /test/console (test-only): a console command name + args to invoke.</summary>
@@ -516,4 +667,105 @@ public class TestImportSaveResponse
 
     /// <summary>SHA-256 (base64) of the target main file after import.</summary>
     public string PostImportMainFileHash { get; set; } = "";
+}
+
+/// <summary>
+/// Which per-tick-physics entity to spawn/measure with the TPS-agnostic-pacing probe.
+/// </summary>
+public enum PacingProbeKind
+{
+    /// <summary>A <c>BasicProjectile</c> fired horizontally — measures <c>travelDistance</c> (the fix keeps
+    /// wall-clock travel speed constant across TPS).</summary>
+    Projectile,
+
+    /// <summary>An object <c>Debris</c> drop — measures how many chunks have come to rest (the fix keeps the
+    /// settle time wall-clock-constant).</summary>
+    Debris,
+
+    /// <summary>A <c>Bat</c> monster — measures its net displacement toward the host (the fix keeps the
+    /// velocity-ramp/turn rate wall-clock-constant so it closes distance at the same speed at any TPS).</summary>
+    Monster,
+
+    /// <summary>A walking monster (<c>GreenSlime</c>) given a fixed knockback impulse via
+    /// <c>setTrajectory</c> — measures how far the knockback carries it before friction stops it (the fix
+    /// makes the per-call velocity-friction decay run once per tick, so knockback distance is
+    /// wall-clock-constant instead of collapsing under the sub-step at low TPS).</summary>
+    Knockback,
+}
+
+/// <summary>Request body for POST /test/pacing_probe_spawn.</summary>
+public class PacingProbeSpawnRequest
+{
+    /// <summary>"projectile", "debris", "monster", or "knockback" (case-insensitive).</summary>
+    public string? Kind { get; set; }
+}
+
+/// <summary>Response for POST /test/pacing_probe_spawn.</summary>
+public class PacingProbeSpawnResponse
+{
+    public bool Success { get; set; }
+    public string? Error { get; set; }
+
+    /// <summary>The host location the probe entity was spawned in (for the test's log context).</summary>
+    public string? LocationName { get; set; }
+
+    /// <summary>Number of probe entities of this kind now present (should be 1 after a clean spawn).</summary>
+    public int Count { get; set; }
+}
+
+/// <summary>Response for GET /test/pacing_probe_state. Only the field(s) relevant to the spawned kind are meaningful.</summary>
+public class PacingProbeStateResponse
+{
+    public bool Success { get; set; }
+    public string? Error { get; set; }
+
+    /// <summary>Number of probe entities of the requested kind still present.</summary>
+    public int Count { get; set; }
+
+    /// <summary>
+    /// <c>Game1.ticks</c> at the moment the state was read (same game-thread action as the entity
+    /// fields, so the pair is atomic). Two reads give a tick-denominated rate — e.g. px/tick =
+    /// Δ<see cref="ProjectileTravelDistance"/>/Δticks — immune to HTTP/scheduler wall-clock jitter.
+    /// </summary>
+    public int ServerTicks { get; set; }
+
+    /// <summary>Projectile: accumulated <c>travelDistance</c> in pixels (monotonic per update). 0 if gone.</summary>
+    public float ProjectileTravelDistance { get; set; }
+
+    /// <summary>Debris: number of chunks that have finished their ballistic fall (bounces &gt; 2).</summary>
+    public int DebrisChunksAtRest { get; set; }
+
+    /// <summary>Debris: total chunk count of the probe debris.</summary>
+    public int DebrisChunkCount { get; set; }
+
+    /// <summary>Monster: net pixel displacement from the spawn position (how far it has travelled/homed).</summary>
+    public float MonsterDisplacement { get; set; }
+
+    /// <summary>Monster: current speed magnitude (sqrt(xVel²+yVel²)) — the velocity-ramp signal.</summary>
+    public float MonsterSpeed { get; set; }
+}
+
+/// <summary>Request body for POST /test/precustomize_farmhand.</summary>
+public class TestPrecustomizeFarmhandRequest
+{
+    /// <summary>Farmhand names to pre-customize; each consumes one available cabin slot.</summary>
+    public List<string>? Names { get; set; }
+}
+
+/// <summary>One slot pre-customized by POST /test/precustomize_farmhand.</summary>
+public class TestPrecustomizedFarmhand
+{
+    public long Uid { get; set; }
+    public string Name { get; set; } = "";
+    public string HomeLocation { get; set; } = "";
+}
+
+/// <summary>Response for POST /test/precustomize_farmhand.</summary>
+public class TestPrecustomizeFarmhandResponse
+{
+    public bool Success { get; set; }
+    public string? Error { get; set; }
+
+    /// <summary>Slots customized, in request order; on failure, the ones completed before the error.</summary>
+    public List<TestPrecustomizedFarmhand> Farmhands { get; set; } = new();
 }

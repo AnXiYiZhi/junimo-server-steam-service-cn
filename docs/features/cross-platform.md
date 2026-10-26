@@ -4,14 +4,9 @@ Steam and GOG players can connect to the same server.
 
 ## How It Works
 
-The server generates two invite codes:
+One invite code serves both platforms. It starts with "S" (e.g., `S1234567890ABC`): a Steam client joins it through the Steam relay, a GOG client reads the same code as its Galaxy lobby and joins through Galaxy P2P.
 
-| Platform | Code Format | Connection Method |
-|----------|-------------|-------------------|
-| Steam | Starts with "S" (e.g., `S123456789`) | Steam Datagram Relay |
-| GOG | Starts with "G" (e.g., `G1234567890ABCDEF`) | Galaxy P2P |
-
-Share the appropriate code with each player based on their platform. When both are available, Steam is recommended for better reliability.
+The code appears a few seconds after the server starts, as soon as the Galaxy lobby exists; GOG players can join it right away, and Steam players a moment later, once the Steam relay is ready. The status page, the Discord bot, and the in-game `!invitecode` command show the code with its [connection status](/admins/operations/public-status#invite-code-status), for example `GOG ready · Steam connecting…` in that window.
 
 ## Connection Reliability
 
@@ -22,7 +17,7 @@ Share the appropriate code with each player based on their platform. When both a
 
 Steam connections are more reliable because Valve's relay handles NAT traversal. GOG uses peer-to-peer which can fail with certain router configurations.
 
-## Getting Invite Codes
+## Getting the Invite Code
 
 ```sh
 docker compose exec server attach-cli

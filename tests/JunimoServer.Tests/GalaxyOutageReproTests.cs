@@ -71,14 +71,14 @@ public class GalaxyOutageReproTests : TestBase
     [Fact]
     public async Task TotalConnectivityLoss_RecordsGalaxyReauthSignal()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
 
         // ── Configurable outage dwell. This is timing margin held AFTER steam_session_lost is
         // already gate-confirmed below — it lets the Galaxy lobby genuinely drop before restore,
         // so recovery exercises a dead-lobby re-login rather than a too-fast flap. Override without
-        // a rebuild via SDVD_OUTAGE_DWELL_MS (verify-documented-config-is-consumed.md).
+        // a rebuild via SDVD_OUTAGE_DWELL_MS.
         var dwell = TimeSpan.FromMilliseconds(
-            int.TryParse(TestEnvLoader.Get("SDVD_OUTAGE_DWELL_MS"), out var ms) ? ms : 10_000
+            int.TryParse(TestEnvLoader.Get("SDVD_OUTAGE_DWELL_MS"), out var ms) ? ms : 30_000
         );
         // Steam reconnect after a full outage can take minutes; bound it generously.
         var reconnectBudget = TimeSpan.FromMinutes(5);
@@ -94,17 +94,23 @@ public class GalaxyOutageReproTests : TestBase
         var inviteCode = InviteCode;
         Log($"Steam client connected; invite code = {inviteCode}");
 
-        // ── 2. Suspend the health watchdog and capture the network id (the inspect
-        // can't find it once the container is detached), then cut the network.
+        // ── 2. Capture the network id (the inspect can't find it once the container is
+        // detached), suspend both poison paths (watchdog + log-error scan — the cut makes
+        // SMAPI log expected Steam/Galaxy ERRORs), then cut the network.
         var managed = Lease.Managed;
         var networkId = await NetworkOutageHelper.GetAttachedNetworkIdAsync(Lease, ct);
-        managed.SuspendHealthChecks();
-        Log($"Health checks suspended; cutting network {networkId[..12]}…");
+        Assert.False(
+            string.IsNullOrEmpty(networkId),
+            "Expected the server container to be attached to a network before the cut — a null id "
+                + "means the container was already gone, so the outage setup is invalid."
+        );
+        managed.SuspendHealthChecks(includeLogErrorScan: true);
+        Log($"Health checks suspended; cutting network {networkId![..12]}…");
         // Anchor every post-cut event wait to this instant so the server's own initial-boot
         // emissions (a first steam_session_connected, the pre-outage auth_steam_lobby_created)
         // can never satisfy an outage-recovery wait.
         var outageStart = DateTime.UtcNow;
-        await NetworkOutageHelper.DisconnectAsync(Lease, ct);
+        await NetworkOutageHelper.DisconnectAsync(Lease, networkId!, ct);
 
         try
         {
@@ -150,8 +156,16 @@ public class GalaxyOutageReproTests : TestBase
             // the API anyway — the verdict and the Steam-recovery check both read the
             // stdout-backed infrastructure.jsonl, which DOES flow once connectivity is back.
             using var restoreCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-            await NetworkOutageHelper.ReconnectAsync(Lease, networkId, restoreCts.Token);
-            Log("Network reconnected (health checks stay suspended; API unreachable on remote).");
+            var reconnected = await NetworkOutageHelper.ReconnectAsync(
+                Lease,
+                networkId!,
+                restoreCts.Token
+            );
+            Log(
+                reconnected
+                    ? "Network reconnected (health checks stay suspended; API unreachable on remote)."
+                    : "Network restore skipped — the container is already gone, nothing to reconnect."
+            );
         }
 
         // ── 6. Steam side must recover (the shipped #391 behavior). Harness invariant —
@@ -236,9 +250,10 @@ public class GalaxyOutageReproTests : TestBase
         // is suspended and, on remote Docker hosts, the daemon never restores the published-port
         // forwarding the API tunnel needs — so a later test reusing this shared server would hit a
         // ServerReady timeout. Poisoning removes it from the pool; the broker boots a fresh one for the
-        // next demand (the freed Steam account allows it, sequentially). Done last, after all asserts:
-        // PoisonServer cancels the ErrorToken, but the client is already disconnected and no client op
-        // remains, so the passed verdict stands. Mirrors TestLifecycle.PoisonOnCleanupFailureIfNeeded.
+        // next demand (the freed Steam account allows it, sequentially). Done last, after all asserts,
+        // so the passed verdict stands. PoisonServer cancels the server's error token, but the
+        // client work left in cleanup runs on its own timeout, so the healthy Steam client goes
+        // back to the pool instead of being marked dead. Mirrors PoisonOnCleanupFailureIfNeeded.
         Lease!.Managed.PoisonServer(
             "Total connectivity loss left the server's API unreachable (suspended watchdog + unrestored port-forward)",
             ManagedServer.PoisonReasonCode.TestRetiredServer
@@ -259,7 +274,7 @@ public class GalaxyOutageReproTests : TestBase
     [Fact]
     public async Task GalaxyReloginGate_WhileHealthy_SkipsAndKeepsClientConnected()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         var serverSlug = $"server-{Lease!.Managed.Server.ServerIndex}";
 
         // Fully join a client (with auth), so there's a live Galaxy lobby the gate must protect.

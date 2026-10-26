@@ -41,10 +41,7 @@ public class SteamAppIdTests : TestBase
     public async Task Server_HasCorrectSteamAppId()
     {
         // Get container logs. Use a timeout since GetLogsAsync can hang on disposed containers.
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(
-            TestContext.Current.CancellationToken
-        );
-        cts.CancelAfter(TimeSpan.FromSeconds(30));
+        using var cts = Cts.LinkedTimeout(TestCt, TimeSpan.FromSeconds(30));
         var logs = await Server.Container.GetLogsAsync(ct: cts.Token);
         var combinedLogs = (logs.Stdout ?? "") + (logs.Stderr ?? "");
 
@@ -114,10 +111,7 @@ public class SteamAppIdTests : TestBase
             WaitName.Polling_SteamAppId_SdrStatusLine,
             async () =>
             {
-                using var cts = CancellationTokenSource.CreateLinkedTokenSource(
-                    TestContext.Current.CancellationToken
-                );
-                cts.CancelAfter(TimeSpan.FromSeconds(10));
+                using var cts = Cts.LinkedTimeout(TestCt, TimeSpan.FromSeconds(10));
                 var logs = await Server.Container.GetLogsAsync(ct: cts.Token);
                 var combinedLogs = (logs.Stdout ?? "") + (logs.Stderr ?? "");
 
@@ -132,7 +126,10 @@ public class SteamAppIdTests : TestBase
                 return false;
             },
             TimeSpan.FromSeconds(30),
-            cancellationToken: TestContext.Current.CancellationToken
+            cancellationToken: TestCt,
+            // A hung GetLogsAsync trips the 10s per-request timeout; retry it against the
+            // outer budget instead of letting that child cancellation end the whole poll.
+            isRetryable: ex => ex is OperationCanceledException
         );
 
         Assert.True(found, "SDR relay status line should appear in server logs");

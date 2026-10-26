@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using JunimoServer.Tests.Clients;
 using JunimoServer.Tests.Schema.Events;
 
@@ -164,6 +165,26 @@ public class ConnectionHelper
     /// </summary>
     public Func<string, Task>? OnCheckpointScreenshot { get; set; }
 
+    /// <summary>
+    /// Optional per-server join gate, set by the caller from <c>ManagedServer</c>.
+    /// <see cref="JoinWorldCoreAsync"/> holds it from just before each connect attempt until the server
+    /// APPROVES the join, then releases so the creation/world-ready tail overlaps the next queued join
+    /// instead of serializing the whole join. The gate exists to serialize the pre-approval same-slot /
+    /// farmhand-deletion races; those are resolved by approval, which is signalled per slot type:
+    /// <list type="bullet">
+    /// <item>uncustomized — the character-customization menu, which the client opens only from
+    /// receiveServerIntroduction → setUpGame (Client.cs:280,226-228), sent only after
+    /// checkFarmhandRequest assigned the home and added the player (GameServer.cs:567,577,602 — both
+    /// strictly precede the send), so the slot is committed out of a concurrent joiner's pool by then;</item>
+    /// <item>already-customized — world-ready.</item>
+    /// </list>
+    /// Both null (the connect-only paths) means no gating.
+    /// </summary>
+    public Func<CancellationToken, Task>? AcquireJoinGate { get; set; }
+
+    /// <summary>Releases the gate acquired by <see cref="AcquireJoinGate"/>.</summary>
+    public Action? ReleaseJoinGate { get; set; }
+
     public ConnectionHelper(
         GameTestClient gameClient,
         ConnectionOptions? options = null,
@@ -241,17 +262,17 @@ public class ConnectionHelper
 
             if (attempt > 1)
             {
-                Log("[Connect] Returning to title for retry...");
+                Log("[Connect] Returning to title for retry");
                 await EnsureDisconnectedAsync();
                 await Task.Delay(TestTimings.RetryPauseDelay, cancellationToken);
 
                 // Re-fetch invite code in case server regenerated it after connection loss
                 if (_serverApi != null)
                 {
-                    var freshCode = await _serverApi.GetInviteCode();
-                    if (!string.IsNullOrEmpty(freshCode?.InviteCode))
+                    var freshCode = (await _serverApi.GetStatus())?.InviteCode;
+                    if (!string.IsNullOrEmpty(freshCode))
                     {
-                        inviteCode = freshCode.InviteCode;
+                        inviteCode = freshCode;
                     }
                 }
             }
@@ -286,7 +307,8 @@ public class ConnectionHelper
         CancellationToken cancellationToken
     )
     {
-        Log($"[Connect] Attempt {attempt}/{maxAttempts} - connecting via invite code...");
+        var connectTimer = Stopwatch.StartNew();
+        Log($"[Connect] Attempt {attempt}/{maxAttempts}: connecting via invite code");
 
         try
         {
@@ -377,7 +399,19 @@ public class ConnectionHelper
                 return ConnectionResult.Failed("Load farmhand slots: timeout", attempt);
             }
 
-            Log($"Connected ({farmhands.Farmhands.Count} slots, attempt {attempt}/{maxAttempts})");
+            Log(
+                $"[Connect] Connected ({farmhands.Farmhands.Count} slots, attempt {attempt}/{maxAttempts})"
+            );
+            EmitDiagnostic(
+                "connect_phase_completed",
+                new
+                {
+                    attempt,
+                    transport = "invite",
+                    slotCount = farmhands.Farmhands.Count,
+                    elapsedMs = connectTimer.ElapsedMilliseconds,
+                }
+            );
             await CaptureCheckpointIfEnabled("after_connect");
             return ConnectionResult.Succeeded(attempt, farmhands);
         }
@@ -418,7 +452,7 @@ public class ConnectionHelper
 
             if (attempt > 1)
             {
-                Log("[Connect] Returning to title for retry...");
+                Log("[Connect] Returning to title for retry");
                 await EnsureDisconnectedAsync();
                 await Task.Delay(TestTimings.RetryPauseDelay, cancellationToken);
             }
@@ -455,8 +489,9 @@ public class ConnectionHelper
         CancellationToken cancellationToken
     )
     {
+        var connectTimer = Stopwatch.StartNew();
         var fullAddress = port == 24642 ? address : $"{address}:{port}";
-        Log($"[Connect] Attempt {attempt}/{maxAttempts} - connecting via LAN to {fullAddress}...");
+        Log($"[Connect] Attempt {attempt}/{maxAttempts}: connecting via LAN to {fullAddress}");
 
         try
         {
@@ -497,7 +532,17 @@ public class ConnectionHelper
             }
 
             Log(
-                $"Connected via LAN ({farmhands.Farmhands.Count} slots, attempt {attempt}/{maxAttempts})"
+                $"[Connect] Connected via LAN ({farmhands.Farmhands.Count} slots, attempt {attempt}/{maxAttempts})"
+            );
+            EmitDiagnostic(
+                "connect_phase_completed",
+                new
+                {
+                    attempt,
+                    transport = "lan",
+                    slotCount = farmhands.Farmhands.Count,
+                    elapsedMs = connectTimer.ElapsedMilliseconds,
+                }
             );
             await CaptureCheckpointIfEnabled("after_connect");
             return ConnectionResult.Succeeded(attempt, farmhands);
@@ -547,10 +592,10 @@ public class ConnectionHelper
             {
                 if (_serverApi != null)
                 {
-                    var freshCode = await _serverApi.GetInviteCode();
-                    if (!string.IsNullOrEmpty(freshCode?.InviteCode))
+                    var freshCode = (await _serverApi.GetStatus())?.InviteCode;
+                    if (!string.IsNullOrEmpty(freshCode))
                     {
-                        currentInviteCode = freshCode.InviteCode;
+                        currentInviteCode = freshCode;
                     }
                 }
             },
@@ -586,6 +631,44 @@ public class ConnectionHelper
     }
 
     /// <summary>
+    /// Holds at most one per-server join-gate token, releasing it exactly once. Makes the early
+    /// (approval) release and the safety-net (finally) release idempotent, so no path double-releases
+    /// the gate or leaks a token across a retry.
+    /// </summary>
+    private sealed class JoinGateHolder
+    {
+        private readonly Func<CancellationToken, Task>? _acquire;
+        private readonly Action? _release;
+        private bool _held;
+
+        public JoinGateHolder(Func<CancellationToken, Task>? acquire, Action? release)
+        {
+            _acquire = acquire;
+            _release = release;
+        }
+
+        public async Task AcquireAsync(CancellationToken ct)
+        {
+            if (_acquire == null || _held)
+            {
+                return;
+            }
+            await _acquire(ct);
+            _held = true;
+        }
+
+        public void Release()
+        {
+            if (!_held)
+            {
+                return;
+            }
+            _held = false;
+            _release?.Invoke();
+        }
+    }
+
+    /// <summary>
     /// Shared implementation for JoinWorldAsync and JoinWorldViaLanAsync.
     /// Owns the single retry loop. connectOnceAsync performs one attempt with no internal retries.
     /// </summary>
@@ -612,8 +695,17 @@ public class ConnectionHelper
                 new { attempt, maxAttempts = _options.MaxAttempts }
             );
 
+            // One hold per attempt, released early at approval; the finally is the safety net. See
+            // AcquireJoinGate.
+            var gate = new JoinGateHolder(AcquireJoinGate, ReleaseJoinGate);
+
             try
             {
+                await gate.AcquireAsync(cancellationToken);
+
+                // Full-join timer (connect entry → world-ready) for world_ready_completed; per attempt.
+                var joinTimer = Stopwatch.StartNew();
+
                 // Connect to server (single attempt; this method owns the retry loop)
                 var connectResult = await connectOnceAsync(
                     attempt,
@@ -656,7 +748,8 @@ public class ConnectionHelper
                 }
                 else
                 {
-                    // Complete the join (slot selection, character creation, auto-login)
+                    // Complete the join (slot selection, character creation, auto-login). gate.Release
+                    // fires at the approval point (see AcquireJoinGate).
                     var (joinResult, completeError) = await CompleteJoinAsync(
                         connectResult.Farmhands,
                         farmerName,
@@ -664,6 +757,8 @@ public class ConnectionHelper
                         preferExistingFarmer,
                         skipAutoLogin,
                         attempt,
+                        joinTimer,
+                        gate.Release,
                         cancellationToken
                     );
 
@@ -711,6 +806,11 @@ public class ConnectionHelper
                     );
                 }
             }
+            finally
+            {
+                // Safety net: releases on any path that didn't reach the approval point. Idempotent.
+                gate.Release();
+            }
 
             // Return to title before retry
             EmitDiagnostic("join_retry_cleanup_started", new { attempt });
@@ -730,7 +830,7 @@ public class ConnectionHelper
             }
             catch (Exception ex)
             {
-                Log($"[Retry] Disconnect before retry failed: {ex.Message}");
+                Log($"[Join] Disconnect before retry failed: {ex.Message}");
             }
             finally
             {
@@ -754,6 +854,8 @@ public class ConnectionHelper
     /// <summary>
     /// Handles the post-connection join flow: slot selection, character creation, and auto-login.
     /// Returns (result, null) on success, or (null, error) if the attempt should be retried.
+    /// <paramref name="releaseGate"/> is the idempotent join-gate release, called at the approval point
+    /// (see <see cref="AcquireJoinGate"/>).
     /// </summary>
     private async Task<(JoinWorldResult? Result, string? Error)> CompleteJoinAsync(
         FarmhandsResponse farmhands,
@@ -762,6 +864,8 @@ public class ConnectionHelper
         bool preferExistingFarmer,
         bool skipAutoLogin,
         int attempt,
+        Stopwatch joinTimer,
+        Action releaseGate,
         CancellationToken cancellationToken
     )
     {
@@ -789,11 +893,13 @@ public class ConnectionHelper
         // We detect this and re-select the slot.
         if (!targetSlot.IsCustomized)
         {
+            // Releases the gate at the character-menu approval point; holds it across bounce re-selects.
             var (characterCreated, charError) = await SelectSlotAndCreateCharacterAsync(
                 targetSlot,
                 farmerName,
                 favoriteThing,
                 preferExistingFarmer,
+                releaseGate,
                 cancellationToken
             );
             if (!characterCreated)
@@ -816,6 +922,20 @@ public class ConnectionHelper
         {
             return (null, $"Wait for world ready: {worldWait?.Error ?? "timeout"}");
         }
+
+        // Customized slots have no character-menu signal — release at world-ready instead. Idempotent
+        // no-op for the uncustomized path (already released at the menu).
+        releaseGate();
+
+        EmitDiagnostic(
+            "world_ready_completed",
+            new
+            {
+                slotIndex = selectedSlotIndex,
+                wasCustomizedFastPath = targetSlot.IsCustomized,
+                elapsedMs = joinTimer.ElapsedMilliseconds,
+            }
+        );
 
         await CaptureCheckpointIfEnabled("after_join");
 
@@ -870,7 +990,7 @@ public class ConnectionHelper
                     if (loginAttempt > 1)
                     {
                         Log(
-                            $"[Auth] Retrying !login (attempt {loginAttempt}/{TestTimings.AuthLoginMaxAttempts})..."
+                            $"[Auth] Retrying !login (attempt {loginAttempt}/{TestTimings.AuthLoginMaxAttempts})"
                         );
                     }
 
@@ -884,9 +1004,7 @@ public class ConnectionHelper
                         continue;
                     }
 
-                    Log(
-                        "[Auth] Waiting for post-auth warp (location change to different cabin)..."
-                    );
+                    Log("[Auth] Waiting for post-auth warp (location change to different cabin)");
                     wasAuthenticated = await _gameClient.WaitForAuthWarpAsync(
                         preAuthLocation!,
                         ct: cancellationToken
@@ -900,7 +1018,7 @@ public class ConnectionHelper
                     }
 
                     Log(
-                        $"[Auth] Auth not confirmed within {TestTimings.AuthLoginAttemptTimeout.TotalSeconds}s"
+                        $"[Auth] Not confirmed within {TestTimings.AuthLoginAttemptTimeout.TotalSeconds}s"
                     );
                 }
 
@@ -991,7 +1109,7 @@ public class ConnectionHelper
 
         var authStatus = wasAuthenticated ? ", authenticated" : (wasInLobby ? ", in lobby" : "");
         Log(
-            $"Joined world as '{farmerName}' (uid={uid}){authStatus} (attempt {attempt}/{_options.MaxAttempts})"
+            $"[Join] Joined world as '{farmerName}' (uid={uid}){authStatus} (attempt {attempt}/{_options.MaxAttempts})"
         );
         return (
             JoinWorldResult.Succeeded(
@@ -1046,6 +1164,7 @@ public class ConnectionHelper
         string farmerName,
         string favoriteThing,
         bool preferExistingFarmer,
+        Action releaseGate,
         CancellationToken cancellationToken
     )
     {
@@ -1061,7 +1180,7 @@ public class ConnectionHelper
             if (bounce > 0)
             {
                 Log(
-                    $"[Join] Server bounced back to farmhand selection (attempt {bounce}/{maxBounceRetries}), re-selecting slot..."
+                    $"[Join] Bounce {bounce}/{maxBounceRetries}: server bounced back to farmhand selection, re-selecting slot"
                 );
             }
 
@@ -1163,6 +1282,9 @@ public class ConnectionHelper
                                     bounce,
                                 }
                             );
+                            // Uncustomized approval point — slot is committed, safe to release (see
+                            // AcquireJoinGate). Only this terminal branch releases; the bounce path doesn't.
+                            releaseGate();
                         }
                         else if (result.Condition == "farmhand-menu")
                         {

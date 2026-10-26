@@ -748,7 +748,7 @@ internal sealed class ContainerRecorder : IAsyncDisposable
         // flushes segments.csv (its documented post-condition — "all segments finalized on disk, ready for
         // clip extraction"), so a clip whose window touched the former active segment still finds it as a
         // finalized covering segment. Accepting Stopped matters because the deferred per-test clip extract
-        // (EnqueueBackgroundTask, runs immediately) can RACE the backgrounded server disposal's StopAsync;
+        // (EnqueueBackgroundRecordingTask, runs immediately) can RACE the backgrounded server disposal's StopAsync;
         // if the stop wins, the clip must still extract off the finalized segments. NotStarted/Failed have
         // no usable segments.
         if (_state != RecorderState.Recording && _state != RecorderState.Stopped)
@@ -788,12 +788,11 @@ internal sealed class ContainerRecorder : IAsyncDisposable
             return new ExtractionResult(null, null);
         }
 
-        using var extractCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         // Budget scales with clip duration to cover pathological cases where concat-copy of
         // a large cover set is slow. max(30s, 5×durationSec) holds a 30s floor for short
         // clips and ~6 minutes for a 75s clip.
         var budgetSec = Math.Max(30.0, durationSec * 5.0);
-        extractCts.CancelAfter(TimeSpan.FromSeconds(budgetSec));
+        using var extractCts = Cts.LinkedTimeout(ct, TimeSpan.FromSeconds(budgetSec));
 
         var id = Guid.NewGuid().ToString("N")[..8];
         var clipName = $"clip_{id}.mp4";

@@ -14,6 +14,12 @@ public class ServerCommand
     private static IMonitor _monitor;
     private static DateTime _startTimeUtc;
 
+    /// <summary>
+    /// UTC time the mod started (set in <see cref="Register"/>), or null if not yet registered.
+    /// Exposed so the HTTP API can report uptime, not just the <c>info</c> command.
+    /// </summary>
+    public static DateTime? StartTimeUtc => _startTimeUtc == default ? null : _startTimeUtc;
+
     public static void Register(
         IModHelper helper,
         IMonitor monitor,
@@ -40,7 +46,7 @@ public class ServerCommand
                 var farmName = Game1.player?.farmName.Value ?? "Unknown";
                 var playerCount = Game1.server?.connectionsCount ?? 0;
                 var maxPlayers = Game1.netWorldState.Value?.CurrentPlayerLimit ?? 4;
-                var inviteCode = Game1.server.getInviteCode() ?? "N/A";
+                var inviteCode = InviteCodes.Describe();
                 var uptime = DateTime.UtcNow - _startTimeUtc;
                 var season = Game1.currentSeason ?? "unknown";
 
@@ -70,7 +76,11 @@ public class ServerCommand
             }
         );
 
-        helper.ConsoleCommands.Add("info", "Displays server information.", ServerConsoleCommand);
+        helper.ConsoleCommands.Register(
+            "info",
+            "Displays server information.",
+            ServerConsoleCommand
+        );
     }
 
     private static string FormatUptime(TimeSpan uptime)
@@ -106,7 +116,7 @@ public class ServerCommand
     {
         if (Game1.server == null)
         {
-            _monitor.Log("Server is not running.", LogLevel.Error);
+            _monitor.Log("Server is not running.", LogLevel.Warn);
             return;
         }
 
@@ -115,7 +125,7 @@ public class ServerCommand
         var farmName = Game1.player?.farmName.Value ?? "Unknown";
         var playerCount = Game1.server?.connectionsCount ?? 0;
         var maxPlayers = Game1.netWorldState.Value?.CurrentPlayerLimit ?? 4;
-        var inviteCode = Game1.server.getInviteCode() ?? "N/A";
+        var inviteCode = InviteCodes.Describe();
         var uptime = DateTime.UtcNow - _startTimeUtc;
         var season = Game1.currentSeason ?? "unknown";
 

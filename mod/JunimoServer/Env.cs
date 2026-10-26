@@ -21,18 +21,42 @@ internal class Env
 
     public static readonly bool EnableModIncompatibleOptimizations = ParseBool(
         "ENABLE_MOD_INCOMPATIBLE_OPTIMIZATIONS",
-        false
+        true
     );
 
     public static readonly int HealthCheckSeconds = ParseInt("HEALTH_CHECK_SECONDS", 300);
 
+    /// <summary>
+    /// Wall-clock seconds an empty server waits past 1:00 AM in-game before the host sleeps
+    /// and closes the day. Long enough for a dropped player to reconnect to the time they
+    /// left; short enough that the next player arrives at a fresh morning.
+    /// Default: 300
+    /// </summary>
+    public static readonly int AutoSleepGraceSeconds = Math.Max(
+        0,
+        ParseInt("AUTO_SLEEP_GRACE_SECONDS", 300)
+    );
+
     public static readonly bool ForceNewDebugGame = ParseBool("FORCE_NEW_DEBUG_GAME", false);
 
     /// <summary>
-    /// Target game ticks per second. Lower values reduce CPU usage.
-    /// Default: 60 (game default). Minimum: 1.
+    /// When true (default), crops tracked by CropSaver survive lightning strikes:
+    /// CropSaverOverrides.KillCrop_Prefix suppresses the strike's Crop.Kill. Set false
+    /// to restore vanilla lightning kills for managed crops (the killed crop's tracking
+    /// entry is dropped so the corpse doesn't stay managed).
     /// </summary>
-    public static readonly int ServerTps = Math.Max(1, ParseInt("SERVER_TPS", 60));
+    public static readonly bool CropSaverLightningImmunity = ParseBool(
+        "CROP_SAVER_LIGHTNING_IMMUNITY",
+        true
+    );
+
+    /// <summary>
+    /// Target game ticks per second. Lower values reduce CPU usage.
+    /// Default: 60 (game default). Clamped to [1, 60]: above vanilla's fixed 60 every per-tick-constant
+    /// gameplay path (movement, physics) runs faster than real time, and <c>TpsAgnosticPacing</c> can
+    /// only add sub-steps, never skip vanilla's own.
+    /// </summary>
+    public static readonly int ServerTps = Math.Clamp(ParseInt("SERVER_TPS", 60), 1, 60);
 
     /// <summary>
     /// Target frames per second for the server's draw loop.
@@ -56,6 +80,22 @@ internal class Env
     /// Default: 8080
     /// </summary>
     public static readonly int ApiPort = ParseInt("API_PORT", 8080);
+
+    /// <summary>
+    /// Display name of this deployment, exposed on /status for the Discord bot nickname and
+    /// the status widget. Distinct from the farm name (game-world state stored in the save) and
+    /// from SERVER_URL_NAME (the proxy routing key). Empty when unset.
+    /// </summary>
+    public static readonly string ServerName =
+        Environment.GetEnvironmentVariable("SERVER_NAME")?.Trim() ?? "";
+
+    /// <summary>
+    /// Pid file of the startup script's phase responder (see ApiPortHandoff). Set by the server
+    /// image, unset elsewhere.
+    /// </summary>
+    public static readonly string? ApiHandoffPidFile = Environment.GetEnvironmentVariable(
+        "API_HANDOFF_PID_FILE"
+    );
 
     /// <summary>
     /// Override verbose logging setting from environment.

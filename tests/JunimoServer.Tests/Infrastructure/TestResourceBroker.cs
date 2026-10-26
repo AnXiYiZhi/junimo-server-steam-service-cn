@@ -76,29 +76,37 @@ public sealed class TestResourceBroker : IAsyncDisposable
             );
     }
 
-    // Server.DisposeAsync tasks kicked off in the background by
-    // TryEvictIdleServerForAsync so the waiting test can proceed without
-    // blocking on Docker stop-grace + recording extraction. Also receives
-    // deferred per-test recording extraction (TestBase.DisposeAsync, "all"
+    // Deferred per-test recording extractions (TestBase.DisposeAsync, "all"
     // mode passing tests) so ffmpeg work doesn't sit on the test critical
-    // path. Drained in DisposeAsync via Task.WhenAll so the broker doesn't
-    // exit with orphan containers or pending extractions.
-    private readonly ConcurrentQueue<Task> _backgroundDisposeTasks = new();
+    // path. Drained in DisposeAsync bounded by RecordingDrainBudget —
+    // extraction is best-effort and must never wedge run finalization.
+    private readonly ConcurrentQueue<Task> _backgroundRecordingTasks = new();
+
+    // Server.DisposeAsync tasks kicked off in the background by
+    // TryEvictIdleServerForAsync, the sibling sweep in ReleaseAsync, and
+    // BackgroundDisposeServer so the waiting test can proceed without
+    // blocking on Docker stop-grace + recording extraction. Drained
+    // unbounded in DisposeAsync — each disposal is internally bounded by
+    // Docker stop-grace and must complete so the broker doesn't exit with
+    // orphan containers.
+    private readonly ConcurrentQueue<Task> _backgroundServerDisposalTasks = new();
 
     /// <summary>
-    /// Enqueues a background task whose completion is awaited during broker
-    /// disposal. Used by <see cref="TestBase"/> to defer non-critical work
-    /// (per-test recording clip extraction in "all" mode passing tests) off
-    /// the test's <c>DisposeAsync</c> critical path. Wrapped in
-    /// <see cref="ExecutionContext.SuppressFlow"/> so the deferred work
+    /// Enqueues a deferred recording extraction, drained in <see cref="DisposeAsync"/>
+    /// bounded by <see cref="TestTimings.RecordingDrainBudget"/> and failed fast on
+    /// abort via the extract-limiter cancel — best-effort only; work that must
+    /// complete does not belong on this queue. Used by
+    /// <see cref="Fixture.TestArtifactCollector"/> to defer per-test clip extraction
+    /// ("all" mode passing tests) off the test's <c>DisposeAsync</c> critical path.
+    /// Wrapped in <see cref="ExecutionContext.SuppressFlow"/> so the deferred work
     /// doesn't carry the deferring test's <c>TestContext.Current</c> across
     /// later events emitted from inside the work itself.
     /// </summary>
-    public void EnqueueBackgroundTask(Func<Task> work)
+    public void EnqueueBackgroundRecordingTask(Func<Task> work)
     {
         using (ExecutionContext.SuppressFlow())
         {
-            _backgroundDisposeTasks.Enqueue(
+            _backgroundRecordingTasks.Enqueue(
                 Task.Run(async () =>
                 {
                     try
@@ -110,6 +118,44 @@ public sealed class TestResourceBroker : IAsyncDisposable
                         InfrastructureEventLog.Emit(
                             "background_task_failed",
                             new { source = "broker_background", error = ex.Message }
+                        );
+                    }
+                })
+            );
+        }
+    }
+
+    /// <summary>
+    /// Enqueues <paramref name="server"/>'s disposal (Docker stop-grace +
+    /// recording extraction) on a background task, drained unbounded in
+    /// <see cref="DisposeAsync"/> so containers always stop cleanly. Callers
+    /// must have already handled pool removal and slot release. Wrapped in
+    /// <see cref="ExecutionContext.SuppressFlow"/> so the disposal doesn't
+    /// inherit the initiating test's <c>TestContext.Current</c> and
+    /// misattribute recording_extracted / server_dispose_* events
+    /// (see .claude/rules/asynclocal-pitfalls.md).
+    /// </summary>
+    private void EnqueueBackgroundServerDisposal(string serverKey, ManagedServer server)
+    {
+        using (ExecutionContext.SuppressFlow())
+        {
+            _backgroundServerDisposalTasks.Enqueue(
+                Task.Run(async () =>
+                {
+                    try
+                    {
+                        await server.DisposeAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        InfrastructureEventLog.Emit(
+                            "server_dispose_background_failed",
+                            new
+                            {
+                                server = serverKey,
+                                instanceId = server.InstanceId,
+                                error = ex.Message,
+                            }
                         );
                     }
                 })
@@ -172,6 +218,15 @@ public sealed class TestResourceBroker : IAsyncDisposable
     // each host serves a slice of STEAM_ACCOUNTS so SteamKit's single-session
     // rule isn't violated. Hosts that aren't Steam-capable have no entry.
     private readonly ConcurrentDictionary<string, SharedSteamAuth> _steamAuthByHost = new();
+
+    /// <summary>
+    /// The shared steam-auth sidecar serving <paramref name="host"/>, or null on a host that is
+    /// not Steam-capable. Tests that drive the sidecar's own endpoints (game validation) go
+    /// through here instead of starting a second sidecar, which could not log in: Steam allows
+    /// one live session per account and the shared one holds them all.
+    /// </summary>
+    internal SharedSteamAuth? TryGetSteamAuth(DockerHost host) =>
+        _steamAuthByHost.TryGetValue(host.Id, out var sa) ? sa : null;
 
     // Per-host Steam-account allocators, parallel to _steamAuthByHost. Each
     // allocator's index space is slice-local (0..k-1). The broker routes
@@ -393,14 +448,16 @@ public sealed class TestResourceBroker : IAsyncDisposable
             RunMetadata.WriteRunMetadata(demands, instancePlan);
             InfrastructureEventLog.Initialize();
 
-            // Ensure the child's infrastructure event log is drained on abnormal
+            // Ensure the child's infrastructure event log is flushed on abnormal
             // exit (ProcessExit / SIGHUP / second Ctrl+C). The parent registers
             // its own in TestRunner/Program.cs against its parent log; this is
             // the symmetric registration for the test child's canonical log.
+            // FlushAsync, not a drain — drain completes the channel and drops
+            // everything emitted after it. RunAll bounds the wait per sink.
             EmergencyCleanup.EnsureRegistered();
             EmergencyCleanup.RegisterDrainable(
                 "infrastructure-event-log",
-                () => new ValueTask(InfrastructureEventLog.DrainAsync(TimeSpan.FromSeconds(2)))
+                () => new ValueTask(InfrastructureEventLog.FlushAsync())
             );
 
             TestLog.Server($"Discovered {demands.Count} unique server config(s) for pre-start:");
@@ -1160,6 +1217,7 @@ public sealed class TestResourceBroker : IAsyncDisposable
                 // Verify the server is still valid, then claim it.
                 if (_servers.Contains(key, server) && !server.IsPoisoned)
                 {
+                    long exclusiveToken = 0;
                     if (requirements.Exclusive)
                     {
                         // Exclusive: acquire gate, add ref, hold gate until test finishes.
@@ -1167,7 +1225,7 @@ public sealed class TestResourceBroker : IAsyncDisposable
                         // Uses ReleaseAndReacquireAsync to atomically enqueue a reacquire
                         // waiter (int.MinValue priority) THEN release slots, so the drain
                         // serves us before other waiters that would block on our gate.
-                        await server.AddRefAndAcquireExclusiveAsync(
+                        exclusiveToken = await server.AddRefAndAcquireExclusiveAsync(
                             testName,
                             ct,
                             releaseAndReacquireCapacity: async () =>
@@ -1264,7 +1322,7 @@ public sealed class TestResourceBroker : IAsyncDisposable
                         server.Release();
                         if (requirements.Exclusive)
                         {
-                            server.ReleaseExclusive();
+                            server.ReleaseExclusive(exclusiveToken, testName);
                         }
 
                         TestLog.Test(
@@ -1279,6 +1337,9 @@ public sealed class TestResourceBroker : IAsyncDisposable
                     );
                     return TrackLease(
                         new ResourceLease(server, requirements, testName, clientPool)
+                        {
+                            ExclusiveToken = exclusiveToken,
+                        }
                     );
                 }
 
@@ -1693,25 +1754,36 @@ public sealed class TestResourceBroker : IAsyncDisposable
                 $"{displayLabel} on {host.Id} poisoned, scheduling replacement (refs={managed.RefCount}, pending={pending})"
             );
 
-            // Only reset the per-host queue if no other healthy instances remain on
-            // this host for this key. When the HOST itself is poisoned, replacement on
-            // it cannot succeed, so fault the orphaned waiters now (Reset's fresh TCS
-            // would otherwise strand every already-attached waiter until a re-signal
-            // that never comes — the host-poison-deadlocks-run hang). When only the
-            // server is poisoned on a healthy host, replacement can still succeed, so
-            // keep the benign Reset and let it re-signal the new TCS.
-            if (
-                _servers.TryGetBest(key, host.Id) == null
-                && _queues.TryGetValue(brokerKey, out var queue)
-            )
+            // Count the replacement as in-flight here, in the same lock as the queue reset
+            // and before it is scheduled. The replacement first drains the poisoned server,
+            // which can take up to PoisonDrainTimeout; if we only counted it after that,
+            // anyone asking for this server in the meantime would see nothing in flight and
+            // start a second one. ReplaceServerInBackgroundAsync's finally counts it back
+            // down, the same way the other creation sites do it.
+            lock (_creationLocks.GetOrAdd(brokerKey, _ => new object()))
             {
-                if (host.IsPoisoned)
+                _creationsInFlight.AddOrUpdate(brokerKey, 1, (_, v) => v + 1);
+
+                // Only reset the per-host queue if no other healthy instances remain on
+                // this host for this key. When the HOST itself is poisoned, replacement on
+                // it cannot succeed, so fault the orphaned waiters now (Reset's fresh TCS
+                // would otherwise strand every already-attached waiter until a re-signal
+                // that never comes — the host-poison-deadlocks-run hang). When only the
+                // server is poisoned on a healthy host, replacement can still succeed, so
+                // keep the benign Reset and let it re-signal the new TCS.
+                if (
+                    _servers.TryGetBest(key, host.Id) == null
+                    && _queues.TryGetValue(brokerKey, out var queue)
+                )
                 {
-                    queue.Reset(BuildAcquisitionFault(displayLabel, host, null));
-                }
-                else
-                {
-                    queue.Reset();
+                    if (host.IsPoisoned)
+                    {
+                        queue.Reset(BuildAcquisitionFault(displayLabel, host, null));
+                    }
+                    else
+                    {
+                        queue.Reset();
+                    }
                 }
             }
 
@@ -1777,60 +1849,62 @@ public sealed class TestResourceBroker : IAsyncDisposable
     {
         var displayLabel = requirements.GetDisplayLabel();
         var brokerKey = BrokerKeyFor(key, host);
-
-        // Dispose the poisoned server to free its host server-slot.
-        // DisposeAfterDrainAsync releases the slot immediately (unblocking
-        // replacement creation below), then waits for active leases to drain
-        // so tests can finish artifact collection against the live container.
-        if (poisoned != null)
-        {
-            ReleaseSteamAccount(poisoned);
-            try
-            {
-                TestLog.Server(
-                    $"{displayLabel} disposing poisoned server on {host.Id} to free slot..."
-                );
-                InfrastructureEventLog.Emit(
-                    "server_disposed",
-                    new
-                    {
-                        server = poisoned.Key,
-                        instanceId = poisoned.InstanceId,
-                        reason = "poisoned_replacing",
-                        host_id = host.Id,
-                    }
-                );
-                await poisoned.DisposeAfterDrainAsync(PoisonDrainTimeout);
-                TestLog.Server($"{displayLabel} poisoned server disposed");
-            }
-            catch (Exception ex)
-            {
-                TestLog.Server($"{displayLabel} poisoned server disposal failed: {ex.Message}");
-            }
-        }
-
         var queue = _queues.GetOrAdd(brokerKey, _ => new ServerQueue());
-        // Ensure queue is in a fresh state for the replacement only if no other
-        // healthy instance exists on this host for this key. A poisoned host can't host
-        // the replacement, so fault any already-attached waiters instead of orphaning
-        // them on a fresh TCS that the failed replacement won't re-signal.
-        if (_servers.TryGetBest(key, host.Id) == null && (queue.IsReady || queue.IsFaulted))
-        {
-            if (host.IsPoisoned)
-            {
-                queue.Reset(BuildAcquisitionFault(displayLabel, host, null));
-            }
-            else
-            {
-                queue.Reset();
-            }
-        }
 
-        _creationsInFlight.AddOrUpdate(brokerKey, 1, (_, v) => v + 1);
+        // OnServerPoisoned (the only caller) already counted this replacement as in-flight,
+        // and the finally below is what counts it back down. So the whole body, including
+        // the dispose-drain, has to stay inside the try.
         var replacementSucceeded = false;
         Exception? replacementError = null;
         try
         {
+            // Dispose the poisoned server to free its host server-slot.
+            // DisposeAfterDrainAsync releases the slot immediately (unblocking
+            // replacement creation below), then waits for active leases to drain
+            // so tests can finish artifact collection against the live container.
+            if (poisoned != null)
+            {
+                ReleaseSteamAccount(poisoned);
+                try
+                {
+                    TestLog.Server(
+                        $"{displayLabel} disposing poisoned server on {host.Id} to free slot..."
+                    );
+                    InfrastructureEventLog.Emit(
+                        "server_disposed",
+                        new
+                        {
+                            server = poisoned.Key,
+                            instanceId = poisoned.InstanceId,
+                            reason = "poisoned_replacing",
+                            host_id = host.Id,
+                        }
+                    );
+                    await poisoned.DisposeAfterDrainAsync(PoisonDrainTimeout);
+                    TestLog.Server($"{displayLabel} poisoned server disposed");
+                }
+                catch (Exception ex)
+                {
+                    TestLog.Server($"{displayLabel} poisoned server disposal failed: {ex.Message}");
+                }
+            }
+
+            // Ensure queue is in a fresh state for the replacement only if no other
+            // healthy instance exists on this host for this key. A poisoned host can't host
+            // the replacement, so fault any already-attached waiters instead of orphaning
+            // them on a fresh TCS that the failed replacement won't re-signal.
+            if (_servers.TryGetBest(key, host.Id) == null && (queue.IsReady || queue.IsFaulted))
+            {
+                if (host.IsPoisoned)
+                {
+                    queue.Reset(BuildAcquisitionFault(displayLabel, host, null));
+                }
+                else
+                {
+                    queue.Reset();
+                }
+            }
+
             TestLog.Server($"{displayLabel} replacing on {host.Id}...");
             var managed = await CreateServerAsync(key, requirements, host, _runCts.Token);
             managed.SetPoisonCallback(OnServerPoisoned);
@@ -1865,9 +1939,9 @@ public sealed class TestResourceBroker : IAsyncDisposable
         {
             // Mirror CreateAndResolveAsync's finally: decrement and fault decision
             // are atomic w.r.t. TryReuseFreedSlotAsync's check+bump on this brokerKey.
-            // Faulting unconditionally on failure (the previous behavior) would wake
-            // waiters with an exception even when a sibling creation is about to
-            // succeed — same race shape as the on-demand path.
+            // Faulting unconditionally on failure would wake waiters with an exception
+            // even when a sibling creation is about to succeed — same race shape as
+            // the on-demand path.
             lock (_creationLocks.GetOrAdd(brokerKey, _ => new object()))
             {
                 var inFlightRemaining = _creationsInFlight.AddOrUpdate(
@@ -1990,36 +2064,7 @@ public sealed class TestResourceBroker : IAsyncDisposable
             // runs in the background. Eviction guards above guarantee
             // RefCount == 0 and no pending/remaining demand, so nothing
             // else can reach this instance.
-            var capturedKey = key;
-            var capturedServer = server;
-            // SuppressFlow: this dispose runs in the background after the evicting
-            // test has finished. Inheriting that test's TestContext.Current
-            // misattributes recording_extracted / server_dispose_* events.
-            // See .claude/rules/asynclocal-pitfalls.md.
-            using (ExecutionContext.SuppressFlow())
-            {
-                _backgroundDisposeTasks.Enqueue(
-                    Task.Run(async () =>
-                    {
-                        try
-                        {
-                            await capturedServer.DisposeAsync();
-                        }
-                        catch (Exception ex)
-                        {
-                            InfrastructureEventLog.Emit(
-                                "server_dispose_background_failed",
-                                new
-                                {
-                                    server = capturedKey,
-                                    instanceId = capturedServer.InstanceId,
-                                    error = ex.Message,
-                                }
-                            );
-                        }
-                    })
-                );
-            }
+            EnqueueBackgroundServerDisposal(key, server);
             return; // Only need to free one slot on this host
         }
     }
@@ -2254,7 +2299,7 @@ public sealed class TestResourceBroker : IAsyncDisposable
                 // work — pool removal, Steam-account release, slot release, and the
                 // server_disposed event emit — happens here so observers see the
                 // sibling leave the pool immediately. Drained in DisposeAsync via
-                // Task.WhenAll(_backgroundDisposeTasks). Mirrors the eviction path
+                // the server-disposal queue. Mirrors the eviction path
                 // (TryEvictIdleServerForAsync).
                 foreach (var sibling in _servers.GetAll(managed.Key))
                 {
@@ -2282,36 +2327,7 @@ public sealed class TestResourceBroker : IAsyncDisposable
                             TestLog.Server($"sibling early slot release failed: {ex.Message}");
                         }
 
-                        var capturedKey = managed.Key;
-                        var capturedSibling = sibling;
-                        // SuppressFlow: this dispose runs in the background after the
-                        // last test has finished. Inheriting that test's
-                        // TestContext.Current misattributes recording_extracted and
-                        // server_dispose_* events. See .claude/rules/asynclocal-pitfalls.md.
-                        using (ExecutionContext.SuppressFlow())
-                        {
-                            _backgroundDisposeTasks.Enqueue(
-                                Task.Run(async () =>
-                                {
-                                    try
-                                    {
-                                        await capturedSibling.DisposeAsync();
-                                    }
-                                    catch (Exception ex)
-                                    {
-                                        InfrastructureEventLog.Emit(
-                                            "server_dispose_background_failed",
-                                            new
-                                            {
-                                                server = capturedKey,
-                                                instanceId = capturedSibling.InstanceId,
-                                                error = ex.Message,
-                                            }
-                                        );
-                                    }
-                                })
-                            );
-                        }
+                        EnqueueBackgroundServerDisposal(managed.Key, sibling);
                     }
                 }
 
@@ -2339,8 +2355,8 @@ public sealed class TestResourceBroker : IAsyncDisposable
     /// slot immediately; <see cref="ManagedServer.ReleaseSlotEarly"/> is idempotent so the backgrounded
     /// <see cref="ManagedServer.DisposeAsync"/>'s own slot release is a no-op. Same shape as the sibling
     /// sweep in <see cref="ReleaseAsync"/>. The caller must have already removed <paramref name="managed"/>
-    /// from <c>_servers</c> and emitted <c>server_disposed</c>. Drained at run end via
-    /// <c>Task.WhenAll(_backgroundDisposeTasks)</c> in <see cref="DisposeAsync"/>.
+    /// from <c>_servers</c> and emitted <c>server_disposed</c>. Drained at run end via the
+    /// server-disposal queue in <see cref="DisposeAsync"/>.
     /// </summary>
     private void BackgroundDisposeServer(ManagedServer managed)
     {
@@ -2353,7 +2369,7 @@ public sealed class TestResourceBroker : IAsyncDisposable
             TestLog.Server($"early slot release failed: {ex.Message}");
         }
 
-        EnqueueBackgroundTask(() => managed.DisposeAsync().AsTask());
+        EnqueueBackgroundServerDisposal(managed.Key, managed);
     }
 
     /// <summary>
@@ -2435,17 +2451,20 @@ public sealed class TestResourceBroker : IAsyncDisposable
             _remainingDemand[key] = 0;
         }
 
-        // Kick off eviction of idle servers in the background to free
-        // environment slots and unblock any tests stuck at WaitForServerAvailableAsync
-        // (they'll see the cancelled token and bail out).
-        _ = EvictAllIdleServersAsync();
+        // Evict idle servers to free environment slots and unblock any tests
+        // stuck at WaitForServerAvailableAsync (they'll see the cancelled token
+        // and bail out). Pool removal is synchronous; container teardown runs
+        // on the tracked server-disposal queue.
+        EvictAllIdleServers();
     }
 
     /// <summary>
     /// Evicts all servers that have refs=0 and pendingDemand=0.
     /// Used by NotifyStopOnFail to free environment slots for deferred configs.
+    /// Disposals go through <see cref="EnqueueBackgroundServerDisposal"/> so
+    /// <see cref="DisposeAsync"/> awaits them before network teardown.
     /// </summary>
-    private async Task EvictAllIdleServersAsync()
+    private void EvictAllIdleServers()
     {
         // During shutdown, don't evict; let DisposeAsync handle ordering (clients first)
         if (ShutdownCoordinator.IsShuttingDown)
@@ -2481,14 +2500,7 @@ public sealed class TestResourceBroker : IAsyncDisposable
                     queue.Reset();
                 }
 
-                try
-                {
-                    await server.DisposeAsync();
-                }
-                catch (Exception ex)
-                {
-                    TestLog.Server($"{displayLabel} shutdown failed: {ex.Message}");
-                }
+                EnqueueBackgroundServerDisposal(key, server);
             }
         }
     }
@@ -2547,19 +2559,49 @@ public sealed class TestResourceBroker : IAsyncDisposable
         await Task.WhenAll(poolDisposeTasks);
         _clientPools.Clear();
 
-        // Await any background server disposals enqueued by
-        // TryEvictIdleServerForAsync. Placed after client-pool dispose
+        // On abort (stopOnFail or Ctrl+C/Docker-down), cancel each host's
+        // extract limiter so queued recording extractions fail fast instead of
+        // serialize-wedging finalization behind a saturated limiter. The
+        // failing test's own clip was already extracted synchronously in its
+        // TestLifecycle.FinalizeAsync, before broker disposal; what's cancelled
+        // here is the deferred passing-test backlog and full-recording pulls.
+        // Never called on a clean run, so passing tests extract fully.
+        if (_stopOnFailNotified || ShutdownCoordinator.IsShuttingDown)
+        {
+            foreach (var host in HostPool.Instance.Hosts)
+            {
+                host.ExtractLimiter.CancelPending();
+            }
+        }
+
+        // Await background server disposals (eviction, sibling sweep,
+        // BackgroundDisposeServer). Placed after client-pool dispose
         // (preserves the clients-before-servers ordering invariant
         // documented above) and before the _servers loop so the shutdown
         // log and cleanup finish in one pass. _runCts is already cancelled
         // above, so any in-flight eviction now takes the synchronous path.
+        // Unbounded: disposals release Docker slots and must complete to
+        // avoid container leaks; Docker stop-grace bounds each internally.
+        await Task.WhenAll(_backgroundServerDisposalTasks);
+
+        // Drain deferred recording extractions, bounded by RecordingDrainBudget.
+        // On abort the limiter cancel above makes waiters fail fast (each task
+        // swallows its own failure and emits skip events), so this completes
+        // near-instantly; expiry means an extraction ignored both its linked
+        // shutdown token and the limiter cancel.
         try
         {
-            await Task.WhenAll(_backgroundDisposeTasks);
+            await Task.WhenAll(_backgroundRecordingTasks)
+                .WaitAsync(TestTimings.RecordingDrainBudget);
         }
-        catch (Exception ex)
+        catch (TimeoutException)
         {
-            TestLog.Server($"Background server dispose(s) faulted during shutdown: {ex.Message}");
+            var pending = _backgroundRecordingTasks.Count(t => !t.IsCompleted);
+            TestLog.Server(
+                $"Recording drain timeout: {pending} extraction(s) still pending after "
+                    + $"{TestTimings.RecordingDrainBudget.TotalSeconds}s; proceeding to finalization "
+                    + "(stragglers are bounded by RecordingFinalizeBackstop or die with the process)"
+            );
         }
 
         // Parallelize server teardown. Heavy extraction work inside
@@ -2767,16 +2809,16 @@ public sealed class TestResourceBroker : IAsyncDisposable
         // the rest create on-demand. With one slot apiece, a config whose
         // non-exclusive demand needs ≥2 instances (InstancesNeeded) cannot keep
         // its join lane drained — every joining test queues on that instance's
-        // single per-game-loop join gate (ManagedServer._joinGate), producing the
-        // end-of-run join convoy. Reactive expansion can't rescue it: a server
-        // boots in ~41s, so an instance spun up at the tail serves ~0 tests before
-        // the run ends. Front-load instead — give the dominant config a 2nd
-        // prestart instance (its own join gate = a real second lane) by demoting
-        // the smallest single-slot config to on-demand. Total stays ≤ slots, so
-        // no slot over-subscription and no churn (the 2nd instance has the whole
-        // backlog to chew through). Guarded on slots >= 2 so single-slot hosts
-        // (CI) are untouched. See .claude/rules/provision-up-front-when-startup-
-        // exceeds-serviceable-tail.md and PLAN-suite-speedup.md §3.
+        // single join gate (ManagedServer._joinGate, one pre-approval lane per
+        // instance), producing the end-of-run join convoy. Reactive expansion
+        // can't rescue it: a server boots in ~41s, so an instance spun up at the
+        // tail serves ~0 tests before the run ends. Front-load instead — give the
+        // dominant config a 2nd prestart instance (its own join gate = a real
+        // second lane) by demoting the smallest single-slot config to on-demand.
+        // Total stays ≤ slots, so no slot over-subscription and no churn (the 2nd
+        // instance has the whole backlog to chew through). Guarded on slots >= 2
+        // so single-slot hosts (CI) are untouched. See PLAN-suite-speedup.md §3 and
+        // .claude/rules/provision-up-front-when-startup-exceeds-serviceable-tail.md.
         // Scope: only fires when demands.Count > slots. At demands.Count == slots
         // (e.g. a narrow --filter run) the Hamilton path below caps every config at
         // 1, so no promotion — the convoy fix targets the saturated full-suite case.

@@ -17,8 +17,8 @@ on:
         required: true
         type: choice
         options:
-          - public-test
-          # - production
+          - public-test-preview
+          # - public-test-latest
       skip_graceful_shutdown:
         description: 'Skip graceful shutdown (emergency deploy)'
         required: false
@@ -50,15 +50,15 @@ jobs:
         run: |
           # Define deployment targets as JSON
           TARGETS='[
-            {"environment": "public-test", "image_tag": "preview", "on_preview": true, "on_release": false}
+            {"environment": "public-test-preview", "image_tag": "preview", "url_name": "preview", "on_preview": true, "on_release": false}
           ]'
-          # {"environment": "production", "image_tag": "latest", "on_preview": false, "on_release": true}
+          # {"environment": "public-test-latest", "image_tag": "latest", "url_name": "latest", "on_preview": false, "on_release": true}
 
           MATRIX=$(echo "$TARGETS" | jq -c '[.[] | select(
             (env.TRIGGER == "workflow_dispatch" and env.SELECTED == .environment) or
             (env.TRIGGER == "workflow_run" and env.WORKFLOW_SUCCESS == "success" and .on_preview) or
             (env.TRIGGER == "release" and .on_release)
-          ) | {environment, image_tag}]')
+          ) | {environment, image_tag, url_name}]')
 
           echo "matrix={\"include\":$MATRIX}" >> $GITHUB_OUTPUT
           echo "has_targets=$([ "$MATRIX" != "[]" ] && echo true || echo false)" >> $GITHUB_OUTPUT
@@ -80,10 +80,13 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # discord-notify must exist in the tree for the `uses: ./…` steps below.
           sparse-checkout: |
             docker-compose.yml
+            docker/proxy
+            .github/actions/discord-notify
           sparse-checkout-cone-mode: false
 
       - name: Graceful shutdown preparation
@@ -102,7 +105,13 @@ jobs:
           DEPLOY_VNC_PASSWORD: ${{ secrets.DEPLOY_VNC_PASSWORD }}
           DEPLOY_API_KEY: ${{ secrets.DEPLOY_API_KEY }}
           DEPLOY_DISCORD_BOT_TOKEN: ${{ secrets.DEPLOY_DISCORD_BOT_TOKEN }}
-          DEPLOY_DISCORD_CHAT_CHANNEL_ID: ${{ secrets.DEPLOY_DISCORD_CHAT_CHANNEL_ID }}
+          DEPLOY_DISCORD_CHAT_CHANNEL: ${{ vars.DEPLOY_DISCORD_CHAT_CHANNEL }}
+          DEPLOY_STATUS_DASHBOARD_CHANNEL: ${{ vars.DEPLOY_STATUS_DASHBOARD_CHANNEL }}
+          DEPLOY_SERVER_NAME: ${{ vars.DEPLOY_SERVER_NAME }}
+          # Optional: enables the HTTPS proxy (docs: operations/reverse-proxy.md).
+          DEPLOY_PUBLIC_HOST: ${{ vars.DEPLOY_PUBLIC_HOST }}
+          DEPLOY_PROXY_ROUTING: ${{ vars.DEPLOY_PROXY_ROUTING }}
+          DEPLOY_SERVER_URL_NAME: ${{ matrix.url_name }}
         run: |
           echo "::group::Generate .env file for ${{ matrix.environment }}"
 
@@ -140,8 +149,100 @@ jobs:
           echo "API_KEY=$DEPLOY_API_KEY" >> .env
           echo "# Discord bot (optional)" >> .env
           echo "DISCORD_BOT_TOKEN=$DEPLOY_DISCORD_BOT_TOKEN" >> .env
-          echo "DISCORD_CHAT_CHANNEL_ID=$DEPLOY_DISCORD_CHAT_CHANNEL_ID" >> .env
+          echo "DISCORD_CHAT_CHANNEL=$DEPLOY_DISCORD_CHAT_CHANNEL" >> .env
+          echo "STATUS_DASHBOARD_CHANNEL=$DEPLOY_STATUS_DASHBOARD_CHANNEL" >> .env
+          echo "SERVER_NAME=$DEPLOY_SERVER_NAME" >> .env
+          if [[ -n "$DEPLOY_PUBLIC_HOST" ]]; then
+            echo "# HTTPS proxy" >> .env
+            echo "COMPOSE_PROFILES=proxy" >> .env
+            echo "PUBLIC_HOST=$DEPLOY_PUBLIC_HOST" >> .env
+            echo "SERVER_URL_NAME=$DEPLOY_SERVER_URL_NAME" >> .env
+            echo "PROXY_ROUTING=${DEPLOY_PROXY_ROUTING:-path}" >> .env
+          fi
           echo "::endgroup::"
+
+      # Image revision label → build tag → the IMAGE_VERSION operators would type. The SHA selects
+      # the operator files and the tag pins .env below (the alias may move before the VPS pulls);
+      # the rest feeds the notification. Never fails the deploy.
+      - name: Resolve deployed version
+        id: version
+        env:
+          TAG: ${{ matrix.image_tag }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          FALLBACK_SHA: ${{ github.sha }}
+        run: |
+          sha=$(docker buildx imagetools inspect "sdvd/server:$TAG" \
+            --format '{{index .Image.Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null || true)
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            # Also hit if the image ever goes multi-arch (.Image becomes a per-platform map;
+            # the template must switch to '{{json .Image}}' + jq on one platform then).
+            echo "::warning::no usable revision label on sdvd/server:$TAG (got '${sha:0:60}')"
+            sha=""
+          fi
+
+          # SHA → version via the build tags (both kinds are lightweight, so ls-remote lists
+          # the commit oid directly). When one commit carries both kinds, pick by the alias
+          # being deployed.
+          version=""
+          if [ -n "$sha" ]; then
+            tags=$(git ls-remote --tags origin 'preview-[0-9]*' 'v[0-9]*' 'sdvd-server-v*' 2>/dev/null \
+              | awk -v s="$sha" '$1 == s { sub("refs/tags/", "", $2); sub(/\^\{\}$/, "", $2); print $2 }' || true)
+            # Stable tags are v<version> (sdvd-server-v<version> up to 1.4.1); preview tags are
+            # v<version>-preview.<counter> (preview-<version>.<counter> for older builds).
+            case "$TAG" in
+              latest) tag=$(grep -m1 -E '^(v[0-9]+\.[0-9]+\.[0-9]+$|sdvd-server-v)' <<< "$tags" || true) ;;
+              *) tag=$(grep -m1 -E '^(v[0-9].*-preview\.|preview-)' <<< "$tags" || true) ;;
+            esac
+            [ -n "$tag" ] || tag=$(head -n 1 <<< "$tags")
+            case "$tag" in
+              preview-*) rest=${tag#preview-}; version="${rest%.*}-preview.${rest##*.}" ;;
+              v[0-9]*) version=${tag#v} ;;
+              sdvd-server-v*) version=${tag#sdvd-server-v} ;;
+            esac
+          fi
+
+          if [ -n "$version" ]; then
+            version_value="\`$version\` (\`$TAG\`)"
+          elif [ -n "$sha" ]; then
+            version_value="\`${sha:0:7}\` (\`$TAG\`, no build tag on this commit)"
+          else
+            version_value="unknown (\`$TAG\`)"
+          fi
+          if [ -z "$sha" ]; then
+            echo "::warning::image revision unknown; operator files stay at the trigger commit and IMAGE_VERSION at the alias"
+          fi
+          commit_sha=${sha:-$FALLBACK_SHA}
+          commit_value="[\`${commit_sha:0:7}\`]($REPO_URL/commit/$commit_sha)"
+
+          jq -cn --arg version "$version_value" --arg commit "$commit_value" \
+            '[
+              {name: "Version", value: $version, inline: true},
+              {name: "Commit", value: $commit, inline: true}
+            ]' | sed 's/^/fields=/' >> "$GITHUB_OUTPUT"
+          jq -cn --arg commit "$commit_value" \
+            '[{name: "Commit", value: $commit, inline: true}]' \
+            | sed 's/^/failure_fields=/' >> "$GITHUB_OUTPUT"
+          echo "sha=$commit_sha" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # github.sha can be newer than the image (redeploy after a compose bump on master).
+      - name: Align operator files and IMAGE_VERSION with the image
+        env:
+          SHA: ${{ steps.version.outputs.sha }}
+          TRIGGER_SHA: ${{ github.sha }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [ -n "$VERSION" ]; then
+            sed -i "s/^IMAGE_VERSION=.*/IMAGE_VERSION=$VERSION/" .env
+            echo "IMAGE_VERSION pinned to $VERSION"
+          fi
+          if [ "$SHA" = "$TRIGGER_SHA" ]; then
+            echo "Operator files already at $SHA"
+            exit 0
+          fi
+          git fetch --no-tags --depth=1 origin "$SHA"
+          git checkout "$SHA" -- docker-compose.yml docker/proxy
+          echo "Operator files checked out at $SHA"
 
       - name: Create deploy directory
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
@@ -159,7 +260,7 @@ jobs:
           username: ${{ secrets.DEPLOY_SSH_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
-          source: "docker-compose.yml,.env"
+          source: "docker-compose.yml,.env,docker/proxy"
           target: ~/srv/${{ matrix.environment }}
 
       - name: Pull and restart containers
@@ -178,13 +279,10 @@ jobs:
             echo "::endgroup::"
 
             echo "::group::Stop containers"
-            docker compose down --timeout 30 || true
+            docker compose down --timeout 30 --remove-orphans || true
             echo "::endgroup::"
 
-            echo "::group::Setup steam-auth and download game"
-            docker compose run --rm steam-auth setup
-            echo "::endgroup::"
-
+            # No steam-auth setup step: serve downloads the game itself on a fresh volume.
             echo "::group::Start containers"
             docker compose up -d
             echo "::endgroup::"
@@ -209,13 +307,34 @@ jobs:
             echo "::endgroup::"
 
             echo "::group::Health check"
-            if docker compose ps | grep -qE "unhealthy|Exit"; then
+            if docker compose ps | grep -qE "unhealthy|Exit|Restarting"; then
               echo "::error::Container health check failed"
               docker compose logs --tail=50
               exit 1
             fi
             docker compose ps
             echo "::endgroup::"
+
+            # The proxy keeps retrying a failed certificate order instead of exiting, so
+            # `compose ps` stays green; only a request through the proxy proves it works.
+            envval() { grep -m1 "^$1=" .env | cut -d= -f2-; }
+            PUBLIC_HOST=$(envval PUBLIC_HOST)
+            if [[ -n "$PUBLIC_HOST" ]]; then
+              echo "::group::Proxy check"
+              SERVER_URL_NAME=$(envval SERVER_URL_NAME)
+              case "$(envval PROXY_ROUTING)" in
+                subdomain) url="https://$SERVER_URL_NAME.$PUBLIC_HOST/health" ;;
+                *) url="https://$PUBLIC_HOST/$SERVER_URL_NAME/health" ;;
+              esac
+              # Retries cover the certificate order, which can take a minute on first start.
+              if ! curl -fsS --retry 12 --retry-delay 10 --retry-all-errors "$url" > /dev/null; then
+                echo "::error::Proxy check failed: $url"
+                docker compose logs --tail=50 proxy server
+                exit 1
+              fi
+              echo "$url OK"
+              echo "::endgroup::"
+            fi
 
       - name: Build summary
         run: |
@@ -228,44 +347,24 @@ jobs:
 
       - name: Discord notification
         if: success()
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          if [ -n "$DISCORD_WEBHOOK" ]; then
-            jq -n \
-              --arg env "${{ matrix.environment }}" \
-              --arg tag "${{ matrix.image_tag }}" \
-              --arg commit "${GITHUB_SHA:0:7}" \
-              '{
-                embeds: [{
-                  title: "Server Deployed",
-                  color: 3066993,
-                  fields: [
-                    {name: "Environment", value: $env, inline: true},
-                    {name: "Image", value: ("`" + $tag + "`"), inline: true},
-                    {name: "Commit", value: ("`" + $commit + "`"), inline: true}
-                  ]
-                }]
-              }' | curl -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK"
-          fi
+        # A Discord outage must never red a deploy that succeeded.
+        continue-on-error: true
+        uses: ./.github/actions/discord-notify
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_INTERNAL_CI }}
+          title: 'Server deployed: ${{ matrix.environment }}'
+          url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          color: "9807270"
+          fields: ${{ steps.version.outputs.fields }}
 
       - name: Discord notification (failure)
         if: failure()
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          if [ -n "$DISCORD_WEBHOOK" ]; then
-            jq -n \
-              --arg env "${{ matrix.environment }}" \
-              --arg commit "${GITHUB_SHA:0:7}" \
-              '{
-                embeds: [{
-                  title: "Deployment Failed",
-                  color: 15158332,
-                  fields: [
-                    {name: "Environment", value: $env, inline: true},
-                    {name: "Commit", value: ("`" + $commit + "`"), inline: true}
-                  ]
-                }]
-              }' | curl -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK"
-          fi
+        uses: ./.github/actions/discord-notify
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_INTERNAL_CI }}
+          title: 'Server deploy failed: ${{ matrix.environment }}'
+          url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          color: "15158332"
+          # The resolve step hasn't run when the failure was earlier (checkout, .env, scp);
+          # fall back to the workflow's own commit.
+          fields: ${{ steps.version.outputs.failure_fields || format('[{{"name":"Commit","value":"[{0}]({1}/{2}/commit/{0})","inline":true}}]', github.sha, github.server_url, github.repository) }}

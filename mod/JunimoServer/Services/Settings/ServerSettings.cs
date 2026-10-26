@@ -1,5 +1,7 @@
 using System;
+using JunimoServer.Services.CabinManager;
 using JunimoServer.Services.GameCreator;
+using Newtonsoft.Json;
 
 namespace JunimoServer.Services.Settings;
 
@@ -23,7 +25,7 @@ public class ServerSettings
 
 public class GameSettings
 {
-    public string FarmName { get; set; } = "Junimo";
+    public string FarmName { get; set; } = "Server";
     public FarmTypeSetting FarmType { get; set; } = FarmTypeSetting.Default;
     public float ProfitMargin { get; set; } = 1.0f;
     public int StartingCabins { get; set; } = 1;
@@ -45,19 +47,39 @@ public class GameSettings
 public class ServerRuntimeSettings
 {
     public int MaxPlayers { get; set; } = 10;
-    public string CabinStrategy { get; set; } = "CabinStack";
+
+    [JsonConverter(typeof(TolerantEnumConverter<CabinStrategy>))]
+    public CabinStrategy CabinStrategy { get; set; } = CabinStrategy.CabinStack;
+
     public bool SeparateWallets { get; set; } = false;
-    public string ExistingCabinBehavior { get; set; } = "KeepExisting";
+
+    [JsonConverter(typeof(TolerantEnumConverter<ExistingCabinBehavior>))]
+    public ExistingCabinBehavior ExistingCabinBehavior { get; set; } =
+        ExistingCabinBehavior.KeepExisting;
+
     public bool VerboseLogging { get; set; } = false;
     public bool AllowIpConnections { get; set; } = false;
 
     /// <summary>
-    /// Lobby mode for password protection: "Shared" or "Individual".
-    /// Shared: All unauthenticated players wait in the same lobby cabin.
-    /// Individual: Each player gets their own isolated lobby cabin.
-    /// Default: "Shared"
+    /// Whether players may move their cabin out to a real farm position via the
+    /// !cabin chat command (and send it back with '!cabin reset'), regardless of
+    /// cabin strategy. Default: true
     /// </summary>
-    public string LobbyMode { get; set; } = "Shared";
+    public bool AllowCabinRelocation { get; set; } = true;
+
+    /// <summary>
+    /// Server-authoritative farmhand ownership: farmhands are visible/claimable only by the
+    /// transport identity (Steam64 / GOG Galaxy id) that first claimed them, and IP-created
+    /// farmhands stay in the LAN pool. Disable for setups where one player uses the same
+    /// farmhand from two transports (e.g. Steam at the desk plus a second device over direct
+    /// IP) — strict mode cannot express that dual identity. Ownership keeps being recorded
+    /// while disabled, so re-enabling restores enforcement with an up-to-date map.
+    /// Default: true
+    /// </summary>
+    public bool EnforceFarmhandOwnership { get; set; } = true;
+
+    [JsonConverter(typeof(TolerantEnumConverter<LobbyMode>))]
+    public LobbyMode LobbyMode { get; set; } = LobbyMode.Shared;
 
     /// <summary>
     /// Name of the active lobby layout to use for new players.

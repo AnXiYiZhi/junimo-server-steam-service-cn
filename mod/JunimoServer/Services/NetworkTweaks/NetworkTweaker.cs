@@ -4,6 +4,7 @@ using System.Reflection;
 using HarmonyLib;
 using JunimoServer.Services.PersistentOption;
 using JunimoServer.Services.Settings;
+using JunimoServer.Util;
 using StardewModdingAPI;
 using StardewModdingAPI.Events;
 using StardewValley;
@@ -18,7 +19,11 @@ public class NetworkTweaker : ModService
     private readonly ServerSettingsLoader _settings;
     private bool _networkSettingsApplied;
     private static IMonitor _monitor = null!;
-    private static readonly MethodInfo RejectFarmhandRequestMethod = AccessTools.Method(
+
+    /// <summary>Shared reflection handle for the private <c>GameServer.rejectFarmhandRequest</c>.
+    /// Also used by <c>FarmhandOwnershipService</c>'s gate prefix — one handle, not per-caller
+    /// reflection copies.</summary>
+    internal static readonly MethodInfo RejectFarmhandRequestMethod = AccessTools.Method(
         typeof(GameServer),
         "rejectFarmhandRequest"
     );
@@ -224,15 +229,11 @@ public class NetworkTweaker : ModService
             y * 64 - (farmer.Sprite.getHeight() - 32) + 16
         );
 
-        // Call private sendLocation via reflection
-        var sendLocationMethod = AccessTools.Method(
-            typeof(GameServer),
-            "sendLocation",
-            new[] { typeof(long), typeof(GameLocation), typeof(bool) }
-        );
-        sendLocationMethod.Invoke(
+        NetworkHelper.SendLocation(
             __instance,
-            new object[] { farmer.UniqueMultiplayerID, location, false }
+            farmer.UniqueMultiplayerID,
+            location,
+            forceCurrent: false
         );
 
         return false; // Skip original

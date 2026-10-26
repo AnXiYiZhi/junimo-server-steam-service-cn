@@ -6,13 +6,13 @@ JunimoServer supports both Steam and GOG clients connecting to the same server. 
 
 | Method | For | Port Forwarding | Reliability |
 |--------|-----|-----------------|-------------|
-| Steam SDR | Steam clients | Not required | ~99% success |
+| Steam relay | Steam clients | Not required | ~99% success |
 | GOG Galaxy | GOG clients | Not required | ~50% success |
 | Direct IP | Any client | Required (UDP 24642) | Depends on network |
 
-### Steam SDR (Recommended)
+### Steam relay (Recommended)
 
-Steam clients connect through Valve's Steam Datagram Relay network. All traffic routes through Valve's servers, which handles NAT traversal automatically.
+Steam clients connect through Valve's relay network (Steam Datagram Relay). All traffic routes through Valve's servers, which handles NAT traversal automatically.
 
 **How it works:**
 
@@ -23,30 +23,36 @@ Steam clients connect through Valve's Steam Datagram Relay network. All traffic 
 
 ### GOG Galaxy
 
-GOG clients connect using Galaxy P2P networking. Invite codes start with "G". Works through most NATs without port forwarding, but has lower success rates than Steam SDR.
+GOG clients connect using Galaxy P2P networking with the same invite code Steam players use. Works through most NATs without port forwarding, but has lower success rates than the Steam relay.
 
 ### Direct IP
 
 Disabled by default. Enable via `AllowIpConnections` in `server-settings.json`.
 
 ::: warning
-Direct IP connections don't provide user IDs. Players may lose farmhand ownership if they reconnect from a different IP.
+Direct IP connections carry no Steam/GOG account identity. Farmers created over direct IP are
+shared among all direct-IP players, and farmers owned by a Steam/GOG account are not visible or
+joinable over direct IP — even for the account's own player. See
+[Farmhand Ownership](/admins/configuration/server-settings#farmhand-ownership).
 :::
 
 ## Ports
 
 | Port | Protocol | Purpose | Forward Required? |
 |------|----------|---------|-------------------|
-| 24642 | UDP | Steam SDR game port | No (relay handles NAT) |
-| 27015 | UDP | Steam SDR query port | No (relay handles NAT) |
-| 5800 | TCP | VNC web interface | Only for remote access |
+| 24642 | UDP | Steam relay game port | No (relay handles NAT) |
+| 27015 | UDP | Steam relay query port | No (relay handles NAT) |
+| 5800 | TCP | VNC web UI | Only for remote access |
 | 8080 | TCP | HTTP API | Only for external tools |
+| 80, 443 | TCP | HTTPS proxy (optional) | Only with a proxy in front (bundled or your own) |
 
-Steam SDR uses these ports internally but traffic goes through Valve's relay. No port forwarding required for most setups.
+The Steam relay uses these ports internally but traffic goes through Valve's relay. No port forwarding required for most setups.
+
+With the [HTTPS proxy](/admins/operations/reverse-proxy), the API and VNC web UI are served on 443 and their plain-HTTP ports stay on loopback.
 
 ### Changing Ports
 
-To change host-side port mappings (for conflicts):
+To change ports (for conflicts):
 
 ```sh
 # In .env
@@ -55,6 +61,8 @@ API_PORT=8081
 GAME_PORT=24643
 QUERY_PORT=27016
 ```
+
+`VNC_PORT`, `GAME_PORT`, and `QUERY_PORT` change only the host mapping; the container ports stay fixed. `API_PORT` changes the API port on the host and inside the container, and the Discord bot follows it.
 
 ## Troubleshooting
 
@@ -114,7 +122,7 @@ Check server logs for these messages:
 
 **GameServer init failed:**
 
-```
+```text
 [Steam] GameServer.Init() failed
 ```
 
@@ -122,25 +130,27 @@ Steamworks SDK may be missing or `steam_appid.txt` incorrect.
 
 **Can't reach Steam:**
 
-```
+```text
 [Steam] Failed to connect to Steam servers: ...
 ```
 
 Check outbound network access and firewall rules for UDP.
 
-**SDR not ready:**
+**Steam relay not ready:**
 
-```
+```text
 [Steam] SDR relay status: k_ESteamNetworkingAvailability_Unknown
 ```
 
-SDR takes a few seconds to initialize. Wait and retry.
+The relay takes a few seconds to initialize. Wait and retry.
 
 ### GOG Clients Can't Connect
 
-1. Verify invite code starts with "G"
+1. Verify the invite code is current (`info` in the CLI)
 2. Run `netdebug nat` to check NAT type
 3. Try having player connect from different network
+4. If the server log shows no connection attempt at all, [capture the Galaxy SDK
+   log](/admins/troubleshooting#capturing-galaxy-sdk-logs)
 
 ## Firewall Configuration
 
@@ -157,9 +167,13 @@ If you need to configure firewalls, allow:
 
 **For remote VNC access:**
 
-- Inbound TCP 5800, VNC web interface
+- Inbound TCP 5800, VNC web UI
 
 **For external API access:**
 
 - Inbound TCP 8080, REST API
+
+**With the HTTPS proxy (replaces the two above):**
+
+- Inbound TCP 80 and 443
 

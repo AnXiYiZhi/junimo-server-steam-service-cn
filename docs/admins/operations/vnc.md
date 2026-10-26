@@ -1,7 +1,7 @@
-# Web Interface (VNC)
+# VNC
 
-::: warning Advanced Tool
-VNC is for debugging and advanced troubleshooting only. For normal operation, use the [CLI](/admins/operations/commands) and connect to your server with your game client like any multiplayer game.
+::: warning Debugging tool
+VNC is for debugging and troubleshooting only. For normal operation, use the [CLI](/admins/operations/commands) and connect to your server with your game client like any multiplayer game.
 
 By default, rendering is disabled (`SERVER_FPS=0`) for performance. VNC will show a "Rendering Disabled" notice. This is intentional.
 :::
@@ -28,6 +28,8 @@ Replace:
 
 Example: `http://localhost:5800`
 
+Behind the [HTTPS proxy](/admins/operations/reverse-proxy) the web UI is at the server's proxy URL plus `/vnc/`, and the plain-HTTP port is not reachable from outside.
+
 You'll be prompted to enter the VNC password configured in your `.env` file.
 
 ## VNC Settings Panel
@@ -46,7 +48,7 @@ Do **not** use the `Remote Resizing` scaling mode. This can cause stability issu
 
 ## Clipboard
 
-Copy and paste works through the VNC interface, but requires a special method:
+Copy and paste works through the VNC web UI, but requires a special method:
 
 1. Open the settings panel on the left
 2. Use the clipboard text area to transfer text
@@ -97,7 +99,7 @@ The console command only lasts until the server restarts.
 If VNC won't load:
 
 1. Check `VNC_PASSWORD` is set in `.env`
-2. Verify firewall allows TCP on VNC port (default 5800)
-3. Use `http://` not `https://`
+2. Without a proxy: verify the firewall allows TCP on the VNC port (default 5800) and use `http://`, not `https://`
+3. Behind the HTTPS proxy: use the proxy URL plus `/vnc/`; the VNC port itself is not reachable from outside
 4. Try a different browser
 

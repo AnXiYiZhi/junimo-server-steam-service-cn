@@ -4,6 +4,7 @@ using System.Text.Json;
 using Docker.DotNet;
 using DotNet.Testcontainers.Containers;
 using JunimoServer.Tests.Helpers;
+using JunimoServer.Tests.Schema.Events;
 
 namespace JunimoServer.Tests.Infrastructure;
 
@@ -571,14 +572,17 @@ public sealed class DockerHost : IAsyncDisposable
     /// </summary>
     internal async Task<TransportFaultOutcome> PoisonIfTransportFaultAsync(Exception ex)
     {
-        var (transportReason, forwardScoped) = TransportFaultClassifier.Classify(ex);
+        var verdict = TransportFaultClassifier.Classify(ex, Id);
+        var forwardScoped = verdict.ForwardScoped;
+        // Unclassified never poisons: an unmapped code is treated as application-level.
+        var transportReason = verdict.IsTransportFault ? verdict.Reason : null;
 
         // Two paths need corroboration against the master before poisoning the
         // whole host (remote only — local hosts have no master):
         //   1. A bare TimeoutException is ambiguous (slow-but-live server vs dead
         //      tunnel).
         //   2. A forward-scoped fault (loopback ConnectionRefused / ConnectionReset /
-        //      ConnectionAborted / broken-pipe / EOF). On a loopback -L forward NONE of
+        //      ConnectionAborted / EOF). On a loopback -L forward NONE of
         //      these proves the host died — the connection only ever talks to the local
         //      forward listener. A transient master keepalive blip drops ALL forwards at
         //      once while the master + host stay alive (reproduced 2026-06-26: Docker
@@ -586,7 +590,7 @@ public sealed class DockerHost : IAsyncDisposable
         // In both cases, a live `ssh -O check` means the host is fine — don't poison; heal
         // the forwards instead so in-flight/next operations retry against the live daemon.
         var needsCorroboration =
-            (transportReason is null && ex is TimeoutException) || forwardScoped;
+            (verdict.Kind == TransportFaultKind.None && ex is TimeoutException) || forwardScoped;
         if (needsCorroboration && SshDestination is not null)
         {
             var masterAlive = await TunnelManager.Default.IsMasterAliveAsync(Id);
@@ -598,7 +602,10 @@ public sealed class DockerHost : IAsyncDisposable
             // the host is recoverable: don't poison. See host-poison-deadlocks-run.md.
             if (!masterAlive)
             {
-                masterAlive = await TunnelManager.Default.TryRespawnMasterAsync(Id);
+                masterAlive = await TunnelManager.Default.TryRespawnMasterAsync(
+                    Id,
+                    cause: "poison_corroboration"
+                );
             }
 
             if (masterAlive)
@@ -615,7 +622,22 @@ public sealed class DockerHost : IAsyncDisposable
                 }
                 catch (Exception healEx)
                 {
-                    TestLog.Test($"[ssh] daemon forward heal failed on '{Id}': {healEx.Message}");
+                    // The heal has no cancellation token, so nothing here is a cooperative
+                    // cancel; the throw is recorded with its stack.
+                    // The fault still resolves as a recoverable blip below — the next
+                    // container op re-tries the daemon forward through the normal seam.
+                    TestLog.Test($"[ssh] daemon forward heal threw on '{Id}': {healEx.Message}");
+                    InfrastructureEventLog.Emit(
+                        TransportEventNames.ForwardHealThrew,
+                        new ForwardHealThrewEvent(
+                            Id,
+                            Site: "daemon_forward",
+                            Label: null,
+                            Trigger: transportReason,
+                            TransportEventFormat.Chain(healEx),
+                            TransportEventFormat.StackTrace(healEx)
+                        )
+                    );
                 }
 
                 InfrastructureEventLog.Emit(
@@ -625,6 +647,7 @@ public sealed class DockerHost : IAsyncDisposable
                         host_id = Id,
                         reason = transportReason,
                         forwardScoped,
+                        kind = verdict.Kind.ToString(),
                         detail = "ssh master alive/respawned; forwards healed, host kept",
                     }
                 );

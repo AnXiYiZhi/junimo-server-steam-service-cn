@@ -2,13 +2,13 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using System.Xml;
 using JunimoServer.Services.GameCreator;
 using JunimoServer.Services.GameManager;
 using JunimoServer.Services.SaveImport;
 using JunimoServer.Util;
 using StardewModdingAPI;
-using StardewModdingAPI.Events;
 using StardewValley;
 
 namespace JunimoServer.Services.Commands;
@@ -19,19 +19,44 @@ internal static class SavesCommand
     private static IMonitor _monitor;
     private static SaveImportService _saveImport;
 
+    private static readonly CommandDescriptor Descriptor = new()
+    {
+        Name = "saves",
+        Description =
+            "Save management. Run 'saves' for list, 'saves info <name>', "
+            + "'saves import <name> [--swap-host-to <id>] [--reload | --force-reload]', "
+            + "'saves reload [--force]'.",
+        Subcommands =
+        {
+            new SubcommandDescriptor
+            {
+                Name = "info",
+                Description = "Show details for one save: saves info <name>",
+            },
+            new SubcommandDescriptor
+            {
+                Name = "import",
+                Description =
+                    "Import a save: saves import <name> "
+                    + "[--swap-host-to <id>] [--reload | --force-reload]",
+                Flags = { "--swap-host-to", "--reload", "--force-reload" },
+            },
+            new SubcommandDescriptor
+            {
+                Name = "reload",
+                Description = "Reload the active world in-process: saves reload [--force]",
+                Flags = { "--force" },
+            },
+        },
+    };
+
     public static void Register(IModHelper helper, IMonitor monitor, SaveImportService saveImport)
     {
         _helper = helper;
         _monitor = monitor;
         _saveImport = saveImport;
 
-        helper.ConsoleCommands.Add(
-            "saves",
-            "Save management. Run 'saves' for list, 'saves info <name>', "
-                + "'saves import <name> [--swap-host-to <id>] [--reload | --force-reload]', "
-                + "'saves reload [--force]'.",
-            (cmd, args) => HandleCommand(args)
-        );
+        helper.ConsoleCommands.Register(Descriptor, (cmd, args) => HandleCommand(args));
     }
 
     private static void HandleCommand(string[] args)
@@ -60,7 +85,7 @@ internal static class SavesCommand
                 break;
             default:
                 _monitor.Log(
-                    $"Unknown saves subcommand: {args[0]}. Use: saves [info|import|reload]",
+                    $"Unknown saves subcommand: {args[0]}. Use: saves [{Descriptor.SubcommandNames}]",
                     LogLevel.Warn
                 );
                 break;
@@ -166,19 +191,17 @@ internal static class SavesCommand
 
     /// <summary>
     /// Guard + kick + in-process reload, shared by import <c>--reload</c> and <c>saves reload</c>.
-    /// Console commands run off the game thread, so the work is marshalled on via a one-shot
-    /// <see cref="UpdateTickedEventArgs"/> handler (the RenderingCommand pattern). Refuses (returns)
+    /// Marshalled onto the game loop via <see cref="GameThreadOneShot"/>. Refuses (returns)
     /// when clients are connected and <paramref name="force"/> is false.
     /// </summary>
     private static void TryReloadActiveWorld(bool force, string contextLine)
     {
-        void Apply(object sender, UpdateTickedEventArgs e)
-        {
-            _helper.Events.GameLoop.UpdateTicked -= Apply;
-
-            // A throw from this UpdateTicked handler logs at Error, which trips the test-poison scan
-            // (debugging.md); catch to Warn, as GameManagerService.ConditionallyStartGame does.
-            try
+        GameThreadOneShot.Run(
+            _helper,
+            _monitor,
+            $"in-process reload ({contextLine})",
+            requireLoadedSave: false,
+            action: () =>
             {
                 // No world loaded (e.g. still at title): nothing to reload; a queued import waits for restart.
                 if (!Game1.hasLoadedGame || Game1.player == null)
@@ -191,15 +214,28 @@ internal static class SavesCommand
                     return;
                 }
 
-                // bare otherFarmers.Count is unreliable during an active event (host-automation.md
-                // invariant 7); mirror AlwaysOnFestivals.CountOnlineOtherPlayers.
-                var others = Game1
-                    .getOnlineFarmers()
-                    .Where(f =>
-                        f.UniqueMultiplayerID != Game1.player.UniqueMultiplayerID
-                        && !Game1.Multiplayer.isDisconnecting(f)
-                    )
-                    .ToList();
+                var manager = GameManagerService.Instance;
+                if (manager == null)
+                {
+                    _monitor.Log(
+                        "Game manager not ready; cannot reload in-process. Restart to load.",
+                        LogLevel.Warn
+                    );
+                    return;
+                }
+
+                // Lease before the player count, like the HTTP handlers: never kick players for
+                // a reload that a running transition or announced disruption then refuses.
+                if (manager.Disruption.Holder is { } holder)
+                {
+                    _monitor.Log(
+                        $"Refusing to reload: {holder} in progress ({contextLine}).",
+                        LogLevel.Warn
+                    );
+                    return;
+                }
+
+                var others = OnlineFarmers.Others();
 
                 if (others.Count > 0 && !force)
                 {
@@ -228,46 +264,43 @@ internal static class SavesCommand
                     );
                 }
 
-                var manager = GameManagerService.Instance;
-                if (manager == null)
-                {
-                    _monitor.Log(
-                        "Game manager not ready; cannot reload in-process. Restart to load.",
-                        LogLevel.Warn
-                    );
-                    return;
-                }
-
                 _monitor.Log($"Reloading the active world ({contextLine})…", LogLevel.Info);
 
-                // Can't await across the tick boundary from a void command — fire-and-forget, log on resolve.
-                manager
-                    .RequestReloadSave()
-                    .ContinueWith(t =>
-                    {
-                        if (t.IsFaulted)
-                        {
-                            _monitor.Log(
-                                $"World reload failed: {t.Exception?.GetBaseException().Message}",
-                                LogLevel.Warn
-                            );
-                        }
-                        else
-                        {
-                            _monitor.Log($"World reloaded ({contextLine}).", LogLevel.Info);
-                        }
-                    });
-            }
-            catch (Exception ex)
-            {
-                _monitor.Log(
-                    $"In-process reload failed ({contextLine}): {ex.Message}",
-                    LogLevel.Warn
-                );
-            }
-        }
+                // Same action as the lease check above, so the acquire cannot fail. Released when
+                // the reload settles, from the continuation.
+                const string leaseHolder = "reload";
+                manager.Disruption.TryAcquire(leaseHolder);
 
-        _helper.Events.GameLoop.UpdateTicked += Apply;
+                // Can't await across the tick boundary from a void command — fire-and-forget, log on resolve.
+                Task reload;
+                try
+                {
+                    reload = manager.RequestReloadSave();
+                }
+                catch
+                {
+                    // A synchronous throw would otherwise leave the lease held until restart.
+                    manager.Disruption.Release(leaseHolder);
+                    throw;
+                }
+
+                reload.ContinueWith(t =>
+                {
+                    manager.Disruption.Release(leaseHolder);
+                    if (t.IsFaulted)
+                    {
+                        _monitor.Log(
+                            $"World reload failed: {t.Exception?.GetBaseException().Message}",
+                            LogLevel.Warn
+                        );
+                    }
+                    else
+                    {
+                        _monitor.Log($"World reloaded ({contextLine}).", LogLevel.Info);
+                    }
+                });
+            }
+        );
     }
 
     private static void ListSaves()

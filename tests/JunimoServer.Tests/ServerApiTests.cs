@@ -32,11 +32,12 @@ public class ServerApiTests : TestBase
             WaitName.Polling_ServerApi_NoPlayersConnected,
             async () =>
             {
-                var players = await ServerApi.GetPlayers(TestContext.Current.CancellationToken);
+                var players = await ServerApi.GetPlayers(TestCt);
                 return players?.Players?.Count == 0;
             },
-            TestTimings.FarmerDeleteTimeout,
-            cancellationToken: TestContext.Current.CancellationToken
+            // Waits for a prior test's cleanup to drain /players to 0 (cross-test lag).
+            TestTimings.ServerReadyBetweenTests,
+            cancellationToken: TestCt
         );
         Assert.True(noPlayers, "Server should have no players connected");
         Log("Verified: no players connected");
@@ -49,15 +50,12 @@ public class ServerApiTests : TestBase
     [TestServer(Artifacts = true)]
     public async Task GetPlayers_WhenPlayerConnected_ShowsPlayer()
     {
-        var client = await Farmers.ConnectNewAsync(ct: TestContext.Current.CancellationToken);
+        var client = await Farmers.ConnectFastAsync(ct: TestCt);
 
         // Poll until player appears in the /players API
         PlayersResponse? response = null;
-        await ServerApi.WaitForPlayerByNameAsync(
-            client.FarmerName,
-            ct: TestContext.Current.CancellationToken
-        );
-        response = await ServerApi.GetPlayers(TestContext.Current.CancellationToken);
+        await ServerApi.WaitForPlayerByNameAsync(client.FarmerName, ct: TestCt);
+        response = await ServerApi.GetPlayers(TestCt);
 
         Assert.NotNull(response);
         Assert.NotNull(response.Players);
@@ -84,10 +82,7 @@ public class ServerApiTests : TestBase
     [TestServer(Clients = 0)]
     public async Task SetTime_WithValidValue_Succeeds()
     {
-        var response = await ServerApi.SetTime(
-            TestTimings.Noon,
-            TestContext.Current.CancellationToken
-        );
+        var response = await ServerApi.SetTime(TestTimings.Noon, TestCt);
 
         Assert.NotNull(response);
         Assert.True(response.Success, response.Error ?? "SetTime failed");
@@ -104,7 +99,7 @@ public class ServerApiTests : TestBase
     [TestServer(Clients = 0)]
     public async Task SetTime_OutOfRange_ReturnsError(int timeValue, string description)
     {
-        var response = await ServerApi.SetTime(timeValue, TestContext.Current.CancellationToken);
+        var response = await ServerApi.SetTime(timeValue, TestCt);
 
         Assert.NotNull(response);
         Assert.False(response.Success, $"Expected failure for {description} ({timeValue})");
@@ -124,10 +119,7 @@ public class ServerApiTests : TestBase
     [TestServer(Clients = 0)]
     public async Task DeleteFarmhandByName_WhenNotExists_ReturnsNotFoundError()
     {
-        var response = await ServerApi.DeleteFarmhandByName(
-            "NonExistentFarmer12345",
-            TestContext.Current.CancellationToken
-        );
+        var response = await ServerApi.DeleteFarmhandByName("NonExistentFarmer12345", TestCt);
 
         Assert.NotNull(response);
         Assert.False(response.Success);
@@ -143,10 +135,7 @@ public class ServerApiTests : TestBase
     [TestServer(Clients = 0)]
     public async Task DeleteFarmhandById_WhenNotExists_ReturnsNotFoundError()
     {
-        var response = await ServerApi.DeleteFarmhandById(
-            999999999L,
-            TestContext.Current.CancellationToken
-        );
+        var response = await ServerApi.DeleteFarmhandById(999999999L, TestCt);
 
         Assert.NotNull(response);
         Assert.False(response.Success);
@@ -162,10 +151,7 @@ public class ServerApiTests : TestBase
     [TestServer(Clients = 0)]
     public async Task GrantAdminByName_WhenNotExists_ReturnsNotFoundError()
     {
-        var response = await ServerApi.GrantAdminByName(
-            "NonExistentAdmin12345",
-            TestContext.Current.CancellationToken
-        );
+        var response = await ServerApi.GrantAdminByName("NonExistentAdmin12345", TestCt);
 
         Assert.NotNull(response);
         Assert.False(response.Success);
@@ -181,16 +167,102 @@ public class ServerApiTests : TestBase
     [TestServer(Clients = 0)]
     public async Task GrantAdminById_WhenNotExists_ReturnsNotFoundError()
     {
-        var response = await ServerApi.GrantAdminById(
-            999999999L,
-            TestContext.Current.CancellationToken
-        );
+        var response = await ServerApi.GrantAdminById(999999999L, TestCt);
 
         Assert.NotNull(response);
         Assert.False(response.Success);
         Assert.NotNull(response.Error);
         Assert.Contains("not found", response.Error, StringComparison.OrdinalIgnoreCase);
         Log($"Correctly rejected: {response.Error}");
+    }
+
+    #endregion
+
+    #region GET /status and /health - connectivity contract
+
+    /// <summary>
+    /// A long-booted, Steam-authenticated server exposes the universal S-code and reports every
+    /// connectivity signal as healthy, on both /status and /health. /health must also still return
+    /// 200 (GetHealth throws on any non-2xx): its HTTP status is tied to game-thread liveness only,
+    /// never to Galaxy/relay state, so the Docker healthcheck does not restart a recovering server.
+    /// </summary>
+    [Fact]
+    [TestServer(WithSteam = true, Clients = 0)]
+    public async Task StatusAndHealth_OnSteamServer_ReportJoinableContract()
+    {
+        var ct = TestCt;
+
+        // Server readiness gates on the invite code; the relay stamp lands about a second later, and
+        // only then does the status read "ready".
+        var ready = await PollingHelper.WaitUntilAsync(
+            WaitName.Polling_ServerApi_ConnectionStatusReady,
+            async () => (await ServerApi.GetStatus(ct))?.ConnectionStatusCode == "ready",
+            TimeSpan.FromSeconds(30),
+            cancellationToken: ct
+        );
+        Assert.True(ready, "connectionStatusCode must reach 'ready' once the relay stamp lands");
+
+        var status = await ServerApi.GetStatus(ct);
+        Assert.NotNull(status);
+        Assert.False(
+            string.IsNullOrEmpty(status!.InviteCode),
+            "inviteCode must be exposed whenever the Galaxy lobby exists"
+        );
+        // Never a G-code: a Steam player who used one would join over Galaxy P2P and get a
+        // farmhand their Steam identity never sees.
+        Assert.True(
+            status.InviteCode!.StartsWith("S", StringComparison.Ordinal),
+            $"invite code must be the S-code; got '{status.InviteCode}'"
+        );
+
+        Assert.Equal("connected", status.GalaxyLobbyState);
+        Assert.Equal("connected", status.SteamSessionState);
+        Assert.True(
+            status.SteamRelayReady,
+            "steamRelayReady must be true once the relay stamp landed"
+        );
+        Assert.True(
+            status.AuthReadiness is "ok" or "expiring",
+            $"authReadiness must be ok or expiring on a Steam-authenticated server; got '{status.AuthReadiness ?? "null"}'"
+        );
+        Assert.Equal("ready", status.ConnectionStatusCode);
+
+        var health = await ServerApi.GetHealth(ct);
+        Assert.NotNull(health);
+        Assert.True(
+            health!.InviteCodePresent,
+            "/health.inviteCodePresent must be true when a code exists"
+        );
+        Assert.Equal("connected", health.GalaxyLobbyState);
+        Assert.Equal("connected", health.SteamSessionState);
+        Assert.True(health.SteamRelayReady);
+        Assert.Equal(status.AuthReadiness, health.AuthReadiness);
+    }
+
+    /// <summary>
+    /// A server without Steam auth (no STEAM_AUTH_URL) has no Galaxy: the Galaxy-side fields are null
+    /// rather than "down", there is no invite code, the connection status says so, and /health still
+    /// returns 200.
+    /// </summary>
+    [Fact]
+    [TestServer(Clients = 0)]
+    public async Task StatusAndHealth_OnLanServer_ReportNoGalaxy()
+    {
+        var ct = TestCt;
+
+        var status = await ServerApi.GetStatus(ct);
+        Assert.NotNull(status);
+        Assert.Null(status!.InviteCode);
+        Assert.Null(status.GalaxyLobbyState);
+        Assert.Null(status.AuthReadiness);
+        Assert.False(status.SteamRelayReady);
+        Assert.Equal("inviteUnavailable", status.ConnectionStatusCode);
+
+        var health = await ServerApi.GetHealth(ct);
+        Assert.NotNull(health);
+        Assert.False(health!.InviteCodePresent);
+        Assert.Null(health.GalaxyLobbyState);
+        Assert.Null(health.AuthReadiness);
     }
 
     #endregion
@@ -204,7 +276,7 @@ public class ServerApiTests : TestBase
     [TestServer(Clients = 0)]
     public async Task GetOpenApiSpec_ReturnsValidJson()
     {
-        var spec = await ServerApi.GetOpenApiSpec(TestContext.Current.CancellationToken);
+        var spec = await ServerApi.GetOpenApiSpec(TestCt);
 
         Assert.NotNull(spec);
         Assert.NotEmpty(spec);
@@ -236,7 +308,7 @@ public class ServerApiTests : TestBase
     [TestServer(Clients = 0)]
     public async Task Api_HandlesConcurrentRequests()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         var tasks = new List<Task<ServerStatus?>>
         {
             ServerApi.GetStatus(ct),
@@ -271,7 +343,7 @@ public class ServerApiTests : TestBase
     [TestServer(Clients = 0)]
     public async Task WebSocket_CanConnect()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         using var ws = new ClientWebSocket();
         var wsUrl = ServerApi.GetWebSocketUrl();
         Log($"Connecting to WebSocket: {wsUrl}");
@@ -291,7 +363,7 @@ public class ServerApiTests : TestBase
     [TestServer(Clients = 0)]
     public async Task WebSocket_PingPong()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         using var ws = new ClientWebSocket();
         var wsUrl = ServerApi.GetWebSocketUrl();
 
@@ -324,10 +396,10 @@ public class ServerApiTests : TestBase
     public async Task WebSocket_ChatSend_MessageAppearsInGame()
     {
         // Connect a player to receive the chat message
-        await Farmers.ConnectNewAsync(ct: TestContext.Current.CancellationToken);
+        await Farmers.ConnectFastAsync(ct: TestCt);
 
         // Send message via WebSocket API
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         using var ws = new ClientWebSocket();
         var wsUrl = ServerApi.GetWebSocketUrl();
         await ws.ConnectAsync(new Uri(wsUrl), ct);
@@ -348,13 +420,13 @@ public class ServerApiTests : TestBase
             WaitName.Polling_ServerApi_ChatMessageDelivered,
             async () =>
             {
-                chatHistory = await GameClient.GetChatHistory(20);
+                chatHistory = await GameClient.GetChatHistory();
                 return chatHistory?.Messages?.Any(m =>
                         m.Message.Contains(testMessage, StringComparison.OrdinalIgnoreCase)
                     ) == true;
             },
             TestTimings.ChatCommandTimeout,
-            cancellationToken: TestContext.Current.CancellationToken
+            cancellationToken: TestCt
         );
 
         Assert.NotNull(chatHistory);

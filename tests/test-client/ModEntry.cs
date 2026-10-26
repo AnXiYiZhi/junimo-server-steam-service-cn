@@ -33,6 +33,8 @@ public class ModEntry : Mod
     private GodTool? _godTool;
     private QiPlaneSkip? _qiPlaneSkip;
     private WeddingCutscenePlayer? _weddingPlayer;
+    private WeddingPaceCompressor? _weddingPaceCompressor;
+    private WeddingDialogueSpeedup? _weddingDialogueSpeedup;
 
     // Diagnostics
     private HealthWatchdog? _healthWatchdog;
@@ -90,6 +92,12 @@ public class ModEntry : Mod
         // day-boundary reset would race the ceremonies, see WeddingCutscenePlayer.ResetForNewSession).
         _weddingPlayer = new WeddingCutscenePlayer(Monitor);
 
+        _weddingPaceCompressor = new WeddingPaceCompressor(helper, Monitor);
+        _weddingPaceCompressor.Apply();
+
+        _weddingDialogueSpeedup = new WeddingDialogueSpeedup(Monitor, _harmony);
+        _weddingDialogueSpeedup.Apply();
+
         // Apply Steam/Galaxy auth patches (must be before Steam diagnostics)
         var authService = new ClientAuthService(helper, Monitor, _harmony);
         authService.Apply();
@@ -100,6 +108,12 @@ public class ModEntry : Mod
         // Test overlay for E2E test debugging
         TestOverlay.Apply(_harmony);
         ButtonTutorialSuppressor.Apply(_harmony);
+
+        // Make per-tick-constant gameplay (cutscene fades, NPC/event-actor walking) advance at real
+        // wall-clock speed regardless of CLIENT_TPS. Unlike the render-suppressed host, this client is
+        // a real (non-dedicated) instance, so the fade patch actually bites here — a wedding globalFade
+        // that crawled ~12× slow at CLIENT_TPS=5 now plays in real time.
+        TpsAgnosticPacing.Apply(_harmony, Monitor);
 
         // Diagnostics
         _healthWatchdog = new HealthWatchdog(helper, Monitor);
@@ -124,11 +138,13 @@ public class ModEntry : Mod
         // Extended spawn logging
         helper.Events.Multiplayer.PeerConnected += OnPeerConnected;
 
-        // Apply custom TPS if configured (reduces CPU usage for test clients)
+        // Apply custom TPS if configured (reduces CPU usage for test clients). Clamped to [1, 60] like
+        // the server's Env.ServerTps: above vanilla's fixed 60 per-tick gameplay outruns real time, and
+        // TpsAgnosticPacing can only add sub-steps, never skip vanilla's own.
         var clientTps = Environment.GetEnvironmentVariable("CLIENT_TPS");
         if (!string.IsNullOrEmpty(clientTps) && int.TryParse(clientTps, out var tps) && tps != 60)
         {
-            _targetTps = Math.Max(1, tps);
+            _targetTps = Math.Clamp(tps, 1, 60);
             helper.Events.GameLoop.UpdateTicked += OnFirstTickSetTps;
         }
 
@@ -681,6 +697,44 @@ public class ModEntry : Mod
         _server.Get(
             "actions/farm_buildings",
             _ => ExecuteOnGameThread(() => _actionsController!.GetFarmBuildings())
+        );
+
+        // GET /actions/location_warps - List the current location's warps as this client
+        // resolves them (the values a walk would use)
+        _server.Get(
+            "actions/location_warps",
+            _ => ExecuteOnGameThread(() => _actionsController!.GetLocationWarps())
+        );
+
+        // POST /actions/walk_onto_tile - Walk onto a warp/door tile the way real movement
+        // does (async transition; caller polls /status to confirm arrival)
+        _server.Post(
+            "actions/walk_onto_tile",
+            req =>
+            {
+                var body =
+                    TestApiServer.ReadBody<WalkOntoTileParams>(req) ?? new WalkOntoTileParams();
+                return ExecuteOnGameThread(() =>
+                    _actionsController!.WalkOntoTile(body.TileX, body.TileY, body.Direction)
+                );
+            }
+        );
+
+        // POST /actions/till_tile - Till a tile into a terrain HoeDirt via the vanilla hoe path
+        _server.Post(
+            "actions/till_tile",
+            req =>
+            {
+                var body = TestApiServer.ReadBody<TillTileParams>(req);
+                if (body == null)
+                {
+                    return new TillTileResult { Success = false, Error = "Missing body" };
+                }
+
+                return ExecuteOnGameThread(() =>
+                    _actionsController!.TillTile(body.LocationName, body.TileX, body.TileY)
+                );
+            }
         );
 
         // POST /actions/plant_crop - Plant a seed in a HoeDirt or IndoorPot at the given tile
@@ -1247,11 +1301,12 @@ public class ModEntry : Mod
         // LOCK CMPXCHG which cannot be optimized away.
         var state = 0;
 
-        // Capture the ambient correlation id on the HTTP handler thread so
-        // ClientEventLog emissions from the game-loop thread still carry it.
+        // Capture the ambient correlation ids on the HTTP handler thread so
+        // ClientEventLog emissions from the game-loop thread still carry them.
         // The game loop pumps its queue on its own thread; AsyncLocal does
-        // not flow across that boundary, so we re-bind it inside the action.
-        var capturedRequestId = Diagnostics.ClientRequestContext.RequestId;
+        // not flow across that boundary, so we re-bind inside the action.
+        var capturedRequestId = RequestContext.RequestId;
+        var capturedTestId = RequestContext.TestId;
 
         QueueGameAction(() =>
         {
@@ -1260,7 +1315,7 @@ public class ModEntry : Mod
                 return; // Caller timed out (state was 1); skip to avoid corrupting game state
             }
 
-            using var _correlationScope = Diagnostics.ClientRequestContext.Bind(capturedRequestId);
+            using var _correlationScope = RequestContext.Bind(capturedRequestId, capturedTestId);
             try
             {
                 result = action();
@@ -1380,10 +1435,11 @@ public class ModEntry : Mod
         var startTime = DateTime.UtcNow;
         var deadline = startTime.AddMilliseconds(timeoutMs);
 
-        // Capture ambient correlation id on the HTTP handler thread; re-bind
+        // Capture ambient correlation ids on the HTTP handler thread; re-bind
         // inside the game-thread continuation so any event emitted from the
-        // condition/failureDetector callbacks carries it.
-        var capturedRequestId = Diagnostics.ClientRequestContext.RequestId;
+        // condition/failureDetector callbacks carries them.
+        var capturedRequestId = RequestContext.RequestId;
+        var capturedTestId = RequestContext.TestId;
 
         while (DateTime.UtcNow < deadline)
         {
@@ -1394,8 +1450,9 @@ public class ModEntry : Mod
             var checkCompleted = false;
             QueueGameAction(() =>
             {
-                using var _correlationScope = Diagnostics.ClientRequestContext.Bind(
-                    capturedRequestId
+                using var _correlationScope = RequestContext.Bind(
+                    capturedRequestId,
+                    capturedTestId
                 );
                 try
                 {
@@ -1474,15 +1531,6 @@ public class ModEntry : Mod
         // Clear the wedding render record for the new session (SaveLoaded, not DayStarted — see
         // ResetForNewSession for why the day-boundary reset would race the ceremonies).
         _weddingPlayer?.ResetForNewSession();
-
-        // Increase chat buffer size for testing (default is 10, which truncates long command outputs)
-        // !lobby help produces 15 messages; 20 gives headroom. Sequence-based deduplication
-        // makes buffer size less critical than before.
-        if (Game1.chatBox != null)
-        {
-            Game1.chatBox.maxMessages = 20;
-            Monitor.Log("Increased chat buffer to 20 messages for testing", LogLevel.Trace);
-        }
     }
 
     private void OnPlayerWarped(object? sender, StardewModdingAPI.Events.WarpedEventArgs e)

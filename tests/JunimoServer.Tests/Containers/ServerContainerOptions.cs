@@ -26,9 +26,9 @@ public class ServerContainerOptions
     #region Game Settings (server-settings.json -> game)
 
     /// <summary>
-    /// Farm name. Default is "Junimo".
+    /// Farm name. Default is "Server".
     /// </summary>
-    public string FarmName { get; set; } = "Junimo";
+    public string FarmName { get; set; } = "Server";
 
     /// <summary>Boot farm type written to server-settings.json.</summary>
     public FarmTypeSetting FarmType { get; set; } = FarmTypeSetting.FromIndex(0);
@@ -78,6 +78,11 @@ public class ServerContainerOptions
     /// </summary>
     public bool AllowIpConnections { get; set; } = false;
 
+    /// <summary>
+    /// Whether players may relocate their cabin via the !cabin command.
+    /// </summary>
+    public bool AllowCabinRelocation { get; set; } = true;
+
     #endregion
 
     /// <summary>
@@ -91,6 +96,11 @@ public class ServerContainerOptions
     /// into /data/Mods at container start. See <see cref="ServerContainer"/>.
     /// </summary>
     public bool FixtureFarmMod { get; set; } = false;
+
+    /// <summary>
+    /// SERVER_TPS for this container. 0 (default) falls back to .env.test's SERVER_TPS (or 60).
+    /// </summary>
+    public int ServerTps { get; set; } = 0;
 
     #region Container Settings
 

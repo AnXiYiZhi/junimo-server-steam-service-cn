@@ -80,7 +80,8 @@ class WorkflowContractTests(unittest.TestCase):
             "org.opencontainers.image.version",
             "org.opencontainers.image.created",
             "io.anxi.upstream.tag",
-            "io.anxi.upstream.ref",
+            "io.anxi.upstream.revision",
+            "io.anxi.upstream.url",
         ):
             self.assertIn(label, workflow)
 

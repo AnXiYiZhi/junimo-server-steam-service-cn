@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Threading.Tasks;
+using JunimoServer.Services.AlwaysOn;
 using JunimoServer.Services.Auth;
 using JunimoServer.Services.CropSaver;
 using JunimoServer.Services.Lobby;
@@ -14,7 +15,9 @@ using StardewModdingAPI.Utilities;
 using StardewValley;
 using StardewValley.Characters;
 using StardewValley.Locations;
+using StardewValley.Monsters;
 using StardewValley.Objects;
+using StardewValley.Projectiles;
 using StardewValley.TerrainFeatures;
 
 namespace JunimoServer.Services.Api;
@@ -22,11 +25,6 @@ namespace JunimoServer.Services.Api;
 // Test-only HTTP endpoints (/test/*), split out from ApiService so the production
 // dispatcher never names them. Reachable only under Env.IsTest — see the gate in
 // ApiService.HandleRequest and the OpenAPI filter in ApiService.StartServer.
-//
-// SEAM: to compile these out of production binaries entirely, define
-// INCLUDE_TEST_ENDPOINTS for test builds only and wrap this file's body (and
-// ApiService.TestEndpoints.Models.cs's body) plus the two // SEAM references in
-// ApiService.cs (the dispatcher gate and the OpenAPI predicate).
 public partial class ApiService
 {
     /// <summary>
@@ -61,8 +59,17 @@ public partial class ApiService
                     case "/test/festival_state":
                         await WriteJsonAsync(response, await HandleGetTestFestivalStateAsync());
                         return;
+                    case "/test/farmevent_state":
+                        await WriteJsonAsync(response, await HandleGetTestFarmEventStateAsync());
+                        return;
                     case "/test/farmers":
                         await WriteJsonAsync(response, await HandleGetTestFarmersAsync(request));
+                        return;
+                    case "/test/object_at_tile":
+                        await WriteJsonAsync(
+                            response,
+                            await HandleGetTestObjectAtTileAsync(request)
+                        );
                         return;
                     case "/test/save_tmp_exists":
                         await WriteJsonAsync(response, HandleGetTestSaveTmpExists(request));
@@ -79,6 +86,12 @@ public partial class ApiService
                             await HandleGetTestNpcSpriteIntegrityAsync()
                         );
                         return;
+                    case "/test/pacing_probe_state":
+                        await WriteJsonAsync(
+                            response,
+                            await HandleGetTestPacingProbeStateAsync(request)
+                        );
+                        return;
                 }
                 break;
             case "POST":
@@ -93,14 +106,41 @@ public partial class ApiService
                     case "/test/saver_crop":
                         await WriteJsonAsync(response, await HandlePostTestSaverCropAsync(request));
                         return;
-                    case "/test/house_upgrade":
+                    case "/test/lightning_strike":
                         await WriteJsonAsync(
                             response,
-                            await HandlePostTestHouseUpgradeAsync(request)
+                            await HandlePostTestLightningStrikeAsync(request)
+                        );
+                        return;
+                    case "/test/debug_command":
+                        await WriteJsonAsync(
+                            response,
+                            await HandlePostTestDebugCommandAsync(request)
+                        );
+                        return;
+                    case "/test/host_farmhouse_bed":
+                        await WriteJsonAsync(
+                            response,
+                            await HandlePostTestHostFarmhouseBedAsync(request)
                         );
                         return;
                     case "/test/stamp_claim":
-                        await WriteJsonAsync(response, await HandlePostTestStampClaimAsync());
+                        await WriteJsonAsync(
+                            response,
+                            await HandlePostTestStampClaimAsync(request)
+                        );
+                        return;
+                    case "/test/precustomize_farmhand":
+                        await WriteJsonAsync(
+                            response,
+                            await HandlePostTestPrecustomizeFarmhandAsync(request)
+                        );
+                        return;
+                    case "/test/break_cabin_link":
+                        await WriteJsonAsync(
+                            response,
+                            await HandlePostTestBreakCabinLinkAsync(request)
+                        );
                         return;
                     case "/test/stamp_lobby_home":
                         await WriteJsonAsync(
@@ -138,6 +178,18 @@ public partial class ApiService
                     case "/test/force_save":
                         await WriteJsonAsync(response, await HandlePostTestForceSaveAsync());
                         return;
+                    case "/test/fail_next_newgame":
+                        await WriteJsonAsync(response, await HandlePostTestFailNextNewGameAsync());
+                        return;
+                    case "/test/set_ip_connections":
+                        await WriteJsonAsync(
+                            response,
+                            await HandlePostTestSetIpConnectionsAsync(request)
+                        );
+                        return;
+                    case "/test/host_menu":
+                        await WriteJsonAsync(response, await HandlePostTestHostMenuAsync(request));
+                        return;
                     case "/test/break_npc_sprite":
                         await WriteJsonAsync(
                             response,
@@ -146,6 +198,12 @@ public partial class ApiService
                         return;
                     case "/test/heal_npc_sprites":
                         await WriteJsonAsync(response, await HandlePostTestHealNpcSpritesAsync());
+                        return;
+                    case "/test/pacing_probe_spawn":
+                        await WriteJsonAsync(
+                            response,
+                            await HandlePostTestPacingProbeSpawnAsync(request)
+                        );
                         return;
                 }
                 break;
@@ -170,7 +228,11 @@ public partial class ApiService
             {
                 Utility.ForEachLocation(location =>
                 {
-                    var locName = location.Name;
+                    // LocationName carries the display Name for test row
+                    // addressing; UniqueLocationName and the IsManaged lookup
+                    // use NameOrUniqueName, the CropSaver entry key.
+                    var displayName = location.Name;
+                    var lookupName = location.NameOrUniqueName;
 
                     foreach (var feature in location.terrainFeatures.Values)
                     {
@@ -188,13 +250,14 @@ public partial class ApiService
                         crops.Add(
                             new TestCrop
                             {
-                                LocationName = locName,
+                                LocationName = displayName,
+                                UniqueLocationName = lookupName,
                                 TileX = (int)dirt.Tile.X,
                                 TileY = (int)dirt.Tile.Y,
                                 IsAlive = !crop.dead.Value,
                                 IsInPot = false,
                                 SeedItemId = crop.netSeedIndex.Value,
-                                IsManaged = CropSaverOverrides.IsManaged(locName, dirt.Tile),
+                                IsManaged = CropSaverOverrides.IsManaged(lookupName, dirt.Tile),
                                 IsSeasonImmune = location.IsCropSeasonImmune(),
                             }
                         );
@@ -217,13 +280,17 @@ public partial class ApiService
                         crops.Add(
                             new TestCrop
                             {
-                                LocationName = locName,
+                                LocationName = displayName,
+                                UniqueLocationName = lookupName,
                                 TileX = (int)pot.TileLocation.X,
                                 TileY = (int)pot.TileLocation.Y,
                                 IsAlive = !crop.dead.Value,
                                 IsInPot = true,
                                 SeedItemId = crop.netSeedIndex.Value,
-                                IsManaged = CropSaverOverrides.IsManaged(locName, pot.TileLocation),
+                                IsManaged = CropSaverOverrides.IsManaged(
+                                    lookupName,
+                                    pot.TileLocation
+                                ),
                                 IsSeasonImmune = location.IsCropSeasonImmune(),
                             }
                         );
@@ -263,6 +330,9 @@ public partial class ApiService
                 result.FestivalEndReady = Game1.netReady.GetNumberReady("festivalEnd");
                 result.FestivalEndRequired = Game1.netReady.GetNumberRequired("festivalEnd");
                 result.TimeOfDay = Game1.timeOfDay;
+                result.LuauIridiumStarfruitCount = Game1.player.team.luauIngredients.Count(i =>
+                    i is { ParentSheetIndex: 268, Quality: 3 }
+                );
                 result.Success = true;
             });
         }
@@ -321,6 +391,59 @@ public partial class ApiService
                     );
                 }
 
+                result.Success = true;
+            });
+        }
+        catch (Exception ex)
+        {
+            // Never LogLevel.Error here (test poison per .claude/rules/debugging.md) — surface via response.
+            result.Success = false;
+            result.Error = ex.Message;
+        }
+
+        return result;
+    }
+
+    [ApiEndpoint(
+        "GET",
+        "/test/object_at_tile",
+        Summary = "Whether an Object sits on a (location, tile), by the same lookup CabinPlacementValidator reads (test-only)",
+        Tag = "Test"
+    )]
+    [ApiResponse(typeof(TestObjectAtTileResponse), 200)]
+    private async Task<TestObjectAtTileResponse> HandleGetTestObjectAtTileAsync(
+        HttpListenerRequest request
+    )
+    {
+        // ?location=<name> (default "Farm")&x=&y=. Reads getObjectAtTile — the same lookup
+        // CabinPlacementValidator.IsTileBuildable reaches (CabinPlacementValidator.cs:138) — so a
+        // test can gate its !cabin on the obstacle being server-visible, which the periodic
+        // snapshots don't carry (mirrors /test/farmers + WaitForFarmerServerTile for a farmer).
+        var locationName = request.QueryString["location"] ?? "Farm";
+        var result = new TestObjectAtTileResponse();
+
+        if (
+            !int.TryParse(request.QueryString["x"], out var x)
+            || !int.TryParse(request.QueryString["y"], out var y)
+        )
+        {
+            result.Success = false;
+            result.Error = "x and y query parameters are required integers";
+            return result;
+        }
+
+        try
+        {
+            await RunOnGameThreadAsync(() =>
+            {
+                var location = Game1.getLocationFromName(locationName);
+                if (location == null)
+                {
+                    result.Success = true;
+                    return;
+                }
+
+                result.Present = location.getObjectAtTile(x, y) != null;
                 result.Success = true;
             });
         }
@@ -448,6 +571,34 @@ public partial class ApiService
     }
 
     [ApiEndpoint(
+        "GET",
+        "/test/farmevent_state",
+        Summary = "Read the host's active overnight FarmEvent (test-only)",
+        Tag = "Test"
+    )]
+    [ApiResponse(typeof(TestFarmEventStateResponse), 200)]
+    private async Task<TestFarmEventStateResponse> HandleGetTestFarmEventStateAsync()
+    {
+        var result = new TestFarmEventStateResponse();
+        try
+        {
+            await RunOnGameThreadAsync(() =>
+            {
+                result.Active = Game1.farmEvent != null;
+                result.Type = Game1.farmEvent?.GetType().Name;
+                result.Success = true;
+            });
+        }
+        catch (Exception ex)
+        {
+            result.Success = false;
+            result.Error = ex.Message;
+        }
+
+        return result;
+    }
+
+    [ApiEndpoint(
         "POST",
         "/test/farmevent",
         Summary = "Queue an overnight FarmEvent for the next night (test-only)",
@@ -466,6 +617,9 @@ public partial class ApiService
         StardewValley.Events.FarmEvent? farmEvent = type switch
         {
             "qiplane" => new StardewValley.Events.QiPlaneEvent(),
+            // Thunder + message only, no tile preconditions, and it takes several seconds of
+            // unpaused ticks to finish: the deterministic multi-tick farm event for pause tests.
+            "earthquake" => new StardewValley.Events.SoundInTheNightEvent(4),
             _ => null,
         };
 
@@ -474,7 +628,7 @@ public partial class ApiService
             return new TestFarmEventResponse
             {
                 Success = false,
-                Error = $"Unknown farm event type '{type}' (supported: qiplane)",
+                Error = $"Unknown farm event type '{type}' (supported: qiplane, earthquake)",
             };
         }
 
@@ -593,7 +747,9 @@ public partial class ApiService
                     Success = false,
                     Found = false,
                     Error =
-                        $"No SaverCrop entry at {body.LocationName} ({body.TileX},{body.TileY})",
+                        $"No SaverCrop entry at {body.LocationName} ({body.TileX},{body.TileY}). "
+                        + "Entries are keyed on the unique location name — pass "
+                        + "uniqueLocationName from the /test/crops row.",
                 };
                 return;
             }
@@ -627,36 +783,142 @@ public partial class ApiService
 
     [ApiEndpoint(
         "POST",
-        "/test/house_upgrade",
-        Summary = "Run a debug house-upgrade command on the host to verify it's blocked (test-only)",
+        "/test/lightning_strike",
+        Summary = "Run a deterministic lightning strike against the crop at a tile (test-only)",
         Tag = "Test"
     )]
-    [ApiResponse(typeof(TestHouseUpgradeResponse), 200)]
-    private async Task<TestHouseUpgradeResponse> HandlePostTestHouseUpgradeAsync(
+    [ApiResponse(typeof(TestLightningStrikeResponse), 200)]
+    private async Task<TestLightningStrikeResponse> HandlePostTestLightningStrikeAsync(
+        HttpListenerRequest request
+    )
+    {
+        TestLightningStrikeRequest? body = null;
+        try
+        {
+            using var reader = new System.IO.StreamReader(
+                request.InputStream,
+                request.ContentEncoding
+            );
+            var json = await reader.ReadToEndAsync();
+            if (!string.IsNullOrWhiteSpace(json))
+            {
+                body = JsonConvert.DeserializeObject<TestLightningStrikeRequest>(json);
+            }
+        }
+        catch (Exception ex)
+        {
+            return new TestLightningStrikeResponse
+            {
+                Success = false,
+                Error = $"Failed to parse body: {ex.Message}",
+            };
+        }
+
+        if (body == null || string.IsNullOrEmpty(body.LocationName))
+        {
+            return new TestLightningStrikeResponse
+            {
+                Success = false,
+                Error = "Missing 'locationName' in request body",
+            };
+        }
+
+        var tile = new Vector2(body.TileX, body.TileY);
+        var result = new TestLightningStrikeResponse();
+        try
+        {
+            await RunOnGameThreadAsync(() =>
+            {
+                var location = Game1.getLocationFromName(body.LocationName);
+                if (location == null)
+                {
+                    result.Error = $"Unknown location '{body.LocationName}'";
+                    return;
+                }
+
+                // Resolve through CropSaver's own lookup (terrain HoeDirt, else a
+                // Garden Pot's inner dirt) so the probe can't drift from the tracker.
+                // Vanilla lightning only ever targets farm.terrainFeatures
+                // (Utility.performLightningUpdate), but the pot path exercises the
+                // identical Crop.Kill enforcement seam, and pots are the only crop
+                // container the E2E client harness can place.
+                var dirt = SaverCrop.TryGetDirtAt(location, tile);
+                if (dirt?.crop == null)
+                {
+                    result.Error = $"No crop at {body.LocationName} ({body.TileX},{body.TileY})";
+                    return;
+                }
+
+                result.Found = true;
+
+                // Reproduce the crop branch of vanilla Utility.performLightningUpdate —
+                // HoeDirt.performToolAction(null, 50, tile) → crop.Kill() — inside the
+                // same lightning context the Harmony patch establishes, so
+                // KillCrop_Prefix sees a real strike. Deliberately skipped vanilla
+                // side effects: the RNG target roll (this endpoint exists to bypass it)
+                // and the cosmetic lightningStrikeEvent flash; the destroyed-feature
+                // removal never applies here because HoeDirt.performToolAction returns
+                // false on the damage path. crop.dead is a NetBool, so the kill
+                // replicates to clients on its own.
+                CropSaverOverrides.LightningUpdate_Prefix();
+                try
+                {
+                    dirt.performToolAction(null, 50, tile);
+                }
+                finally
+                {
+                    CropSaverOverrides.LightningUpdate_Finalizer();
+                }
+
+                result.CropAliveAfter = !dirt.crop.dead.Value;
+                result.IsManagedAfter = CropSaverOverrides.IsManaged(body.LocationName, tile);
+                result.Success = true;
+            });
+        }
+        catch (Exception ex)
+        {
+            // Never LogLevel.Error here (test poison per .claude/rules/debugging.md) —
+            // surface via the response.
+            result.Success = false;
+            result.Error = ex.Message;
+        }
+
+        return result;
+    }
+
+    [ApiEndpoint(
+        "POST",
+        "/test/debug_command",
+        Summary = "Run a vanilla debug command on the host via parseDebugInput (test-only)",
+        Tag = "Test"
+    )]
+    [ApiResponse(typeof(TestDebugCommandResponse), 200)]
+    private async Task<TestDebugCommandResponse> HandlePostTestDebugCommandAsync(
         HttpListenerRequest request
     )
     {
         var command = request.QueryString["command"];
         if (string.IsNullOrWhiteSpace(command))
         {
-            return new TestHouseUpgradeResponse
+            return new TestDebugCommandResponse
             {
                 Success = false,
                 Error = "Missing 'command' query parameter",
             };
         }
 
-        // Route through parseDebugInput so the real vanilla handler — and thus the
-        // HostFarmhouseUpgradeGuard Harmony prefix — is exercised, exactly as an admin typing it
-        // at the console would be. Set Success only after the command actually runs, so a throw
-        // can't report a false-positive pass to the guard test.
-        var result = new TestHouseUpgradeResponse();
+        // parseDebugInput runs the real vanilla handler, Harmony prefixes included. Success is set
+        // only after the command ran so a throw can't report a false pass. A warp command only
+        // arms the warp, so HostLocation is the pre-warp location; poll /diagnostics/state for
+        // arrival.
+        var result = new TestDebugCommandResponse();
         try
         {
             await RunOnGameThreadAsync(() =>
             {
                 Game1.game1.parseDebugInput(command);
                 result.HostHouseUpgradeLevel = Game1.MasterPlayer.HouseUpgradeLevel;
+                result.HostLocation = Game1.currentLocation?.NameOrUniqueName ?? "";
                 result.Success = true;
             });
         }
@@ -673,16 +935,161 @@ public partial class ApiService
 
     [ApiEndpoint(
         "POST",
+        "/test/host_farmhouse_bed",
+        Summary = "Replace every bed in the host farmhouse with the given bed item (test-only)",
+        Tag = "Test"
+    )]
+    [ApiResponse(typeof(TestHostFarmhouseBedResponse), 200)]
+    private async Task<TestHostFarmhouseBedResponse> HandlePostTestHostFarmhouseBedAsync(
+        HttpListenerRequest request
+    )
+    {
+        var bedId = request.QueryString["bedId"];
+        if (string.IsNullOrWhiteSpace(bedId))
+        {
+            return new TestHostFarmhouseBedResponse
+            {
+                Success = false,
+                Error = "Missing 'bedId' query parameter",
+            };
+        }
+
+        // Vanilla has no debug command that places furniture.
+        var result = new TestHostFarmhouseBedResponse();
+        try
+        {
+            await RunOnGameThreadAsync(() =>
+            {
+                var farmhouse = Utility.getHomeOfFarmer(Game1.player);
+                if (!HostFarmhouseUpgradeGuard.ReplaceBeds(farmhouse, bedId))
+                {
+                    result.Error = "Host farmhouse map has no DefaultBedPosition";
+                    return;
+                }
+
+                result.FarmHouseHasPlayerBed = farmhouse.GetPlayerBed() != null;
+                result.FarmHouseFurnitureCount = farmhouse.furniture.Count;
+                result.Success = true;
+            });
+        }
+        catch (Exception ex)
+        {
+            result.Success = false;
+            result.Error = ex.Message;
+        }
+
+        return result;
+    }
+
+    [ApiEndpoint(
+        "POST",
+        "/test/set_ip_connections",
+        Summary = "Flip the LAN/IP door at runtime (test-only)",
+        Tag = "Test"
+    )]
+    [ApiResponse(typeof(TestSetIpConnectionsResponse), 200)]
+    private async Task<TestSetIpConnectionsResponse> HandlePostTestSetIpConnectionsAsync(
+        HttpListenerRequest request
+    )
+    {
+        // Vanilla consults Game1.options.ipConnectionsEnabled per incoming Lidgren connection
+        // attempt (LidgrenServer.cs:152,158) — the listener always runs and this flag IS the
+        // door, the same one IpConnectionService sets from Server.AllowIpConnections at
+        // SaveLoaded. Flipping it at runtime therefore reproduces the production IP-off
+        // posture exactly, letting the shared steam test server exercise the platform-only
+        // configuration without forking the per-run steam server config (a per-host-slice
+        // account-cost constraint, see test-broker-invariants.md).
+        var enabled = string.Equals(
+            request.QueryString["enabled"],
+            "true",
+            StringComparison.OrdinalIgnoreCase
+        );
+
+        var result = new TestSetIpConnectionsResponse();
+        try
+        {
+            await RunOnGameThreadAsync(() =>
+            {
+                Game1.options.ipConnectionsEnabled = enabled;
+                result.Enabled = enabled;
+                result.Success = true;
+            });
+        }
+        catch (Exception ex)
+        {
+            // Never LogLevel.Error here (test poison per .claude/rules/debugging.md) — surface via response.
+            result.Success = false;
+            result.Error = ex.Message;
+        }
+
+        return result;
+    }
+
+    [ApiEndpoint(
+        "POST",
+        "/test/host_menu",
+        Summary = "Open or close an inert host menu to exercise the festival leave-end gate (test-only)",
+        Tag = "Test"
+    )]
+    [ApiResponse(typeof(TestHostMenuResponse), 200)]
+    private async Task<TestHostMenuResponse> HandlePostTestHostMenuAsync(
+        HttpListenerRequest request
+    )
+    {
+        // ?open=true|false. Sets an inert menu that no host handler auto-clears, holding
+        // HandleFestivalLeave's leave-end gate (activeClickableMenu is null) closed until closed here.
+        var open = string.Equals(
+            request.QueryString["open"],
+            "true",
+            StringComparison.OrdinalIgnoreCase
+        );
+
+        var result = new TestHostMenuResponse();
+        try
+        {
+            await RunOnGameThreadAsync(() =>
+            {
+                Game1.activeClickableMenu = open ? new TestHoldMenu() : null;
+                result.MenuOpen = Game1.activeClickableMenu != null;
+                result.Success = true;
+            });
+        }
+        catch (Exception ex)
+        {
+            // Never LogLevel.Error here (test poison per .claude/rules/debugging.md) — surface via response.
+            result.Success = false;
+            result.Error = ex.Message;
+        }
+
+        return result;
+    }
+
+    /// <summary>Inert menu holding Game1.activeClickableMenu non-null with no side effects, for /test/host_menu.</summary>
+    private sealed class TestHoldMenu : StardewValley.Menus.IClickableMenu { }
+
+    [ApiEndpoint(
+        "POST",
         "/test/stamp_claim",
         Summary = "Stamp a synthetic abandoned slot claim onto an uncustomized homed farmhand (test-only)",
         Tag = "Test"
     )]
     [ApiResponse(typeof(TestStampClaimResponse), 200)]
-    private async Task<TestStampClaimResponse> HandlePostTestStampClaimAsync()
+    private async Task<TestStampClaimResponse> HandlePostTestStampClaimAsync(
+        HttpListenerRequest request
+    )
     {
         // Synthetic platform id mimicking a Steam/GOG stamp. Fixed so a test could match it,
         // but the test only needs StampedUid; the value just has to be non-empty.
         const string syntheticUserId = "test-stuck-claim-9999";
+
+        // Synthetic Steam64 for the optional ownership record (?withOwner=true) — the
+        // map-only/map+stamp abandoned-claim shapes the heal and sweep must clear.
+        const string syntheticOwnerId = "76561198000009999";
+        var withOwner = string.Equals(
+            request.QueryString["withOwner"],
+            "true",
+            StringComparison.OrdinalIgnoreCase
+        );
 
         var result = new TestStampClaimResponse();
         try
@@ -696,50 +1103,299 @@ public partial class ApiService
                     return;
                 }
 
-                // Find an unclaimed slot with an existing farmhand entry whose home resolves to its
-                // cabin: owner present, not customized, no userID yet (exactly IsCabinAvailable's
-                // "available" shape). Stamping its userID reproduces the homed abandoned-claim state
-                // — the case vanilla's load-time ResetFarmhandState does NOT clear (NetWorldState.cs
-                // :783 returns true for a homed farmhand, skipping the userID-clearing else-branch),
-                // so only the sweep heals it on reload.
-                foreach (var building in farm.buildings)
+                // An available slot (owner present, not customized, no userID) is exactly the shape
+                // to stamp: setting its userID reproduces the homed abandoned-claim state — the case
+                // vanilla's load-time ResetFarmhandState does NOT clear (NetWorldState.cs:783 returns
+                // true for a homed farmhand, skipping the userID-clearing else-branch), so only the
+                // sweep heals it on reload.
+                var cabin = _cabinManager.FindAvailableCabinWithOwner();
+                if (cabin == null)
                 {
-                    if (!building.isCabin || LobbyService.IsLobbyCabin(building))
+                    result.Error =
+                        "No uncustomized, unclaimed cabin slot with an owner entry found to stamp";
+                    return;
+                }
+
+                var owner = cabin.owner;
+
+                // Pin homeLocation to this cabin so TryAssignFarmhandHome resolves on reload
+                // (the slot's home should already be its cabin; set it to be deterministic).
+                owner.homeLocation.Value = cabin.NameOrUniqueName;
+                owner.userID.Value = syntheticUserId;
+                if (withOwner)
+                {
+                    _farmhandOwnership.RecordOwner(
+                        owner.UniqueMultiplayerID,
+                        ConnectionTransport.PlatformSteam,
+                        syntheticOwnerId
+                    );
+                    result.StampedOwner = true;
+                }
+
+                result.StampedUid = owner.UniqueMultiplayerID;
+                result.StampedUserId = syntheticUserId;
+                result.HomeLocation = owner.homeLocation.Value ?? "";
+                result.Success = true;
+            });
+        }
+        catch (Exception ex)
+        {
+            // Never LogLevel.Error here (test poison per .claude/rules/debugging.md) — surface via response.
+            result.Success = false;
+            result.Error = ex.Message;
+        }
+
+        return result;
+    }
+
+    [ApiEndpoint(
+        "POST",
+        "/test/precustomize_farmhand",
+        Summary = "Pre-customize spare farmhand slots so joining clients take the no-menu fast path (test-only)",
+        Tag = "Test"
+    )]
+    [ApiResponse(typeof(TestPrecustomizeFarmhandResponse), 200)]
+    private async Task<TestPrecustomizeFarmhandResponse> HandlePostTestPrecustomizeFarmhandAsync(
+        HttpListenerRequest request
+    )
+    {
+        TestPrecustomizeFarmhandRequest? body;
+        try
+        {
+            using var reader = new System.IO.StreamReader(
+                request.InputStream,
+                request.ContentEncoding
+            );
+            var json = await reader.ReadToEndAsync();
+            body = string.IsNullOrWhiteSpace(json)
+                ? null
+                : JsonConvert.DeserializeObject<TestPrecustomizeFarmhandRequest>(json);
+        }
+        catch (Exception ex)
+        {
+            return new TestPrecustomizeFarmhandResponse
+            {
+                Success = false,
+                Error = $"Failed to parse body: {ex.Message}",
+            };
+        }
+
+        if (
+            body?.Names == null
+            || body.Names.Count == 0
+            || body.Names.Any(string.IsNullOrWhiteSpace)
+        )
+        {
+            return new TestPrecustomizeFarmhandResponse
+            {
+                Success = false,
+                Error = "Body must contain a non-empty 'names' list of non-blank farmhand names",
+            };
+        }
+
+        // Fail closed before mutating (matches /test/set_date): without a loaded world there are
+        // no farmhand slots to customize.
+        if (Game1.gameMode != 3 || !Game1.IsServer)
+        {
+            return new TestPrecustomizeFarmhandResponse
+            {
+                Success = false,
+                Error = "Server not ready",
+            };
+        }
+
+        var result = new TestPrecustomizeFarmhandResponse();
+        try
+        {
+            await RunOnGameThreadAsync(() =>
+            {
+                var farm = Game1.getFarm();
+                if (farm == null)
+                {
+                    result.Error = "No farm loaded";
+                    return;
+                }
+
+                // Guarantee a slot per requested name up front; the loop below then can't starve
+                // unless cabin builds failed.
+                _cabinManager.EnsureAtLeastXCabins(body.Names.Count);
+
+                foreach (var name in body.Names)
+                {
+                    var cabin = _cabinManager.FindAvailableCabinWithOwner();
+                    if (cabin == null)
                     {
-                        continue;
+                        result.Error =
+                            $"No available cabin slot left for '{name}' "
+                            + $"({result.Farmhands.Count}/{body.Names.Count} slots customized before exhaustion)";
+                        return;
                     }
 
-                    var cabin = building.GetIndoors<Cabin>();
-                    var owner = cabin?.owner;
-                    if (owner == null)
-                    {
-                        continue;
-                    }
+                    var owner = cabin.owner;
 
-                    if (owner.isCustomized.Value)
-                    {
-                        continue;
-                    }
-
-                    if (!string.IsNullOrEmpty(owner.userID.Value))
-                    {
-                        continue;
-                    }
-
-                    // Pin homeLocation to this cabin so TryAssignFarmhandHome resolves on reload
-                    // (the slot's home should already be its cabin; set it to be deterministic).
+                    // isCustomized=true with an EMPTY userID makes the slot a returning farmer any
+                    // client may select (IsFarmhandSelectableByUserId), so the test client's
+                    // already-customized fast path skips the character menu entirely. A userID
+                    // stamp here would route the join through vanilla authCheck string-equality
+                    // and reject LAN clients, whose getUserID() is "".
+                    owner.isCustomized.Value = true;
+                    owner.Name = name;
+                    owner.displayName = name; // plain Character field, not a NetField
                     owner.homeLocation.Value = cabin.NameOrUniqueName;
-                    owner.userID.Value = syntheticUserId;
 
-                    result.StampedUid = owner.UniqueMultiplayerID;
-                    result.StampedUserId = syntheticUserId;
-                    result.HomeLocation = owner.homeLocation.Value ?? "";
+                    result.Farmhands.Add(
+                        new TestPrecustomizedFarmhand
+                        {
+                            Uid = owner.UniqueMultiplayerID,
+                            Name = name,
+                            HomeLocation = owner.homeLocation.Value,
+                        }
+                    );
+                }
+
+                result.Success = true;
+            });
+        }
+        catch (Exception ex)
+        {
+            // Never LogLevel.Error here (test poison per .claude/rules/debugging.md) — surface via response.
+            result.Success = false;
+            result.Error = ex.Message;
+        }
+
+        if (result.Success)
+        {
+            Monitor.Log(
+                $"Precustomized {result.Farmhands.Count} farmhand slot(s) via test API",
+                LogLevel.Info
+            );
+        }
+
+        return result;
+    }
+
+    [ApiEndpoint(
+        "POST",
+        "/test/break_cabin_link",
+        Summary = "Null a cabin's farmhandReference to manufacture a one-way farmhand↔cabin link (test-only)",
+        Tag = "Test"
+    )]
+    [ApiResponse(typeof(TestBreakCabinLinkResponse), 200)]
+    private async Task<TestBreakCabinLinkResponse> HandlePostTestBreakCabinLinkAsync(
+        HttpListenerRequest request
+    )
+    {
+        var result = new TestBreakCabinLinkResponse();
+
+        if (!long.TryParse(request.QueryString["ownerId"], out var ownerId))
+        {
+            result.Error = "ownerId query parameter is required (a farmhand UniqueMultiplayerID)";
+            return result;
+        }
+
+        // Optional: repoint the farmhand's home at ANOTHER farmhand's cabin, producing the
+        // unrecoverable shape (home cabin owned by someone else) the join-time repair must decline.
+        long.TryParse(request.QueryString["redirectHomeToOwner"], out var redirectOwnerId);
+
+        // Optional: install a fresh unclaimed placeholder as the farmhand's OWN home cabin's owner,
+        // producing the recoverable "home cabin owned by a spurious placeholder" shape the join-time
+        // repair must HEAL (delete the placeholder, re-home the owner) rather than decline or orphan.
+        bool.TryParse(
+            request.QueryString["makeHomeOwnerPlaceholder"],
+            out var makeHomeOwnerPlaceholder
+        );
+
+        try
+        {
+            await RunOnGameThreadAsync(() =>
+            {
+                var farm = Game1.getFarm();
+                if (farm == null)
+                {
+                    result.Error = "No farm loaded";
+                    return;
+                }
+
+                var cabin = farm.GetCabin(ownerId)?.GetIndoors<Cabin>();
+                if (cabin == null)
+                {
+                    result.Error = $"No cabin owned by {ownerId} found to break";
+                    return;
+                }
+
+                var farmhand = Game1.GetPlayer(ownerId);
+                if (farmhand == null)
+                {
+                    result.Error = $"Farmhand {ownerId} not found";
+                    return;
+                }
+
+                result.BrokenCabinName = cabin.NameOrUniqueName;
+
+                if (makeHomeOwnerPlaceholder)
+                {
+                    // Manufacture the corruption ON the farmhand's OWN cabin: a fresh uncustomized
+                    // placeholder becomes the cabin's owner while the farmhand still homes here.
+                    // GetCabin(ownerId) then returns null (owner is the placeholder) while
+                    // homeLocation still resolves to this cabin — the shape the join-time repair must
+                    // heal by DELETING the placeholder and re-homing the owner. Mirrors
+                    // Cabin.CreateFarmhand's placeholder shape (farmhandData entry + home set).
+                    long placeholderId;
+                    do
+                    {
+                        placeholderId = Utility.RandomLong();
+                    } while (Game1.GetPlayer(placeholderId) != null);
+
+                    var placeholder = new Farmer(
+                        new FarmerSprite(null),
+                        Vector2.Zero,
+                        1,
+                        "",
+                        Farmer.initialTools(),
+                        isMale: true
+                    )
+                    {
+                        UniqueMultiplayerID = placeholderId,
+                    };
+                    placeholder.homeLocation.Value = cabin.NameOrUniqueName;
+                    Game1.netWorldState.Value.farmhandData[placeholderId] = placeholder;
+                    cabin.farmhandReference.Value = placeholder;
+                    farmhand.homeLocation.Value = cabin.NameOrUniqueName;
+
+                    result.PlaceholderOwnerId = placeholderId;
+                    result.HomeLocation = farmhand.homeLocation.Value ?? "";
                     result.Success = true;
                     return;
                 }
 
-                result.Error =
-                    "No uncustomized, unclaimed cabin slot with an owner entry found to stamp";
+                if (redirectOwnerId != 0)
+                {
+                    var otherCabin = farm.GetCabin(redirectOwnerId)?.GetIndoors<Cabin>();
+                    if (otherCabin == null)
+                    {
+                        result.Error =
+                            $"No cabin owned by redirectHomeToOwner {redirectOwnerId} found";
+                        return;
+                    }
+
+                    // farmhand→another player's cabin: the repair must decline (owner mismatch),
+                    // never steal the other cabin.
+                    farmhand.homeLocation.Value = otherCabin.NameOrUniqueName;
+                    result.Redirected = true;
+                }
+                else
+                {
+                    // Keep farmhand→own cabin so the one-way link is recoverable.
+                    farmhand.homeLocation.Value = cabin.NameOrUniqueName;
+                }
+
+                // Break cabin→farmhand: GetCabin(ownerId) now returns null while homeLocation still
+                // resolves to a Cabin — the exact one-way link the join gate approves anyway
+                // (NetWorldState.TryAssignFarmhandHome's homeLocation-resolves-to-Cabin early return).
+                cabin.farmhandReference.Value = null;
+
+                result.HomeLocation = farmhand.homeLocation.Value ?? "";
+                result.Success = true;
             });
         }
         catch (Exception ex)
@@ -1090,27 +1746,12 @@ public partial class ApiService
                 // cross-farmhand collision the import guard must catch.
                 if (!string.IsNullOrEmpty(body.InjectFarmhandUserId))
                 {
-                    var stamped = false;
-                    foreach (var building in Game1.getFarm().buildings)
+                    var spareSlot = _cabinManager.FindAvailableCabinWithOwner()?.owner;
+                    if (spareSlot != null)
                     {
-                        if (!building.isCabin || LobbyService.IsLobbyCabin(building))
-                        {
-                            continue;
-                        }
-                        var slot = building.GetIndoors<Cabin>()?.owner;
-                        if (
-                            slot == null
-                            || slot.isCustomized.Value
-                            || !string.IsNullOrEmpty(slot.userID.Value)
-                        )
-                        {
-                            continue;
-                        }
-                        slot.userID.Value = body.InjectFarmhandUserId;
-                        stamped = true;
-                        break;
+                        spareSlot.userID.Value = body.InjectFarmhandUserId;
                     }
-                    result.FarmhandUserIdInjected = stamped;
+                    result.FarmhandUserIdInjected = spareSlot != null;
                 }
 
                 result.OwnerUid = master.UniqueMultiplayerID;
@@ -1555,6 +2196,26 @@ public partial class ApiService
 
     [ApiEndpoint(
         "POST",
+        "/test/fail_next_newgame",
+        Summary = "Make the next new-game creation throw, to exercise failed-creation recovery (test-only)",
+        Tag = "Test"
+    )]
+    [ApiResponse(typeof(TestFailNextNewGameResponse), 200)]
+    private async Task<TestFailNextNewGameResponse> HandlePostTestFailNextNewGameAsync()
+    {
+        var gameManager = GameManager.GameManagerService.Instance;
+        if (gameManager == null)
+        {
+            return new TestFailNextNewGameResponse { Error = "Game manager not initialized yet" };
+        }
+
+        // The flag is read and cleared on the game thread, so it is written there too.
+        await RunOnGameThreadAsync(gameManager.FailNextNewGameForTest);
+        return new TestFailNextNewGameResponse { Success = true };
+    }
+
+    [ApiEndpoint(
+        "POST",
         "/test/force_save",
         Summary = "Persist the current world synchronously, without a day transition (test-only)",
         Tag = "Test"
@@ -1563,17 +2224,10 @@ public partial class ApiService
     private async Task<TestForceSaveResponse> HandlePostTestForceSaveAsync()
     {
         // Flushes in-memory state (seeded Game1 mutations + a connected client's customization) to
-        // the save folder without a sleep/day-transition. Lets save-import source generation shed
-        // the ~full-in-game-day SleepToSaveAsync wait. Mirrors the day-transition save's two steps:
-        //   1. saveFarmhands() clones every connected farmhand's live root into farmhandData
-        //      (Multiplayer.cs:1018-1028 → NetWorldState.SaveFarmhand) — same call the transition
-        //      makes (Game1.cs:8238). A homed/customized connected farmhand survives intact;
-        //      ResetFarmhandState only clears userID/home for a HOMELESS farmhand.
-        //   2. getSaveEnumerator() does the actual file write. SaveGame.Save() normally offloads
-        //      this to a background Task and yields across ticks (SaveGame.cs:296-310), but the
-        //      enumerator itself is fully synchronous (SaveGame.cs:346-546 — the yields are just
-        //      progress markers). Driving it inline writes the save within this one game-thread
-        //      Action, sidestepping the background-task split and the UpdateTicked save-suppression.
+        // the save folder without a sleep/day-transition — see SaveNow for the mechanism. Lets
+        // save-import source generation shed the ~full-in-game-day SleepToSaveAsync wait. The
+        // connected-farmhand caveat in SaveNow is acceptable here: test flows control exactly who
+        // is connected when they force a save.
         var result = new TestForceSaveResponse();
         try
         {
@@ -1581,18 +2235,11 @@ public partial class ApiService
             await RunOnGameThreadAsync(
                 () =>
                 {
-                    if (Game1.gameMode != 3 || !Game1.IsMasterGame)
+                    if (!SaveNow.TrySave(Helper, out var error))
                     {
-                        result.Error =
-                            $"Not in a loaded master game (gameMode={Game1.gameMode}, IsMasterGame={Game1.IsMasterGame})";
+                        result.Error = error;
                         return;
                     }
-
-                    // Game1.multiplayer is protected; reach it via the established reflective accessor.
-                    Helper.GetMultiplayer().saveFarmhands();
-
-                    var save = SaveGame.getSaveEnumerator();
-                    while (save.MoveNext()) { }
 
                     result.SaveFolderName = Constants.SaveFolderName;
                     result.Success = true;
@@ -1683,6 +2330,19 @@ public partial class ApiService
                 result.DialogueUp = Game1.dialogueUp;
                 result.HostLocationIsTemporary = Game1.currentLocation?.IsTemporary == true;
                 result.HostCurrentLocation = Game1.currentLocation?.NameOrUniqueName;
+
+                // Location alone can't pin the post-wedding park normalization — the vanilla wedding
+                // exit warp also lands on the Farm (at the farmhouse porch), so report whether the
+                // host stands exactly on the Farm default warp tile (the park target
+                // WarpHostToFarmAfterWeddings / HideHostActivity resolve via getDefaultWarpLocation).
+                var hostTile = Game1.player.TilePoint;
+                result.HostTileX = hostTile.X;
+                result.HostTileY = hostTile.Y;
+                int parkX = 0,
+                    parkY = 0;
+                Utility.getDefaultWarpLocation("Farm", ref parkX, ref parkY);
+                result.HostAtFarmParkSpot =
+                    Game1.currentLocation is Farm && hostTile.X == parkX && hostTile.Y == parkY;
 
                 if (farmhandId != 0)
                 {
@@ -1826,5 +2486,381 @@ public partial class ApiService
         }
 
         return result;
+    }
+
+    // === TPS-agnostic-pacing combat probe (test-only) ===
+    // Spawns one per-tick-physics entity (projectile / debris / flyer monster) in the HOST's own
+    // location — which the server simulates (the host is a Farmer there, IsMasterGame always true) — so
+    // the probe needs no connected client. The paired state endpoint reads the entity's measured quantity
+    // so a test can compare wall-clock behavior with SDVD_TPS_AGNOSTIC_PACING on vs off at the same TPS.
+    // The spawn offsets assume the host stands at its standard Farm park spot (HideHostActivity warps it
+    // there on every day start), where every offset has open in-bounds runway; the spawn handler
+    // fail-fasts if the host's actual position puts any part of a probe's motion envelope outside the map.
+
+    // The spawned probe entities, tracked so the state endpoint can read them back. Typed as object (not
+    // the StardewValley types) and coords as floats so ApiService's field metadata carries NO game-type
+    // references — the OpenAPI generator reflects ApiService via Assembly.GetType across the net10-tool /
+    // net6-mod boundary, and a StardewValley-typed field there makes that GetType return null ("ApiService
+    // type not found"). Cast back inside the handlers, which run
+    // on the game thread where the types are loaded. Referenced only from the game thread (both handlers
+    // marshal via RunOnGameThreadAsync), so no synchronization needed.
+    private object? _probeProjectile;
+    private object? _probeDebris;
+    private object? _probeMonster;
+    private object? _probeLocation;
+    private float _probeMonsterSpawnX;
+    private float _probeMonsterSpawnY;
+
+    [ApiEndpoint(
+        "POST",
+        "/test/pacing_probe_spawn",
+        Summary = "Spawn a per-tick-physics probe entity (projectile/debris/monster/knockback) in the host location (test-only)",
+        Tag = "Test"
+    )]
+    [ApiResponse(typeof(PacingProbeSpawnResponse), 200)]
+    private async Task<PacingProbeSpawnResponse> HandlePostTestPacingProbeSpawnAsync(
+        HttpListenerRequest request
+    )
+    {
+        var result = new PacingProbeSpawnResponse();
+
+        PacingProbeSpawnRequest? body;
+        try
+        {
+            using var reader = new System.IO.StreamReader(
+                request.InputStream,
+                request.ContentEncoding
+            );
+            var json = await reader.ReadToEndAsync();
+            body = string.IsNullOrWhiteSpace(json)
+                ? new PacingProbeSpawnRequest()
+                : JsonConvert.DeserializeObject<PacingProbeSpawnRequest>(json);
+        }
+        catch (Exception ex)
+        {
+            result.Success = false;
+            result.Error = $"Failed to parse body: {ex.Message}";
+            return result;
+        }
+
+        if (!TryParseProbeKind(body?.Kind, out var kind))
+        {
+            result.Success = false;
+            result.Error =
+                $"Unknown probe kind '{body?.Kind}' (expected projectile/debris/monster/knockback).";
+            return result;
+        }
+
+        if (Game1.gameMode != 3 || !Game1.IsServer)
+        {
+            result.Success = false;
+            result.Error = "Server not ready";
+            return result;
+        }
+
+        try
+        {
+            await RunOnGameThreadAsync(() =>
+            {
+                var location = Game1.player.currentLocation;
+                if (location == null)
+                {
+                    result.Error = "Host has no current location";
+                    return;
+                }
+
+                result.LocationName = location.NameOrUniqueName;
+                var origin = Game1.player.Position;
+
+                // One spawn point per kind, computed up front so the bounds guard below checks exactly
+                // what the spawn cases use.
+                var debrisDropOrigin = origin + new Vector2(640f, -128f);
+                var batSpawnPos = origin + new Vector2(640f, 0f);
+                var slimeSpawnPos = origin + new Vector2(320f, 0f);
+
+                // Fail fast unless the probe's full MOTION ENVELOPE — spawn point plus everywhere the
+                // entity travels during the measurement — fits inside the host location's map. From an
+                // unexpected host spot, an entity that spawns or drifts out of bounds is deleted by
+                // vanilla mid-measurement, which would otherwise surface only as an empty/short state
+                // read seconds later.
+                var (envelopeMin, envelopeMax) = kind switch
+                {
+                    // Chunks spawn at the drop origin − 32 px on each axis (Debris.InitializeChunks)
+                    // and settle within ~64 px of the drop point (updateChunks bounce/drift).
+                    PacingProbeKind.Debris => (
+                        debrisDropOrigin - new Vector2(96f, 96f),
+                        debrisDropOrigin + new Vector2(96f, 96f)
+                    ),
+                    // Homes west from its spawn onto the host and overshoots a few tiles past it.
+                    PacingProbeKind.Monster => (
+                        origin - new Vector2(192f, 64f),
+                        batSpawnPos + new Vector2(64f, 64f)
+                    ),
+                    // The 100 px/tick knockback impulse slides it ~400 px further east before friction
+                    // stops it — the very distance the test measures.
+                    PacingProbeKind.Knockback => (
+                        slimeSpawnPos - new Vector2(64f, 64f),
+                        slimeSpawnPos + new Vector2(512f, 64f)
+                    ),
+                    // Fires from the host and ricochets off walls/obstacles — no free path needed.
+                    _ => (origin, origin),
+                };
+                var map = location.map;
+                if (
+                    envelopeMin.X < 0
+                    || envelopeMin.Y < 0
+                    || envelopeMax.X >= map.DisplayWidth
+                    || envelopeMax.Y >= map.DisplayHeight
+                )
+                {
+                    result.Error =
+                        $"Probe motion envelope ({envelopeMin.X:F0},{envelopeMin.Y:F0})–"
+                        + $"({envelopeMax.X:F0},{envelopeMax.Y:F0}) exceeds the map bounds of "
+                        + $"'{location.NameOrUniqueName}' ({map.DisplayWidth}x{map.DisplayHeight} px); "
+                        + $"host is at ({origin.X:F0}, {origin.Y:F0}). The probes assume the host stands "
+                        + "at its Farm park spot (HideHostActivity) — something moved it.";
+                    return;
+                }
+
+                // Remove all prior probe entities (by identity, from their own spawn location) so a later
+                // state read for any kind can only ever see THIS spawn's entity, and no leaked entity can
+                // contaminate it (a leftover probe projectile ricochets forever and damages monsters, so
+                // it could hit a later monster/knockback probe). Unrelated world entities are untouched.
+                RemoveTrackedProbes();
+                _probeLocation = location;
+
+                switch (kind)
+                {
+                    case PacingProbeKind.Projectile:
+                    {
+                        // Fire one projectile horizontally from the host. A high bounce count makes
+                        // travelDistance accumulate at the wall-clock rate regardless of farm geometry —
+                        // the projectile ricochets off any wall/obstacle instead of being destroyed, so
+                        // the measurement doesn't depend on a clear line of fire.
+                        // damagesMonsters=true so it targets monsters (none on the idle Farm), not the host.
+                        var projectile = new BasicProjectile(
+                            damageToFarmer: 0,
+                            spriteIndex: 0,
+                            bouncesTillDestruct: 100000,
+                            tailLength: 0,
+                            rotationVelocity: 0f,
+                            xVelocity: 8f,
+                            yVelocity: 0f,
+                            startingPosition: origin,
+                            damagesMonsters: true,
+                            location: location,
+                            firer: Game1.player
+                        );
+                        projectile.ignoreTravelGracePeriod.Value = true;
+                        location.projectiles.Add(projectile);
+                        _probeProjectile = projectile;
+                        result.Count = 1;
+                        break;
+                    }
+                    case PacingProbeKind.Debris:
+                    {
+                        // Drop an object debris well away from the host so its chunks fall and settle
+                        // WITHOUT being magnetized-and-collected (object debris homes to a nearby player
+                        // once done bouncing; 640 px keeps it outside the ~64 px pickup range for the
+                        // measurement window).
+                        var debris = new Debris(
+                            "(O)388", // Wood — an ordinary object drop
+                            debrisDropOrigin,
+                            debrisDropOrigin
+                        );
+                        location.debris.Add(debris);
+                        _probeDebris = debris;
+                        result.Count = 1;
+                        break;
+                    }
+                    case PacingProbeKind.Monster:
+                    {
+                        // Spawn a Bat a fixed distance from the host so it homes in; measure how far it closes.
+                        var bat = new Bat(batSpawnPos) { focusedOnFarmers = true };
+                        location.characters.Add(bat);
+                        _probeMonster = bat;
+                        _probeMonsterSpawnX = batSpawnPos.X;
+                        _probeMonsterSpawnY = batSpawnPos.Y;
+                        result.Count = 1;
+                        break;
+                    }
+                    case PacingProbeKind.Knockback:
+                    {
+                        // Spawn a WALKING monster (GreenSlime — not a glider, so at rest its velocity is 0)
+                        // and hit it with a fixed knockback impulse; measure how far the impulse carries it
+                        // before friction stops it. Non-glider is essential: gliders are always
+                        // velocity-driven, which would muddy a clean knockback measurement.
+                        var slime = new GreenSlime(slimeSpawnPos);
+                        location.characters.Add(slime);
+                        // Large impulse along +x, away from the host, so it dominates any velocity the
+                        // slime's own AI adds (its hop toward the player) and gives a clean knockback slide.
+                        // setTrajectory routes through the master-only doSetTrajectory, which sets xVelocity
+                        // when the impulse exceeds current velocity.
+                        slime.setTrajectory(100, 0);
+                        _probeMonster = slime;
+                        _probeMonsterSpawnX = slimeSpawnPos.X;
+                        _probeMonsterSpawnY = slimeSpawnPos.Y;
+                        result.Count = 1;
+                        break;
+                    }
+                }
+
+                result.Success = result.Error == null;
+            });
+        }
+        catch (Exception ex)
+        {
+            result.Success = false;
+            result.Error = ex.Message;
+        }
+
+        return result;
+    }
+
+    [ApiEndpoint(
+        "GET",
+        "/test/pacing_probe_state",
+        Summary = "Read the current state of the spawned pacing-probe entity (test-only)",
+        Tag = "Test"
+    )]
+    [ApiResponse(typeof(PacingProbeStateResponse), 200)]
+    private async Task<PacingProbeStateResponse> HandleGetTestPacingProbeStateAsync(
+        HttpListenerRequest request
+    )
+    {
+        var result = new PacingProbeStateResponse();
+
+        if (!TryParseProbeKind(request.QueryString["kind"], out var kind))
+        {
+            result.Success = false;
+            result.Error = $"Unknown probe kind '{request.QueryString["kind"]}'.";
+            return result;
+        }
+
+        try
+        {
+            await RunOnGameThreadAsync(() =>
+            {
+                // Count = "is the tracked probe still in its spawn location" — by identity, so unrelated
+                // world entities of the same kind never inflate it.
+                var location = _probeLocation as GameLocation;
+                result.ServerTicks = Game1.ticks;
+
+                switch (kind)
+                {
+                    case PacingProbeKind.Projectile:
+                        if (_probeProjectile is Projectile projectile)
+                        {
+                            result.Count =
+                                location != null && location.projectiles.Contains(projectile)
+                                    ? 1
+                                    : 0;
+                            result.ProjectileTravelDistance = projectile.travelDistance;
+                        }
+                        break;
+                    case PacingProbeKind.Debris:
+                        if (_probeDebris is Debris debris)
+                        {
+                            result.DebrisChunkCount = debris.Chunks.Count;
+                            // "At rest" = finished the ballistic fall: a chunk stops bouncing at
+                            // bounces > 2 (Debris.updateChunks), after which it either rests or magnetizes
+                            // toward a player. Keying on `bounces` (not zero velocity) gives a stable
+                            // "fall complete" signal unaffected by the post-settle magnetize drift.
+                            result.DebrisChunksAtRest = debris.Chunks.Count(c => c.bounces > 2);
+                            result.Count =
+                                location != null && location.debris.Contains(debris) ? 1 : 0;
+                        }
+                        break;
+                    case PacingProbeKind.Monster:
+                    case PacingProbeKind.Knockback:
+                        // Both read the tracked monster's net displacement from spawn: Monster = homing
+                        // distance closed, Knockback = distance the impulse carried it before friction.
+                        if (_probeMonster is Monster monster)
+                        {
+                            result.Count =
+                                location != null && location.characters.Contains(monster) ? 1 : 0;
+                            result.MonsterDisplacement = Vector2.Distance(
+                                monster.Position,
+                                new Vector2(_probeMonsterSpawnX, _probeMonsterSpawnY)
+                            );
+                            result.MonsterSpeed = (float)
+                                Math.Sqrt(
+                                    monster.xVelocity * monster.xVelocity
+                                        + monster.yVelocity * monster.yVelocity
+                                );
+                        }
+                        break;
+                }
+
+                result.Success = true;
+            });
+
+            // Durably record the measurement in the server log (LogLevel.Info — not Error, which would
+            // poison the test). The console test annotations can scroll out of a tail'd capture; this line
+            // survives in container.log so a run's pacing numbers are always recoverable.
+            Monitor.Log(
+                $"[PacingProbe] {kind}: travelDistance={result.ProjectileTravelDistance:F0} "
+                    + $"debrisAtRest={result.DebrisChunksAtRest}/{result.DebrisChunkCount} "
+                    + $"monsterDisplacement={result.MonsterDisplacement:F0} monsterSpeed={result.MonsterSpeed:F1} "
+                    + $"count={result.Count} ticks={result.ServerTicks}",
+                LogLevel.Info
+            );
+        }
+        catch (Exception ex)
+        {
+            result.Success = false;
+            result.Error = ex.Message;
+        }
+
+        return result;
+    }
+
+    private static bool TryParseProbeKind(string? raw, out PacingProbeKind kind)
+    {
+        switch (raw?.Trim().ToLowerInvariant())
+        {
+            case "projectile":
+                kind = PacingProbeKind.Projectile;
+                return true;
+            case "debris":
+                kind = PacingProbeKind.Debris;
+                return true;
+            case "monster":
+                kind = PacingProbeKind.Monster;
+                return true;
+            case "knockback":
+                kind = PacingProbeKind.Knockback;
+                return true;
+            default:
+                kind = default;
+                return false;
+        }
+    }
+
+    /// <summary>
+    /// Removes every tracked probe entity by identity from the location it was spawned in (the host may
+    /// have moved since), then drops all tracking. Game thread only, like the fields it clears.
+    /// </summary>
+    private void RemoveTrackedProbes()
+    {
+        if (_probeLocation is GameLocation location)
+        {
+            if (_probeMonster is Monster monster)
+            {
+                location.characters.Remove(monster);
+            }
+            if (_probeProjectile is Projectile projectile)
+            {
+                location.projectiles.Remove(projectile);
+            }
+            if (_probeDebris is Debris debris)
+            {
+                location.debris.Remove(debris);
+            }
+        }
+        _probeMonster = null;
+        _probeProjectile = null;
+        _probeDebris = null;
+        _probeLocation = null;
     }
 }

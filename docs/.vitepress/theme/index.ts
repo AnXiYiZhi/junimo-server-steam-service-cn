@@ -2,6 +2,7 @@ import type { Theme } from "vitepress";
 import DefaultTheme from "vitepress/theme";
 import { theme as openapiTheme, useOpenapi, useTheme as useOpenapiTheme } from "vitepress-openapi/client";
 import AnnouncementBar from "./AnnouncementBar.vue";
+import InstallCommand from "./InstallCommand.vue";
 import { initRandomIconAnimation } from "./randomIconAnimation";
 import ServerStatusWidget from "./ServerStatusWidget.vue";
 import "vitepress-openapi/dist/style.css";
@@ -12,8 +13,10 @@ import spec from "../../assets/openapi.json";
 export default {
     extends: DefaultTheme,
     Layout: AnnouncementBar,
-    async enhanceApp({ app }) {
+    async enhanceApp(ctx) {
+        const { app } = ctx;
         app.component("ServerStatusWidget", ServerStatusWidget);
+        app.component("InstallCommand", InstallCommand);
         // TODO: Show for local builds, but hide for public deployments
         const hideTryItOutButton = true;
 
@@ -67,7 +70,8 @@ export default {
                 },
             },
         });
-        openapiTheme.enhanceApp({ app });
+        // Forward the full context: vitepress-openapi's enhanceApp needs router and siteData too.
+        openapiTheme.enhanceApp(ctx);
 
         if (!import.meta.env.SSR) {
             const AnimatedIcon = (await import("./web-components/animated-icon")).default;

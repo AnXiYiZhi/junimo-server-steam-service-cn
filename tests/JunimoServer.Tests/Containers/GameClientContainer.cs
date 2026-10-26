@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using Docker.DotNet.Models;
 using DotNet.Testcontainers.Builders;
 using DotNet.Testcontainers.Containers;
 using DotNet.Testcontainers.Images;
@@ -91,6 +90,13 @@ public class GameClientContainer : IAsyncDisposable
     /// Set by <see cref="Infrastructure.ClientPool"/> after creation.
     /// </summary>
     public int SteamAccountIndex { get; internal set; } = -1;
+
+    /// <summary>
+    /// True once <see cref="Infrastructure.ClientPool.MarkClientDead"/> has retired this
+    /// container: it stays in the pool's roster only for recording extraction at dispose
+    /// and must not count toward the live container cap.
+    /// </summary>
+    public bool IsMarkedDead { get; internal set; }
 
     /// <summary>
     /// Final Galaxy auth state captured from <c>/health</c> when readiness was reached.
@@ -188,6 +194,13 @@ public class GameClientContainer : IAsyncDisposable
             .WithEnvironment("STEAM_AUTH_URL", options.SteamAuthUrl ?? "")
             .WithEnvironment("SDVD_TEST_STEAM_ACCOUNT_INDEX", options.SteamAccountIndex.ToString())
             .WithEnvironment("CLIENT_TPS", TestEnvLoader.Get("CLIENT_TPS") ?? "60")
+            // Kill-switch for the TPS-agnostic pacing patches, same as the server container: pass
+            // .env.test's value through (default-on) so a run can set it =false to A/B the client's
+            // movement pacing. The test client registers the same patches as the server mod.
+            .WithEnvironment(
+                "SDVD_TPS_AGNOSTIC_PACING",
+                TestEnvLoader.Get("SDVD_TPS_AGNOSTIC_PACING") ?? "true"
+            )
             // CLIENT_FPS drives both the in-container draw cap and the recorder's
             // sample rate (they're literally the same value; sampling X11 faster
             // than the framebuffer updates is wasted). 0 = rendering disabled.
@@ -211,9 +224,6 @@ public class GameClientContainer : IAsyncDisposable
             .WithGpuIfEnabled(host)
             .WithCreateParameterModifier(p =>
             {
-                p.HostConfig ??= new HostConfig();
-                p.HostConfig.CapAdd ??= new List<string>();
-                p.HostConfig.CapAdd.Add("SYS_TIME");
                 p.Labels ??= new Dictionary<string, string>();
                 p.Labels["sdvd.test"] = "true";
                 p.Labels["sdvd.run-id"] = runId;
@@ -289,8 +299,7 @@ public class GameClientContainer : IAsyncDisposable
 
         var _startSw = Stopwatch.StartNew();
 
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(_options.StartupTimeout);
+        using var timeoutCts = Cts.LinkedTimeout(ct, _options.StartupTimeout);
 
         // Remote hosts only: tighter daemon-responsiveness deadline on docker create+start —
         // same rationale as ServerContainer.StartAsync. A wedged shared daemon-socket forward
@@ -513,7 +522,8 @@ public class GameClientContainer : IAsyncDisposable
             BaseUrl,
             defaultWaitTimeout: null,
             liveBaseUrl: () => BaseUrl,
-            healAsync: HealApiForwardAsync
+            healAsync: HealApiForwardAsync,
+            hostId: HostId
         );
         // Copy the client reference (GameTestClient is a wrapper, we need to update the internal HttpClient)
         typeof(GameTestClient)
@@ -669,6 +679,7 @@ public class GameClientContainer : IAsyncDisposable
             _host.ApiClient,
             _container,
             $"client-{_clientIndex}",
+            HostId,
             HandleLine,
             msg => _logCallback?.Invoke($"client-{_clientIndex} {msg}")
         );

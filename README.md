@@ -2,7 +2,7 @@
 
 <!-- Project -->
 
-![GitHub Tag](https://img.shields.io/github/v/tag/stardew-valley-dedicated-server/server?label=Latest%20Release&style=flat-square&colorA=18181B) ![Static Badge](https://img.shields.io/badge/Stardew%20Valley-v1.6.15-34D058?style=flat-square&colorA=18181B) [![CodeQL](https://img.shields.io/github/actions/workflow/status/stardew-valley-dedicated-server/server/codeql.yml?branch=master&label=CodeQL&style=flat-square&colorA=18181B)](https://github.com/stardew-valley-dedicated-server/server/actions/workflows/codeql.yml) [![E2E Tests](https://img.shields.io/endpoint?url=https%3A%2F%2Fpub-8b02482b459740d1b403ddbc47d0b817.r2.dev%2Fe2e%2Fmaster%2Fbadge.json&style=flat-square&colorA=18181B)](https://pub-8b02482b459740d1b403ddbc47d0b817.r2.dev/e2e/master/latest/index.html) [![Discord](https://img.shields.io/discord/947923329057185842?label=Discord&logo=discord&color=34D058&style=flat-square&colorA=18181B)](https://discord.gg/w23GVXdSF7)
+[![Latest Release](https://img.shields.io/github/v/release/stardew-valley-dedicated-server/server?label=Latest%20Release&style=flat-square&colorA=18181B)](https://github.com/stardew-valley-dedicated-server/server/releases/latest) [![Preview Build](https://img.shields.io/github/v/tag/stardew-valley-dedicated-server/server?filter=v*-preview*&label=Preview%20Build&style=flat-square&colorA=18181B)](https://hub.docker.com/r/sdvd/server/tags) ![Static Badge](https://img.shields.io/badge/Stardew%20Valley-v1.6.15-34D058?style=flat-square&colorA=18181B) [![CodeQL](https://img.shields.io/github/actions/workflow/status/stardew-valley-dedicated-server/server/codeql.yml?branch=master&label=CodeQL&style=flat-square&colorA=18181B)](https://github.com/stardew-valley-dedicated-server/server/actions/workflows/codeql.yml) [![E2E Tests](https://img.shields.io/endpoint?url=https%3A%2F%2Fpub-8b02482b459740d1b403ddbc47d0b817.r2.dev%2Fe2e%2Fmaster%2Fbadge.json&style=flat-square&colorA=18181B)](https://pub-8b02482b459740d1b403ddbc47d0b817.r2.dev/e2e/master/latest/index.html) [![Discord](https://img.shields.io/discord/947923329057185842?label=Discord&logo=discord&color=34D058&style=flat-square&colorA=18181B)](https://discord.gg/w23GVXdSF7)
 
 **JunimoServer** makes [Stardew Valley](https://www.stardewvalley.net/) multiplayer hosting simple and flexible. Host your farm anytime, anywhere — on your local machine, a VPS, or a dedicated server.
 
@@ -47,11 +47,16 @@ JunimoServer gives you everything you need to host Stardew Valley:
 
 1. **Create Configuration**:
 
-    Download the configuration files from GitHub:
-    - [`docker-compose.yml`](https://github.com/stardew-valley-dedicated-server/server/blob/master/docker-compose.yml)
-    - [`.env.example`](https://github.com/stardew-valley-dedicated-server/server/blob/master/.env.example)
+    Create a new server folder with the config files:
 
-    Rename `.env.example` to `.env` and configure your server. Here is a minimal example:
+    ```sh
+    curl -fsSL https://docs.junimoserver.com/install.sh | bash
+    cd junimoserver
+    ```
+
+    On Windows: `powershell -c "irm https://docs.junimoserver.com/install.ps1 | iex"`, then `cd junimoserver`.
+
+    Then edit `.env` and configure your server. Here is a minimal example:
 
     ```sh
     # Steam Account Details (required for downloading the game server)
@@ -60,17 +65,20 @@ JunimoServer gives you everything you need to host Stardew Valley:
 
     # VNC Server (for web-based administration access)
     VNC_PASSWORD=""
+
+    # HTTP API key (the server won't start until VNC_PASSWORD and API_KEY are set)
+    API_KEY=""
     ```
 
 2. **First-Time Setup**:
 
-    Run the interactive setup to authenticate with Steam and download the game files:
+    Run the interactive setup to authenticate with Steam:
 
     ```sh
     docker compose run --rm -it steam-auth setup
     ```
 
-    This will prompt you for Steam Guard authentication if enabled on your account.
+    This will prompt you for Steam Guard authentication if enabled on your account, and downloads the game files. Once Steam can log in without prompts, a fresh server downloads the game files itself on first start.
 
 3. **Start the Server**:
 
@@ -86,17 +94,19 @@ JunimoServer gives you everything you need to host Stardew Valley:
 
 ### Updating to a new version
 
-When a new version is released, update your server with:
+When a new version is released, run the same script from your server folder:
 
 ```sh
-docker compose pull
-docker compose down
-docker compose up -d
+curl -fsSL https://docs.junimoserver.com/install.sh | bash
 ```
+
+On Windows: `powershell -c "irm https://docs.junimoserver.com/install.ps1 | iex"`
+
+This pulls the new image and installs the matching `docker-compose.yml`, then asks before restarting to apply it; a run with no terminal (or with `NO_TTY=1`) restarts automatically. Your `.env`, saves, and settings are untouched. Keep your own compose changes in a `docker-compose.override.yml` (see [Upgrading](https://docs.junimoserver.com/admins/operations/upgrading)).
 
 ### Using preview releases
 
-> **Note:** JunimoServer is under heavy development. If the latest stable release isn't working for you, try the preview release — it often contains fixes that haven't been officially released yet. As the project matures, stable releases will become more reliable.
+> **Note:** JunimoServer is under heavy development. If the `latest` release isn't working for you, try the preview release; it often contains fixes that haven't been officially released yet. As the project matures, `latest` releases will become more reliable.
 
 Preview builds are published automatically with every code change. To use a preview release, add this to your `.env` file:
 
@@ -105,29 +115,23 @@ Preview builds are published automatically with every code change. To use a prev
 IMAGE_VERSION=preview
 ```
 
-To switch back to stable releases, remove the line or set it to `latest`:
+To switch back to `latest`, remove the line or set it to `latest`:
 
 ```sh
 IMAGE_VERSION=latest
 ```
 
-After changing the version, run:
-
-```sh
-docker compose pull
-docker compose down
-docker compose up -d
-```
+After changing the version, run the update command above. It pulls the matching image and `docker-compose.yml` for whichever `IMAGE_VERSION` you set (`latest`, `preview`, or pinned).
 
 You can also pin to a specific version (e.g., `IMAGE_VERSION=1.0.0` or `IMAGE_VERSION=1.1.0-preview.3`). Check [Docker Hub](https://hub.docker.com/r/sdvd/server/tags) for available tags.
 
 ## Documentation
 
-Explore the [full documentation](https://stardew-valley-dedicated-server.github.io/server/) to get started. Here's what you'll find:
+Explore the [full documentation](https://docs.junimoserver.com/) to get started. Here's what you'll find:
 
-- **[Getting Started](https://stardew-valley-dedicated-server.github.io/server/getting-started/introduction):** Step-by-step instructions on setting up and managing your server.
-- **[Server Guide](https://stardew-valley-dedicated-server.github.io/server/guide/using-the-server):** Learn how to use and manage your server.
-- **[Community](https://stardew-valley-dedicated-server.github.io/server/community/getting-help):** Find out how to get involved and get help.
+- **[Getting Started](https://docs.junimoserver.com/admins/quick-start/installation):** Step-by-step instructions on setting up and managing your server.
+- **[Server Guide](https://docs.junimoserver.com/players/):** Learn how to use and manage your server.
+- **[Community](https://docs.junimoserver.com/community/getting-help):** Find out how to get involved and get help.
 
 ## Support
 

@@ -23,7 +23,9 @@ public sealed record ResourceRequirements(
     string? TestMethodName,
     bool Exclusive = false,
     string ExistingCabinBehavior = "KeepExisting",
-    bool FixtureFarmMod = false
+    bool FixtureFarmMod = false,
+    int ServerTps = 0,
+    bool AllowCabinRelocation = true
 )
 {
     private static int _perTestCounter;
@@ -53,19 +55,21 @@ public sealed record ResourceRequirements(
         var connection = WithSteam ? "steam" : "lan";
         var pw = Password != null ? "+pw" : "";
         var fixture = FixtureFarmMod ? "+fixturemod" : "";
-        return $"{connection}{pw}{fixture}-farm{FarmType}-{CabinStrategy}-c{StartingCabins}";
+        var tps = ServerTps > 0 ? $"-tps{ServerTps}" : "";
+        return $"{connection}{pw}{fixture}-farm{FarmType}-{CabinStrategy}-c{StartingCabins}{tps}";
     }
 
     /// <summary>
     /// Hash of server-affecting config fields (not Clients, which doesn't affect server identity).
     /// FixtureFarmMod changes which mods load, which is server identity — so it enters the key.
+    /// ServerTps changes the container's tick rate, which is server identity too.
     /// </summary>
     private string ComputeConfigHash()
     {
         var configString =
             $"{Password}|{FarmType}|{WithSteam}|{StartingCabins}"
             + $"|{MaxPlayers}|{CabinStrategy}|{AllowIpConnections}|{ExistingCabinBehavior}"
-            + $"|{FixtureFarmMod}";
+            + $"|{FixtureFarmMod}|{ServerTps}|{AllowCabinRelocation}";
         var bytes = Encoding.UTF8.GetBytes(configString);
         var hash = SHA256.HashData(bytes);
         return Convert.ToHexString(hash)[..12].ToLowerInvariant();
@@ -90,14 +94,23 @@ public sealed record ResourceRequirements(
             MaxPlayers: attr.MaxPlayers,
             Clients: attr.Clients,
             CabinStrategy: attr.CabinStrategy,
-            // Without Steam there's no invite code path; force IP connections on
-            AllowIpConnections: attr.WithSteam ? attr.AllowIpConnections : true,
+            // Always on. LAN servers need it (no invite-code path), and steam servers keep it
+            // on too so mixed-transport tests don't fork the steam config: each host slice's
+            // allocator partitions off ONE server account (SteamAccountAllocator index 0) — a
+            // cost-minimization policy (accounts are paid), not an infra limit — so a second
+            // steam config's prestart blocks on that slice's server account and wedges the
+            // run unless a second steam-capable host slice exists. Production's IP-off posture
+            // is covered via the runtime /test/set_ip_connections toggle instead. The extra
+            // Lidgren listener is idle for invite-code-only tests.
+            AllowIpConnections: true,
             Isolation: attr.Isolation,
             TestClassName: testClassName,
             TestMethodName: testMethodName,
             Exclusive: attr.Exclusive,
             ExistingCabinBehavior: attr.ExistingCabinBehavior,
-            FixtureFarmMod: attr.FixtureFarmMod
+            FixtureFarmMod: attr.FixtureFarmMod,
+            ServerTps: attr.ServerTps,
+            AllowCabinRelocation: attr.AllowCabinRelocation
         );
 
     /// <summary>
@@ -113,8 +126,10 @@ public sealed record ResourceRequirements(
             CabinStrategy = CabinStrategy,
             ExistingCabinBehavior = ExistingCabinBehavior,
             AllowIpConnections = AllowIpConnections,
+            AllowCabinRelocation = AllowCabinRelocation,
             WithSteam = WithSteam,
             FixtureFarmMod = FixtureFarmMod,
+            ServerTps = ServerTps,
         };
         return options;
     }

@@ -1,17 +1,26 @@
 import { fileURLToPath, URL } from "node:url";
-import { defineConfig } from "vitepress";
+import { defineConfig, loadEnv } from "vitepress";
 import { useSidebar } from "vitepress-openapi";
-import { groupIconVitePlugin } from "vitepress-plugin-group-icons";
+import { groupIconMdPlugin, groupIconVitePlugin } from "vitepress-plugin-group-icons";
 import { withMermaid } from "vitepress-plugin-mermaid";
 import spec from "../assets/openapi.json" with { type: "json" };
+import { STUB_BASE, statusStubPlugin } from "./statusStub";
 import { DEFAULT_THEME_ID, themes } from "./theme/themes";
 
 // Docs version: "latest" or "preview" (set via DOCS_VERSION env var during build)
 const docsVersion = process.env.DOCS_VERSION || "latest";
 const isPreview = docsVersion === "preview";
-const base = isPreview ? "/server/preview/" : "/server/";
+const base = isPreview ? "/preview/" : "/";
 
-const origin = "https://stardew-valley-dedicated-server.github.io";
+// API base URL of the public test server, shown on community/test-server.md. CI sets the
+// env var; locally a docs/.env.local file works too. Unset: the dev server stubs it
+// (statusStub.ts), a build ships the page without the card.
+const isBuild = process.argv.includes("build");
+const dotenv = loadEnv("", process.cwd(), "DOCS_");
+const testServerApiUrl =
+    process.env.DOCS_TEST_SERVER_API_URL || dotenv.DOCS_TEST_SERVER_API_URL || (isBuild ? "" : STUB_BASE);
+
+const origin = "https://docs.junimoserver.com";
 const ogImage = `${origin}${base}og-image.png`;
 
 const openApiSidebar = useSidebar({ spec, linkPrefix: "/developers/api/" });
@@ -22,10 +31,16 @@ const foucThemeMap = JSON.stringify(Object.fromEntries(themes.map((t) => [t.id, 
 
 export default withMermaid(
     defineConfig({
+        markdown: {
+            config(md) {
+                md.use(groupIconMdPlugin);
+            },
+        },
         vite: {
             // Bake the build time into the bundle so the sidebar can show "Last built: …"
             define: {
                 __BUILD_TIME__: JSON.stringify(new Date().toISOString()),
+                __DOCS_TEST_SERVER_API_URL__: JSON.stringify(testServerApiUrl),
             },
             resolve: {
                 alias: [
@@ -37,11 +52,14 @@ export default withMermaid(
                 ],
             },
             plugins: [
+                statusStubPlugin(),
                 groupIconVitePlugin({
                     // Add custom icons which are not available otherwise
                     customIcon: {
                         curl: "simple-icons:curl",
                         ".cs": "vscode-icons:file-type-csharp2",
+                        windows: "vscode-icons:file-type-powershell",
+                        "linux / macos": "logos:bash-icon",
                     },
                     // Set default labels for code blocks (labels for API samples are defined separately in `theme/index.ts`)
                     defaultLabels: ["curl", ".cs", ".ts", ".py"],
@@ -105,12 +123,12 @@ export default withMermaid(
         `,
             ],
         ],
-        // Per-page social/SEO tags. `title`/`description` here are already resolved
-        // (page value, falling back to the site title/description), so the home page
+        // Per-page social/SEO tags. `description` here is already resolved
+        // (page value, falling back to the site description), so the home page
         // and description-less pages get sensible values. These tags replace the
         // page-invariant placeholders in `head` via mergeHead (property/name must be
         // the first attr key for the dedup to match).
-        transformHead({ pageData, siteConfig, title, description }) {
+        transformHead({ pageData, siteConfig, description }) {
             if (pageData.isNotFound) {
                 return [];
             }
@@ -140,7 +158,7 @@ export default withMermaid(
             // sitemap as `new URL(relativeUrl, hostname)`, so the hostname must carry
             // the deploy subpath (and its trailing slash — without it `new URL` resolves
             // against the parent and drops the base). `base` already differs per deploy
-            // (/server/ vs /server/preview/), keeping sitemap locs aligned with the
+            // (/ vs /preview/), keeping sitemap locs aligned with the
             // og:url/canonical tags, which also use `${origin}${base}`.
             hostname: `${origin}${base}`,
         },
@@ -182,7 +200,6 @@ export default withMermaid(
                             { text: "Overview", link: "/admins/" },
                             { text: "Prerequisites", link: "/admins/quick-start/prerequisites" },
                             { text: "Installation", link: "/admins/quick-start/installation" },
-                            { text: "First Setup", link: "/admins/quick-start/first-setup" },
                         ],
                     },
                     {
@@ -202,13 +219,17 @@ export default withMermaid(
                             { text: "Importing Saves", link: "/admins/operations/importing-saves" },
                             { text: "Networking", link: "/admins/operations/networking" },
                             { text: "Upgrading", link: "/admins/operations/upgrading" },
-                            { text: "VNC (Advanced)", link: "/admins/operations/vnc" },
                             { text: "Modern Docker Image", link: "/admins/operations/modern-docker" },
+                            { text: "HTTPS & Reverse Proxy", link: "/admins/operations/reverse-proxy" },
+                            { text: "Public Server Status", link: "/admins/operations/public-status" },
                         ],
                     },
                     {
                         text: "Troubleshooting",
-                        items: [{ text: "Common Issues", link: "/admins/troubleshooting" }],
+                        items: [
+                            { text: "Common Issues", link: "/admins/troubleshooting" },
+                            { text: "VNC", link: "/admins/operations/vnc" },
+                        ],
                     },
                 ],
                 "/features/": [
@@ -306,6 +327,7 @@ export default withMermaid(
                         text: "Advanced",
                         items: [
                             { text: "Building from Source", link: "/developers/advanced/building-from-source" },
+                            { text: "Code Navigation (Serena)", link: "/developers/advanced/code-navigation" },
                             { text: "Decompiling", link: "/developers/advanced/decompiling" },
                             {
                                 text: "Client Manipulation Techniques",
@@ -317,16 +339,31 @@ export default withMermaid(
                 "/community/": [
                     {
                         text: "Community",
+                        items: [{ text: "Overview", link: "/community/" }],
+                    },
+                    {
+                        text: "Try It Out",
+                        items: [{ text: "Public Test Server", link: "/community/test-server" }],
+                    },
+                    {
+                        text: "Get Help",
                         items: [
-                            { text: "Overview", link: "/community/" },
                             { text: "FAQ", link: "/community/faq" },
                             { text: "Getting Help", link: "/community/getting-help" },
                             { text: "Reporting Bugs", link: "/community/reporting-bugs" },
-                            { text: "Contributing", link: "/community/contributing" },
-                            { text: "Resources", link: "/community/resources" },
+                        ],
+                    },
+                    {
+                        text: "Contribute",
+                        items: [{ text: "Contributing", link: "/community/contributing" }],
+                    },
+                    {
+                        text: "Project",
+                        items: [
                             { text: "Roadmap", link: "/community/roadmap" },
                             { text: "Changelog", link: "/community/changelog" },
-                            { text: "Contributors", link: "/community/contributors" },
+                            { text: "Credits", link: "/community/credits" },
+                            { text: "Related Projects & Links", link: "/community/links" },
                         ],
                     },
                 ],
@@ -347,7 +384,7 @@ export default withMermaid(
             },
 
             footer: {
-                message: "Released under the MIT License.",
+                message: "Released under the MIT License. Not affiliated with or endorsed by ConcernedApe LLC.",
                 copyright: "Copyright © 2024-present JunimoServer Contributors",
             },
 

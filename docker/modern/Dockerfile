@@ -5,6 +5,8 @@
 # fully tested. The production image is docker/Dockerfile (Debian/glibc). This
 # image is not wired into the Makefile or CI; it builds only via
 # docker/modern/docker-compose.yml, manually.
+# Runs stock SMAPI from the prebuilt installer zip; the source-patched SMAPI build the
+# production image ships (patches/smapi, smapi-builder stage) is not ported here.
 # Reference: docs/admins/operations/modern-docker.md
 # ============================================================================
 # Modern Docker Image for Stardew Valley Dedicated Server
@@ -169,6 +171,7 @@ COPY --from=game-downloader /game /game
 # (.editorconfig: code-style rules enforced at build via EnforceCodeStyleInBuild)
 COPY ./Directory.Build.props ./CodeStyle.props ./.editorconfig /src/
 COPY ./mod/JunimoServer/JunimoServer.csproj /src/mod/JunimoServer/
+COPY ./mod/JunimoServer.Shared/JunimoServer.Shared.csproj /src/mod/JunimoServer.Shared/
 
 # Restore dependencies
 RUN --mount=type=cache,target=/root/.nuget/packages \
@@ -190,7 +193,6 @@ COPY ./mod /src/mod
 RUN --mount=type=cache,target=/root/.nuget/packages \
     dotnet build /src/mod/JunimoServer/JunimoServer.csproj \
     --configuration ${BUILD_CONFIGURATION} \
-    --no-restore \
     /p:GamePath=/game \
     -o /output/JunimoServer
 
@@ -215,7 +217,13 @@ ARG GO2RTC_VERSION
 
 # ---------- Environment ----------
 
-ENV HOME=/root \
+# USER_ID/GROUP_ID: the app services drop to this uid/gid via s6-applyuidgid (see the s6-rc.d
+# run scripts); the init-runtime oneshot chowns the volumes to match. Defaults to non-root;
+# override per deployment from docker-compose. HOME is a writable dir owned by that user (the
+# app's ~/.steam SDK link and any dotfiles live here), not /root.
+ENV USER_ID=1000 \
+    GROUP_ID=1000 \
+    HOME=/home/app \
     LANG=en_US.UTF-8 \
     # X11 display
     DISPLAY=:99 \
@@ -257,8 +265,9 @@ RUN apk add --no-cache \
     pipewire pipewire-pulse openal-soft-libs \
     # Game native dependencies
     icu-libs libstdc++ libgcc gcompat \
-    # Utilities
-    curl ca-certificates bash coreutils util-linux tmux unzip \
+    # Utilities (zsh drives the attach-cli input pane: ghost text + TAB completion; bash stays for
+    # mem-cpu.sh, filter-output.sh, startapp.sh and friends)
+    curl ca-certificates bash zsh coreutils util-linux tmux unzip \
     procps
 
 # ---------- Custom Mesa (Zink only, no LLVM) + SwiftShader ----------
@@ -282,7 +291,9 @@ RUN curl -sSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh && 
 # ---------- go2rtc ----------
 
 ADD https://github.com/AlexxIT/go2rtc/releases/download/v${GO2RTC_VERSION}/go2rtc_linux_amd64 /usr/local/bin/go2rtc
-RUN chmod +x /usr/local/bin/go2rtc
+# 0755, not +x: ADD from a URL lands the file 0600, and go2rtc re-opens /proc/self/exe at start,
+# so the non-root streaming service needs the read bit too.
+RUN chmod 0755 /usr/local/bin/go2rtc
 
 # ---------- Locale ----------
 
@@ -310,7 +321,11 @@ RUN apk add --no-cache gcc musl-dev && \
 
 RUN chmod +x /opt/bin/* && \
     find /etc/s6-overlay/s6-rc.d -name run -exec chmod +x {} \; && \
-    find /etc/s6-overlay/s6-rc.d -name up -exec chmod +x {} \;
+    find /etc/s6-overlay/s6-rc.d -name up -exec chmod +x {} \; && \
+    # App-user HOME (chowned to USER_ID:GROUP_ID at runtime by the init-runtime oneshot).
+    mkdir -p /home/app && \
+    # X socket dir with the standard sticky world-writable mode, so a non-root Xvfb can create its socket.
+    mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 
 # ---------- Copy mod from build stage ----------
 

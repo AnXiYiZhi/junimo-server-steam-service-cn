@@ -38,9 +38,15 @@ public static class TestTimings
     public static readonly TimeSpan SteamAccountReadyTimeout = TimeSpan.FromSeconds(30);
 
     /// <summary>
-    /// Timeout for stopping Docker containers during cleanup.
+    /// Bound on a single client Steam-account allocation in ClientPool.CreateClientAsync.
+    /// Worst legitimate case is ~0s semaphore wait (accounts release eagerly on
+    /// death/discard/dispose) plus the ≤90s readiness-probe phase inside
+    /// SteamAccountAllocator.AllocateAsync (AllocationReadinessBudget), so 120s cannot
+    /// false-trip. Expiry means no account will ever be released (an account leak), so
+    /// the lease fails fast as infrastructure (InfrastructureSkipException) instead of
+    /// blocking to the run-stall watchdog.
     /// </summary>
-    public static readonly TimeSpan ContainerStopTimeout = TimeSpan.FromSeconds(10);
+    public static readonly TimeSpan SteamAccountAllocationBound = TimeSpan.FromSeconds(120);
 
     #endregion
 
@@ -63,14 +69,23 @@ public static class TestTimings
     public static readonly TimeSpan RetryPauseDelay = TimeSpan.FromMilliseconds(200);
 
     /// <summary>
-    /// Budget for polling the server-side /players endpoint after a client has
-    /// disconnected, waiting for the player record to disappear. The next test
-    /// reusing the same client container must not reconnect before the server
-    /// has finished processing the disconnect, or farmhand rejection loops
-    /// ensue. If the budget expires, the caller poisons the server lease
-    /// rather than continuing with an unknown server state.
+    /// Fast-fail bound for disappear-polls after a client disconnect. The next
+    /// test reusing the container must not reconnect before the server processes
+    /// the disconnect (farmhand rejection loops), so cleanup paths keep this
+    /// short and decide on expiry themselves: PersistentSession poisons the
+    /// lease, TestLifecycle warns and lets the delete-retry loop absorb the lag.
+    /// Test-body gates asserting server-side removal use PlayerRemovalTimeout.
     /// </summary>
     public static readonly TimeSpan FarmerRemovalBudget = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// Default for WaitForPlayersRemovedBy*: test-body gates observing server-side
+    /// removal after a disconnect. Removal can lag multi-second under full-suite
+    /// load (~2.2s worst measured) and /players is a 1 Hz snapshot; 10s covers
+    /// that with headroom. Infra cleanup paths that prefer to fast-fail pass
+    /// FarmerRemovalBudget explicitly.
+    /// </summary>
+    public static readonly TimeSpan PlayerRemovalTimeout = TimeSpan.FromSeconds(10);
 
     /// <summary>
     /// Budget for revalidating a persistent session on reuse. A KeepConnected
@@ -85,30 +100,14 @@ public static class TestTimings
     public static readonly TimeSpan SessionRevalidationBudget = TimeSpan.FromSeconds(2);
 
     /// <summary>
-    /// Total timeout for farmer deletion polling during cleanup.
-    /// The delete API is called immediately after disconnect; if the server
-    /// hasn't processed the disconnect yet ("currently online" error), we
-    /// retry with FastPollInterval until this timeout. Must exceed the
-    /// server's RunOnGameThreadAsync timeout (15s) so that a single 503
-    /// (which takes ~16s wall-clock) doesn't exhaust the entire budget.
-    /// 35s allows one 503 + one successful call with headroom.
+    /// Total budget for the delete-retry loop: poll DELETE /farmhands until it
+    /// succeeds. The delete API is called immediately after disconnect; if the
+    /// server hasn't processed the disconnect yet ("currently online" error), we
+    /// retry with FastPollInterval until this timeout. The server runs the delete
+    /// under a 15s game-thread budget and a measured delete costs ~0.1s, so 35s
+    /// covers a game thread blocked by a day transition or save.
     /// </summary>
     public static readonly TimeSpan FarmerDeleteTimeout = TimeSpan.FromSeconds(35);
-
-    /// <summary>
-    /// Delay after killing game processes to ensure they fully exit.
-    /// </summary>
-    public static readonly TimeSpan ProcessExitDelay = TimeSpan.Zero;
-
-    /// <summary>
-    /// Short delay between attempts when waiting for game client to respond.
-    /// </summary>
-    public static readonly TimeSpan GameClientPollDelay = TimeSpan.FromMilliseconds(100);
-
-    /// <summary>
-    /// Delay between connection checks during game client startup.
-    /// </summary>
-    public static readonly TimeSpan GameClientStartupPollDelay = TimeSpan.FromMilliseconds(500);
 
     /// <summary>
     /// Patience window for a non-Steam client lease that finds the pool empty
@@ -150,20 +149,17 @@ public static class TestTimings
 
     #region Game Time Values
 
-    /// <summary>Game time for noon (12:00 PM). Mid-day, firmly inside the pause window.</summary>
+    /// <summary>Game time for noon (12:00 PM). Mid-day.</summary>
     public const int Noon = 1200;
+
+    /// <summary>1:00 AM — the inclusive lower bound of the empty-server grace-sleep window.</summary>
+    public const int OneAmTime = 2500;
 
     /// <summary>One tick before 2:00 AM pass-out (2550 → 2600 in ~7s).</summary>
     public const int PrePassOutTime = 2550;
 
-    /// <summary>2:00 AM. Game forces performPassoutWarp() at this time.</summary>
+    /// <summary>2:00 AM. The game forces the host pass-out at this time.</summary>
     public const int PassOutTime = 2600;
-
-    /// <summary>Start of the auto-pause window (6:10 AM). AlwaysOn pauses when no players connected.</summary>
-    public const int PauseWindowStart = 610;
-
-    /// <summary>End of the auto-pause window (1:00 AM). After this, game unpauses for pass-out sequence.</summary>
-    public const int PauseWindowEnd = 2500;
 
     #endregion
 
@@ -187,22 +183,16 @@ public static class TestTimings
     #region Polling Intervals
 
     /// <summary>
-    /// Interval between status polls when waiting for day change.
-    /// The /status endpoint is lightweight; 500ms reduces detection latency.
-    /// </summary>
-    public static readonly TimeSpan DayChangePollInterval = TimeSpan.FromMilliseconds(500);
-
-    /// <summary>
     /// Interval for tight polling loops in tests (chat responses, state sync, etc.).
     /// Short interval to minimize wasted time while avoiding busy-spinning.
     /// </summary>
     public static readonly TimeSpan FastPollInterval = TimeSpan.FromMilliseconds(100);
 
     /// <summary>
-    /// Timeout for waiting for cabin assignment to sync after character creation.
-    /// Must exceed the server's RunOnGameThreadAsync timeout (15s) so that at least
-    /// one API call can complete even if the game thread is briefly contended.
-    /// A single 503 takes ~16s wall-clock; 35s allows one 503 + one successful call.
+    /// Budget for a fresh join's slot to appear and customize. The real driver is
+    /// customization/isCustomized sync after a fresh join, which lags well behind
+    /// peer-add (p90 ~20s measured); 35s gives ~1.75x headroom. Also backs
+    /// WaitForFarmhandByNameAsync, which polls for the same appear-and-customize event.
     /// </summary>
     public static readonly TimeSpan CabinAssignmentTimeout = TimeSpan.FromSeconds(35);
 
@@ -211,20 +201,13 @@ public static class TestTimings
     #region Cleanup Delays
 
     /// <summary>
-    /// Delay between kill command retries during cleanup.
-    /// </summary>
-    public static readonly TimeSpan KillRetryDelay = TimeSpan.FromMilliseconds(500);
-
-    /// <summary>
-    /// Time to wait for background tasks to complete during cleanup.
-    /// </summary>
-    public static readonly TimeSpan TaskCleanupTimeout = TimeSpan.FromSeconds(2);
-
-    /// <summary>
-    /// Hard timeout for the entire test cleanup phase (disconnect, farmer delete,
-    /// exception check, client lease return). Prevents slow HTTP calls from stalling
-    /// the global client capacity gate and blocking all subsequent tests.
-    /// Must accommodate at least one 503 retry (~16s) per cleanup phase.
+    /// Backstop timeout on the serial cleanup phase (disconnect, farmer delete,
+    /// exception check, client lease return) so a wedged HTTP or lease call can't
+    /// stall the global client capacity gate and block subsequent tests. This is a
+    /// stall guard, not the sum of the phase budgets: the phase ceilings
+    /// (DisconnectedTimeout 10s + FarmerRemovalBudget 2s + FarmerDeleteTimeout 35s +
+    /// 10s diagnostic check) can exceed 45s, and DeleteFarmerAsync runs its own
+    /// deadline without honoring the cleanup token, so this cannot preempt it.
     /// </summary>
     public static readonly TimeSpan CleanupTimeout = TimeSpan.FromSeconds(45);
 
@@ -263,12 +246,33 @@ public static class TestTimings
 
     #endregion
 
-    #region HTTP Client Timeouts
+    #region Recording Extraction
 
     /// <summary>
-    /// Timeout for quick HTTP health checks.
+    /// Per-finalization timeout for recording-clip extraction (one
+    /// RecordingOrchestrator.FinalizeAsync call: the failing test's synchronous
+    /// path or one deferred passing-test extraction). A typical per-test clip
+    /// extracts in ~10-30s (per-clip budget inside ContainerRecorder is
+    /// max(30, 5×durationSec)); under full-suite load with the extract limiter
+    /// contended, ~90-120s has been observed. 150s covers that tail without
+    /// truncating legitimate extractions.
     /// </summary>
-    public static readonly TimeSpan HttpHealthCheckTimeout = TimeSpan.FromSeconds(5);
+    public static readonly TimeSpan RecordingFinalizeBackstop = TimeSpan.FromSeconds(150);
+
+    /// <summary>
+    /// Aggregate bound on draining deferred (passing-test) recording extractions
+    /// during broker disposal. On a clean run the drain completes well inside
+    /// this (extractions run concurrently up to the extract limiter); on abort
+    /// (stopOnFail / shutdown) the limiter is cancelled first so waiters fail
+    /// fast and the drain is near-instant. Expiry means an extraction ignored
+    /// both signals — the run proceeds to finalization and the stragglers hit
+    /// their own RecordingFinalizeBackstop or die with the process.
+    /// </summary>
+    public static readonly TimeSpan RecordingDrainBudget = TimeSpan.FromSeconds(90);
+
+    #endregion
+
+    #region HTTP Client Timeouts
 
     /// <summary>
     /// Per-request timeout for HTTP calls inside polling loops.
@@ -375,6 +379,15 @@ public static class TestTimings
     /// but the save and post-barrier processing can take several more seconds.
     /// </summary>
     public static readonly TimeSpan ServerReadyBetweenTests = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Independent budget for a cleanup /newgame reset (ResetServerToPooledConfigAsync).
+    /// Runs from DisposeAsync and MUST NOT be bound to TestCt — cleanup needs to complete
+    /// after a per-test body timeout has already cancelled TestCt, or a timed-out test would
+    /// PoisonServer a healthy pooled instance. Sized generously above the reset's internal
+    /// 120s WaitForServerOnline plus game-creation, so it never cuts off a slow-but-live reset.
+    /// </summary>
+    public static readonly TimeSpan ServerResetCleanupBudget = TimeSpan.FromSeconds(240);
 
     /// <summary>
     /// Timeout for waiting for IsReady after a day change is detected.

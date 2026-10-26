@@ -53,13 +53,45 @@ The steam-auth HTTP API exposes:
 
 ### GET /health
 
-Health check endpoint.
+Health check endpoint. Always 200 while the HTTP server is up; per-account login state and refresh-token expiry are in the body.
 
 ```json
 {
   "status": "ok",
   "logged_in": true,
-  "timestamp": "2026-01-16T12:00:00.000Z"
+  "timestamp": "2026-01-16T12:00:00.000Z",
+  "accounts": [
+    {
+      "index": 0,
+      "username": "steamuser",
+      "logged_in": true,
+      "steam_id": "76561198012345678",
+      "token_expires_at": "2026-08-04T12:00:00.000Z",
+      "token_days_remaining": 200,
+      "token_last_renewal_at": "2026-01-16T11:59:30.000Z",
+      "token_last_renewal_outcome": "refused"
+    }
+  ]
+}
+```
+
+### POST /steam/renew-token
+
+Asks Steam to renew the account's refresh token over the live session (`?account=N`, default 0). Steam decides whether to issue one; `outcome` is:
+
+- `renewed` — a new token was issued. It is saved before the response returns, because Steam invalidates the previous token on renewal. If saving fails, `outcome` stays `renewed` and `error` says so, since the new token is now the only valid one.
+- `refused` — Steam answered without a token, the normal result far from expiry.
+- `failed` — Steam rejected the request; `error` carries the Steam result name. The token still logs in until it expires.
+
+Returns 409 for tokens supplied via environment variables, since the environment copy would go stale.
+
+```json
+{
+  "renewed": true,
+  "outcome": "renewed",
+  "error": null,
+  "previous_expires_at": "2026-02-01T12:00:00.000Z",
+  "expires_at": "2026-08-20T12:00:00.000Z"
 }
 ```
 
@@ -74,6 +106,38 @@ Get an encrypted app ticket for GOG Galaxy authentication.
 }
 ```
 
+### GET /game/validate-status
+
+State of the boot-time game content check. On every `serve` start with a completed game download, the sidecar chunk-hash validates the installed depot in the background and re-downloads corrupt chunks, pinned to the installed manifest so a repair never upgrades the game. The game container's entrypoint polls this endpoint and holds the game back while `status` is `pending` or `running`, because the pass rewrites files on the shared game volume.
+
+```json
+{
+  "status": "completed",
+  "detail": null,
+  "started_at": "2026-01-01T00:00:00.0000000+00:00",
+  "finished_at": "2026-01-01T00:01:30.0000000+00:00"
+}
+```
+
+`status` is one of `pending`, `running`, `completed`, `failed`, `skipped` (no completed download, or no account) or `disabled` (`VALIDATE_ON_BOOT=false`). `detail` is the pass summary on `completed` and the error message on `failed`. A healthy install passes with nothing fetched: the pass knows the four depot files a later step rewrites on purpose (the execstack-patched Galaxy libraries, the pruned `Content/ContentHashes.json`, SMAPI's replacement `StardewValley` launcher, the entrypoint-written `steam_appid.txt`) and does not treat them as corrupt. A failure (no usable login, Steam unreachable, disk error, an unreadable completion marker) is terminal: the game boots with the files as they are, and `download` remains the manual repair. While the game container waits, its `/status` reports `phase: "validating"`.
+
+### POST /game/validate
+
+Runs the same validate/repair pass now, on demand, and answers when it is done (minutes for a full install). `?account=N` picks the Steam session (default 0); `?target_dir=` validates a directory other than `GAME_DIR`, which the E2E suite uses to repair a scratch copy of the game volume. One pass runs at a time, shared with the boot pass.
+
+```json
+{
+  "status": "completed",
+  "detail": "1 repaired, 0 downloaded, 3210 unchanged",
+  "target_dir": "/data/game",
+  "files_repaired": 1,
+  "files_downloaded": 0,
+  "files_unchanged": 3210,
+  "started_at": "2026-01-01T00:00:00.0000000+00:00",
+  "finished_at": "2026-01-01T00:01:30.0000000+00:00"
+}
+```
+
 ## Available Commands
 
 The steam-auth service supports several commands:
@@ -85,11 +149,14 @@ The steam-auth service supports several commands:
 | `download` | Download/update game files (uses saved session) |
 | `ticket` | Output encrypted app ticket to stdout |
 | `export-token` | Export saved refresh token for CI use |
+| `renew` | Ask Steam to renew saved refresh tokens. Opens its own Steam session, so stop `serve` first; while `serve` runs use `POST /steam/renew-token` instead |
 | `serve` | Run HTTP API for runtime ticket requests (default) |
 
 ## Token Persistence
 
-Refresh tokens are saved to `/data/steam-session/session-{username}.json` and reused on container restart. Steam tokens typically last 200 days.
+Refresh tokens are saved to `/data/steam-session/{username}/session.json` and reused on container restart. Steam tokens typically last 200 days; the expiry comes from the token's JWT `exp` claim and is logged at every login and exposed per account in `GET /health`. An expired token fails login immediately with the setup command instead of retrying.
+
+`serve` asks Steam once a day to renew each saved-session token and logs the answer. Steam only issues a new token close to expiry and does not publish the window, so the request is made unconditionally rather than gated on remaining days. A renewed token replaces the saved session before anything else can observe it, because Steam invalidates the previous one; if saving fails, the new token lives only in the running process, and a restart before the next successful save needs `setup`. Tokens supplied via environment variables are skipped. During the last 14 days a daily warning reports the last renewal outcome (also `token_last_renewal_outcome` in `GET /health`).
 
 ## How Invite Codes Work
 
@@ -97,7 +164,113 @@ Refresh tokens are saved to `/data/steam-session/session-{username}.json` and re
 2. Galaxy creates a lobby and requests an encrypted app ticket
 3. Game server's `AuthService` fetches ticket from steam-auth via HTTP
 4. Steam-auth uses SteamKit2 to get an encrypted app ticket from Steam
-5. Ticket is returned and used to generate an invite code with "G" prefix
+5. The Galaxy SDK produces the invite code — which vanilla already makes **S-prefixed**
+   (`"S" + Base36(lobby id)`). The server mirrors this live-lobby code and exposes it the moment a
+   Galaxy lobby exists. A GOG client decodes it and joins over Galaxy P2P immediately; a vanilla
+   Steam client joins over the Steam relay once the Galaxy lobby carries the `SteamLobbyId` stamp,
+   reported separately as `steamRelayReady`. The G-code is never exposed — a Steam player who used it
+   would join over Galaxy and be given a farmhand their Steam identity never sees again.
+
+### Connectivity signals on `/status` and `/health`
+
+The invite code is a **mirror of the live Galaxy lobby**, not a cache: it is derived from
+`Game1.server?.getInviteCode()` by one writer at lobby-lifecycle transitions and is never erased by an
+unrelated Steam-session flap. Both endpoints report the code alongside four connectivity signals so a
+monitor can explain a missing or non-working code without reading logs; `/status` also derives the
+one code a display maps to text:
+
+| Field | Meaning |
+|-------|---------|
+| `inviteCode` | The universal S-code, or null when no Galaxy lobby exists |
+| `steamRelayReady` | Whether Steam clients can join using the code yet (the Galaxy lobby carries the relay stamp) |
+| `galaxyLobbyState` | `connected` \| `recovering` \| `down` (null when Steam auth is not configured) |
+| `steamSessionState` | `connected` \| `lost` — the Steam GameServer session |
+| `authReadiness` | `unknown` \| `ok` \| `expiring` \| `unavailable` — sidecar token health; `unknown` until the first poll reaches the sidecar (null when Steam auth is not configured) |
+| `connectionStatusCode` | `/status` only: `ready` \| `steamRelayPending` \| `reconnecting` \| `starting` \| `steamSessionDown` \| `inviteUnavailable` — whether the code is usable and by whom, derived from the signals above by `ConnectionStatus.Compute` (values in the [API reference](/developers/api/introduction#invite-code-status)) |
+
+`/health` carries the same summary in its body but keeps its HTTP status and `status` field tied to
+game-thread liveness only, so an alive-but-recovering server stays `200` (the Docker healthcheck and
+deploy gate must not restart it on a transient Galaxy/Steam blip). Galaxy recovers on its own
+supervisor timer independent of a Steam reconnect; a permanently dead/expired token surfaces as
+`authReadiness: unavailable` instead of being retried forever.
+
+### Lobbies are forced Public
+
+An invite code is just the lobby's raw ID handed to `JoinLobby`. Stardew's default
+visibility is **FriendsOnly** (`Game1.options.serverPrivacy`), which restricts joins to
+friends of the host account — but a dedicated server's host account is not friended by its
+players, so the default would block invite-code joins for everyone. The mod therefore forces
+**both** lobbies Public regardless of the game-chosen value:
+
+| Transport | Site |
+|-----------|------|
+| Steam lobby | `GalaxyAuthService.SetSteamLobbyPrivacy` (hardcodes `"public"`) |
+| Galaxy (GOG) lobby | `ServerOptimizerOverrides.CreateLobby_Prefix` (forces `ServerPrivacy.Public`) |
+
+This is why a JunimoServer lobby is always Public and can appear in the Steam/GOG lobby
+list. The two sites must stay in sync; changing one alone splits the transports' privacy.
+
+## Auth vs Transport: What the Sidecar Replaces (and What It Can't)
+
+The sidecar fully replaces the Steam client for **authentication** — but Steam network
+**sessions** are a separate layer, and the distinction decides which flows can run headless.
+
+An `encryptedAppTicket` is a static, signed identity proof designed to be shown to third
+parties. GOG's backend accepts it as a login (`GalaxyInstance.User().SignInSteam(ticket)`), so
+every Galaxy-side feature runs headless with sidecar tickets. The Steam relay (Steam Datagram
+Relay, SDR) is different: relays only carry traffic for endpoints holding live session certificates, and
+Valve opens such sessions through exactly two doors:
+
+| Door | API family | Headless? | Identity granted |
+|------|-----------|-----------|------------------|
+| User session | `SteamAPI.Init()` → attaches to a running Steam client process | No | The account's personal Steam64 (`7656…`) |
+| GameServer session | `SteamGameServer.Init()` + `LogOnAnonymous()` | Yes (by design, for dedicated servers) | An ephemeral gameserver ID (`90…`), no account involved |
+
+There is no API that turns a ticket into a Steam network session — deliberately, since
+otherwise any headless process could impersonate a live user endpoint (the unforgeability the
+mod's farmhand-ownership gate relies on).
+
+**Consequences in this codebase:**
+
+- The **server** never needs a user session: SDR *listening* uses the GameServer door
+  (`SteamGameServerNetworkingSockets`, `Callback.CreateGameServer` —
+  `SteamGameServerNetServer.cs`), the Steam lobby is managed by the sidecar's SteamKit2
+  account session (GameServer mode has no `SteamMatchmaking`), and Galaxy hosting uses a
+  sidecar ticket. Steam credentials exist for the ticket/lobby plumbing, not for SDR.
+- A **vanilla client dialing SDR** is the one operation in the whole system gated on the user
+  door. The decompiled chain (`decompiled/sdv-1.6.15-24356/StardewValley/SDKs/Steam/`):
+  `SteamHelper.cs:60` `SteamAPI.Init()` (attach to the Steam client; the app ticket itself is
+  then requested from the logged-on user session) → `SteamNetClient.cs:204`
+  `SteamMatchmaking.JoinLobby` → `:163` `SteamMatchmaking.GetLobbyGameServer` (resolves the
+  host's gameserver ID) → `:131` `SteamNetworkingSockets.ConnectP2P` — all user-mode APIs
+  with no GameServer-mode counterpart for a *player* connection.
+- **Test clients** therefore authenticate fully (real account, real ticket, real Galaxy
+  logon — same chain as the server) but transport over Galaxy P2P: the test-client mod
+  redirects Hybrid (S-prefix invite) joins to `GalaxyNetClient`
+  (`tests/test-client/Auth/ClientAuthService.cs`, `CreateClient_Prefix`). Client-side SDR is
+  never dialed in the harness; the server's SDR listener runs but is only exercised in
+  production. A GameServer-door dialer for the test client (real SDR traffic under a
+  gameserver identity) is planned in
+  `.claude/plans/features/tests-sdr-client-transport.md`.
+
+### Which identity a joining player presents (per door)
+
+The door a *player* joins through decides the transport identity their connection carries —
+and therefore which identity the farmhand-ownership map records:
+
+| Join path | Transport | Identity the server sees |
+|-----------|-----------|--------------------------|
+| Friends list / S-prefix invite code | Steam SDR (`SN_…` connection id) | The account's Steam64 (`7656…`) |
+| G-prefix invite code | Galaxy P2P (`GN_…` connection id) | The account's GOG Galaxy uint64 |
+| Direct IP | Lidgren LAN (`L_…` connection id) | None |
+
+The same Steam account therefore presents two unrelated ids depending on the door: the
+Steam64 and the Galaxy pseudo-id share no id space and cannot be correlated server-side
+(client-declared `userID` stamps are Galaxy-space on *both* platform transports, never the
+Steam64). A player who owns a farmhand through one door and rejoins through the other is
+rejected by the ownership gate; the operator fix is `farmhand rebind` with the id from the
+new door's connect-log line. `ConnectionTransport` (mod) is the canonical parser for these
+connection-id shapes.
 
 ## File Filtering
 
@@ -157,6 +330,7 @@ STEAM_REFRESH_TOKEN=xxx STEAM_USERNAME=user docker compose run steam-auth downlo
 | `SESSION_DIR` | Token storage directory | /data/steam-session |
 | `GAME_DIR` | Game files directory | /data/game |
 | `FORCE_REDOWNLOAD` | Set to "1" to re-download all files | - |
+| `VALIDATE_ON_BOOT` | Set to "false" to skip the boot-time validation/repair of the installed game files (`GET /game/validate-status`) | true |
 | `STEAM_KEEP_LANGUAGES` | Comma-separated language codes whose fonts to keep in the download (e.g. `pt-BR,ru-RU`). Default strips all localized content (English-only). | - |
 
 ### Game Server Container

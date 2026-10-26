@@ -8,7 +8,7 @@
 #   1. workflow_dispatch (Actions tab) — runs the full suite from a trusted branch; the
 #      optional `pr` input instead resolves that PR's HEAD (forks included, gated by
 #      `fork-pr`) and posts the same sticky as the comment path.
-#   2. `/run-tests-e2e [filter]` PR comment.
+#   2. `!run-tests-e2e [filter]` PR comment.
 #   3. the "Re-run E2E tests" checkbox in the bot's results comment (a click in the
 #      PR view; toggling it fires issue_comment: edited).
 #   4. schedule (nightly 08:00 UTC) — a full-suite run on master so the README E2E
@@ -32,11 +32,10 @@
 #     cancel triggers the runner's abort path (writes summary.json, sweeps VPS containers
 #     by run-id), and the sticky reports "⚪ aborted".
 #   - This workflow must NEVER become a required check (external-VPS availability can't
-#     gate the merge queue). The nightly `schedule` is the ONLY automatic trigger and is
+#     gate merges). The nightly `schedule` is the ONLY automatic trigger and is
 #     safe precisely because it doesn't gate anything — it runs on master after the fact,
 #     never blocks a merge, and is bounded to one run/day on the single VPS. Do NOT add a
-#     merge-coupled trigger (push / pull_request_target / merge_group) or mark any job a
-#     required check.
+#     merge-coupled trigger (push / pull_request_target) or mark any job a required check.
 #
 # PR visibility: issue_comment and dispatch+pr runs execute at github.sha (the default
 # branch's HEAD), not the PR's head SHA, so GitHub Actions' own auto-registered check for
@@ -75,7 +74,7 @@ on:
   # 06:00). Handled like workflow_dispatch in the gate (trusted, no PR context).
   schedule:
     - cron: '0 8 * * *'
-  # PR comments: `created` = the typed `/run-tests-e2e` command; `edited` = the re-run
+  # PR comments: `created` = the typed `!run-tests-e2e` command; `edited` = the re-run
   # checkbox in the bot's results comment being ticked. The `gate` job's `if:` narrows
   # this to PR comments that are actually our command or our sticky (see that job).
   issue_comment:
@@ -115,7 +114,7 @@ jobs:
        && github.event.sender.type != 'Bot'
        && (
             (github.event.action == 'created'
-               && startsWith(github.event.comment.body, '/run-tests-e2e'))
+               && startsWith(github.event.comment.body, '!run-tests-e2e'))
          || (github.event.action == 'edited'
                && contains(github.event.comment.body, '<!-- e2e-results -->'))
           ))
@@ -132,7 +131,7 @@ jobs:
       # the github-script step can require() it. issue_comment already runs the default-
       # branch workflow; this checkout is the default ref too (never the PR head).
       - name: Checkout gate helper
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: .github/scripts/e2e-pr-sticky.js
           sparse-checkout-cone-mode: false
@@ -276,7 +275,7 @@ jobs:
             let filterValid = true;
             if (action === 'created') {
               const cmd = helper.parseCommand(body);
-              if (!cmd.isCommand) return noop('comment is not an anchored /run-tests-e2e command');
+              if (!cmd.isCommand) return noop('comment is not an anchored !run-tests-e2e command');
               filter = cmd.filter;
               filterValid = cmd.valid;
             } else {
@@ -418,8 +417,11 @@ jobs:
       # turns on the in-container draw loop AND the video recorder; on this
       # gpu:false VPS the recorder uses libx264 software encoding (no NVENC). The
       # .mp4 clips land under TestResults/runs/ and are uploaded as artifacts.
-      # SDVD_TEST_SCREENSHOTS / SDVD_TEST_TRACING are intentionally unset here
-      # (as in .env.test) so they take their defaults.
+      # SDVD_TEST_SCREENSHOTS is intentionally unset here (as in .env.test) so it
+      # takes its default. SDVD_TEST_TRACING=none skips the unset default's
+      # per-poll body capture; per-test attribution (X-Test-Id) is sent at every
+      # level, so server events stay attributable to their test.
+      SDVD_TEST_TRACING: none
       SERVER_TPS: "5"
       SERVER_FPS: "5"
       CLIENT_TPS: "5"
@@ -473,7 +475,7 @@ jobs:
             || { echo "::error::containerd snapshotter not active (Driver=$driver)"; exit 1; }
 
       - name: Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # When the gate resolved a PR (comment, checkbox, or dispatch+pr), head_sha is the
           # PR's HEAD — check it out so we test the proposed code, not master (a full SHA
@@ -495,7 +497,7 @@ jobs:
       # just avoids handing forks an extra code-execution vector through our own tooling.)
       - name: Checkout trusted sticky helper
         if: needs.gate.outputs.pr_number != ''
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
           sparse-checkout: .github/scripts/e2e-pr-sticky.js
@@ -525,12 +527,13 @@ jobs:
             });
 
       # The coordinator is a net10.0 app that runs HERE on the runner (the mod
-      # builds inside Docker; the runner does not). .NET 10 is GA, so the default
-      # quality channel resolves a stable SDK — no preview pin needed.
+      # builds inside Docker; the runner does not). The SDK is pinned exactly
+      # (Renovate-managed) so every run uses the same SDK rather than whatever
+      # Microsoft shipped that day.
       - name: Setup .NET 10.0
-        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
-          dotnet-version: '10.0.x'
+          dotnet-version: '10.0.401'
 
       # Build the test-UI SPA so the runner can assemble the offline web report
       # (test-web) from it after the run. The runner's report path (ReportGenerator,
@@ -551,7 +554,7 @@ jobs:
       # steam-service) in-process.
       - name: Set up Docker Buildx
         id: buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # The Dockerfile uses a BuildKit `--mount=type=cache` for /root/.nuget/packages
       # that BuildKit does not persist across runs. The cache-dance bridges that:
@@ -559,12 +562,20 @@ jobs:
       # the BuildKit mount from it before the build, and the extract step (after)
       # writes the updated mount back. Mirrors validate-pr.yml — but with no
       # `changes`-job gating (this job always builds).
-      - name: Cache NuGet mount
+      #
+      # SECURITY: restore-only. The checkout above is PR HEAD on any PR run (fork or
+      # not), so its Dockerfile could plant a tampered package into the mount without
+      # changing the hashed key files. Saving that would poison the default-branch
+      # cache scope a later trusted build restores. Only trusted default-branch runs
+      # (head_sha == '' AND github.ref == refs/heads/master → schedule / dispatch on
+      # master, no PR) save (see the Save/Extract steps); PR runs and dispatches on
+      # other branches restore the warm trusted cache read-only.
+      - name: Restore NuGet mount
         id: nuget-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: nuget-cache-mount
-          key: nuget-cache-mount-${{ hashFiles('mod/**/*.csproj', 'tools/steam-service/**/*.csproj', 'Directory.Build.props') }}
+          key: nuget-cache-mount-${{ hashFiles('mod/**/*.csproj', 'tools/steam-service/**/*.csproj', 'Directory.Build.props', 'docker/Dockerfile') }}
 
       - name: Inject NuGet mount
         uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723 # v3.4.0
@@ -631,7 +642,7 @@ jobs:
           IMAGE_VERSION: local
           STEAM_ACCOUNTS: ${{ secrets.STEAM_ACCOUNTS }}
         run: |
-          docker compose build steam-auth
+          docker compose -f docker-compose.yml -f docker-compose.dev.yml build steam-auth
           # Drop the sidecar's SDVD_EVENT transport lines from this step's log:
           # they're a machine envelope with no consumer here (unlike the E2E run,
           # nothing tails/forwards a `docker compose run` stdout). Keep the
@@ -777,17 +788,21 @@ jobs:
       - name: Publish CTRF results to job summary
         if: always()
         continue-on-error: true
-        uses: ctrf-io/github-test-reporter@e500b992f936420eb633c91644cf10d4d71df700 # v1.1.0
+        uses: ctrf-io/github-test-reporter@7974087018bf4857cf5a9d78723e152038c3fa31 # v1.3.0
         with:
           report-path: 'TestResults/runs/**/ctrf-report.json'
           summary-report: true
           failed-report: true
 
       # After the build (which seeds the BuildKit mount), write the updated NuGet
-      # mount back for actions/cache to save. Gated on cache-miss only — matches
-      # validate-pr.yml; do NOT add `if: always()`.
+      # mount back for actions/cache to save. Gated on cache-miss only; do NOT add
+      # `if: always()`. Also gated on a trusted default-branch run — head_sha == ''
+      # (schedule / plain dispatch, no PR) AND github.ref is master, so a dispatch on
+      # a non-default branch can't write the mount either. (Literal refs/heads/master,
+      # like codeql.yml — github.event.repository.default_branch isn't guaranteed
+      # populated on the schedule payload.) See the Restore step's SECURITY note.
       - name: Extract NuGet mount
-        if: steps.nuget-cache.outputs.cache-hit != 'true'
+        if: steps.nuget-cache.outputs.cache-hit != 'true' && needs.gate.outputs.head_sha == '' && github.ref == 'refs/heads/master'
         uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723 # v3.4.0
         with:
           builder: ${{ steps.buildx.outputs.name }}
@@ -797,6 +812,16 @@ jobs:
               "nuget-cache-mount": "/root/.nuget/packages"
             }
           extract: true
+
+      # Save the extracted mount to the default-branch cache scope. Same gate as the
+      # Extract step: trusted default-branch run + cache-miss only, so PR runs and
+      # non-default-branch dispatches never write.
+      - name: Save NuGet mount
+        if: steps.nuget-cache.outputs.cache-hit != 'true' && needs.gate.outputs.head_sha == '' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: nuget-cache-mount
+          key: ${{ steps.nuget-cache.outputs.cache-primary-key }}
 
       # Per-run artifact tree: summary.json, ctrf-report.json, run-metadata.json,
       # diagnostics/infrastructure.jsonl, tests/{Class}.{Method}/, containers/...
@@ -1104,7 +1129,7 @@ jobs:
     steps:
       # Same trusted default-ref helper checkout as the gate job (never the PR head).
       - name: Checkout sticky helper
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: .github/scripts/e2e-pr-sticky.js
           sparse-checkout-cone-mode: false

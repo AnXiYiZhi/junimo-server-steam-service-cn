@@ -29,10 +29,13 @@ namespace JunimoServer.Tests.Helpers;
 ///
 /// <item><b>HTTP traffic</b>:
 /// <c>http_request</c> (client-side, TracingHandler: <c>clientKind, method, path,
-/// status, durationMs, reqBytes?, respBytes?, snapshotAgeMs?,
-/// predicateChangedMsAgo?, respSummary?, error?</c>) · <c>http_503_retry</c>
+/// status, durationMs, reqBytes?, respBytes?, respBody?, snapshotAgeMs?,
+/// predicateChangedMsAgo?, error?</c>; <c>respBytes</c>/<c>respBody</c> are
+/// <c>Full</c>-only, and <c>respBody</c> is truncated response text, scrubbed by
+/// <c>ReportRedactor</c>) · <c>http_503_retry</c>
 /// (ServerApiClient retried a 503) · <c>http_served</c> (mod, ApiService:
-/// <c>method, path, status, durationMs</c>).</item>
+/// <c>method, path, status, durationMs</c>; the envelope carries
+/// <c>testId</c> at every tracing level).</item>
 ///
 /// <item><b>Polling &amp; failure context</b>:
 /// <c>poll_completed</c> (<c>label, succeeded, iterations, durationMs, timeoutMs,
@@ -40,7 +43,7 @@ namespace JunimoServer.Tests.Helpers;
 /// outer wait in <c>finally</c> by <see cref="PollingHelper.WaitUntilAsync"/>;
 /// observer-time — describes the polling loop's wall-clock duration) ·
 /// <c>long_poll_completed</c> (<c>label, succeeded, iterations, durationMs,
-/// timeoutMs, snapshotVersionAtMatch?, error?, ctCancelled, diagnostics?,
+/// timeoutMs, snapshotSequenceAtMatch?, error?, ctCancelled, diagnostics?,
 /// onTimeoutError?</c>; emitted once per outer wait by
 /// <see cref="PollingHelper.LongPollAsync"/> and by bespoke long-poll outer
 /// loops. <c>iterations</c> counts HTTP round-trips to <c>/wait/*</c> and
@@ -62,6 +65,18 @@ namespace JunimoServer.Tests.Helpers;
 /// whose matched response did not carry the header — predicate-shape
 /// without an associated field-change time, or test-client-mod endpoints) ·
 /// <c>failure_context</c> (<c>reason, extras?, serverState?, diagnosticsError?</c>).</item>
+///
+/// <item><b>Client connect/join flow</b> (<see cref="ConnectionHelper"/>;
+/// test-harness native): the connect + join-world retry loop emits a family of
+/// join-progress events (slot pick, slot select, character-menu race, bounce
+/// re-selects, per-attempt failures) — grep <see cref="ConnectionHelper"/> for
+/// the definitive names and field sets. Two carry a phase-budget contract:
+/// <c>connect_phase_completed</c> (<c>attempt, transport:"lan"|"invite",
+/// slotCount, elapsedMs</c>; measured from connect entry to farmhand-list ready)
+/// and <c>world_ready_completed</c> (<c>slotIndex, wasCustomizedFastPath,
+/// elapsedMs</c>; measured from connect entry to the world-ready gate — subtract
+/// the matching <c>connect_phase_completed.elapsedMs</c> to isolate the
+/// post-connect select/customize tail).</item>
 ///
 /// <item><b>Mod game-state snapshots</b>:
 /// <c>peer_connected</c> (LobbyService) · <c>peer_disconnected</c> (LobbyService) ·
@@ -97,10 +112,23 @@ namespace JunimoServer.Tests.Helpers;
 /// <c>cabin_claims_swept_on_load</c> (save-load sweep summary, emitted only when it
 /// released at least one claim: <c>cleared</c>) · <c>cabin_strategy_migration</c>
 /// (success path: <c>fromStrategy, toStrategy, migrated</c>) ·
-/// <c>cabin_strategy_migration_aborted</c> (Stacked→None migration pre-validation
-/// found fewer designated positions than hidden cabins; no cabin moved and strategy
-/// reverted: <c>fromStrategy, toStrategy, hiddenCabinCount, availablePositionCount,
-/// deficit, reason:"insufficient_designated_positions"</c>) ·
+/// <c>cabin_strategy_migration_aborted</c> (a materializing settings-file switch
+/// (stacked→None or FarmhouseStack→CabinStack) rejected on an existing save — the
+/// staged 'cabins migrate' flow is the supported path; no cabin moved and strategy
+/// reverted: <c>fromStrategy, toStrategy, hiddenCabinCount,
+/// reason:"requires_staged_migration"</c>) ·
+/// <c>cabin_migration_started</c> (staged 'cabins migrate start': <c>fromStrategy,
+/// toStrategy, autoPlaced, remaining</c>) · <c>cabin_migration_placed</c> (one staging
+/// cabin placement — a cabin moved to a validated spot: <c>tileX, tileY, manual</c>) ·
+/// <c>cabin_migration_stackspot_set</c> (the FarmhouseStack→CabinStack staging's
+/// shared-stack-spot choice — no cabin moves: <c>tileX, tileY, manual</c>) ·
+/// <c>cabin_migration_committed</c> (<c>fromStrategy, toStrategy, placedCount</c>) ·
+/// <c>cabin_migration_aborted</c> (staging undone, staged cabins returned to the
+/// hidden stack: <c>fromStrategy, toStrategy, cabinsReturned</c>) ·
+/// <c>cabin_none_reconciled</c> (load-time terminal-state guard: a None world loaded
+/// with cabins still in the hidden stack — crashed migration commit or stacked save
+/// imported onto a None server — and placed them at designated spots: <c>placed,
+/// leftHidden</c>) ·
 /// <c>farmhand_references_cleaned</c> (save-load stale-ref cleanup:
 /// <c>orphansRemoved, homeCleared, lastSleepCleared, validCabins</c>).</item>
 ///
@@ -157,7 +185,10 @@ namespace JunimoServer.Tests.Helpers;
 /// <c>steam_account_allocated</c> / <c>steam_account_released</c> /
 /// <c>steam_account_pool_insufficient</c> (<c>kind:"server"|"client", index?,
 /// remaining?, available?, totalSize?, inUse?</c>) ·
-/// <c>steam_account_release_error</c> (ClientPool release path).</item>
+/// <c>steam_account_release_error</c> (ClientPool release path) ·
+/// <c>steam_account_allocation_timeout</c> (<c>clientIndex, boundSec</c>; a client
+/// Steam-account allocation exceeded <see cref="TestTimings.SteamAccountAllocationBound"/>
+/// — no account released within the bound, so the lease fails fast as infrastructure).</item>
 ///
 /// <item><b>Docker / container lifecycle</b>:
 /// <c>docker_preflight</c> (ContainerStatsCollector.InitializeAsync:
@@ -195,7 +226,8 @@ namespace JunimoServer.Tests.Helpers;
 /// <c>helper_image_pull_failed</c> (<c>host_id, image, error</c>).</item>
 ///
 /// <item><b>SSH tunnel lifecycle</b> (<c>TunnelManager</c>; remote hosts only):
-/// <c>ssh_preflight</c> (<c>sshPath, staleSocketsDeleted</c>; emitted once at
+/// <c>ssh_preflight</c> (<c>sshPath, orphanMastersReaped, orphanReapTimedOut,
+/// staleSocketsSwept, staleSweepTimedOut</c>; emitted once at
 /// HostPool.PreflightAsync start when any host is remote) ·
 /// <c>ssh_master_ready</c> (<c>host_id, controlPath, logPath, durationMs</c>;
 /// <c>logPath</c> = the master's <c>-E</c> error log) ·
@@ -203,12 +235,71 @@ namespace JunimoServer.Tests.Helpers;
 /// <c>stderr</c> falls back to the <c>-E</c> log tail when the parent pipe is
 /// empty) · <c>ssh_master_check_failed</c> (<c>host_id, exitCode, stderr,
 /// spawnStderr, durationMs</c>) · <c>ssh_master_exited</c> (<c>host_id, exitCode,
-/// stderr?, durationMs</c>; per host during DrainAsync; <c>stderr</c> only when
-/// <c>exitCode != 0</c>) · <c>ssh_master_log</c> (<c>host_id, logPath, byteLength,
+/// gone, killOutcome?, stderr?, durationMs</c>; per host during DrainAsync;
+/// <c>stderr</c> only when <c>exitCode != 0</c>, <c>killOutcome</c> only when a
+/// pid-kill fallback ran) ·
+/// <c>ssh_master_teardown_failed</c> (<c>host_id, masterPid, controlPath,
+/// killOutcome</c>; the master survived even the kill — its socket and journal
+/// entry are kept as the reap handle) ·
+/// <c>ssh_master_emergency_teardown</c> (<c>host_id, gone, exitCode,
+/// killOutcome</c>; journal-driven teardown on abort paths) ·
+/// <c>ssh_orphan_master_reaped</c> (<c>host_id, coordinatorPid, controlPath,
+/// gone, killOutcome</c>; next run's preflight reap of a dead coordinator's
+/// master) · <c>ssh_master_log</c> (<c>host_id, logPath, byteLength,
 /// tail</c>; emitted at teardown only when the <c>-E</c> log is non-empty —
 /// carries the master's death line, e.g. "Timeout, server not responding.") ·
+/// <c>ssh_master_unhealthy_owner</c> (<c>host_id, cause</c>; see
+/// <see cref="Infrastructure.TunnelManager"/> for cause variants — owner-side
+/// monitor verdict before a respawn; the <c>/_ping</c> canary through the host's
+/// socket forward catches the wedge mode where <c>-O check</c> still passes) ·
+/// <c>ssh_master_pid_unparsed</c> (<c>host_id, stderr</c>; the master registered
+/// without a parseable pid, so a later respawn's hard-reset kill degrades to a
+/// skip — loud here because at kill time it would be silent) ·
+/// <c>ssh_master_pid_unmapped</c> (<c>host_id, reportedPid</c>; the Cygwin-space
+/// pid could not be mapped to a Windows pid, so every kill degrades to
+/// <c>-O exit</c> + check-based confirmation) ·
+/// <c>ssh_master_canary_stall</c> / <c>ssh_master_canary_recovered</c> /
+/// <c>ssh_master_wedge_observed</c> (typed records in
+/// <see cref="Schema.Events.TransportEventNames"/>; the canary streak's start,
+/// its measured end, and — at the action threshold — every canary of the streak
+/// plus <c>-O check</c>, coordinator TCP state, a reachability probe and the
+/// master log tail, captured before any respawn) ·
+/// <c>ssh_master_respawn_attempt</c> (<see cref="Schema.Events.SshMasterRespawnAttemptEvent"/>:
+/// <c>host_id, incidentId, cause, oldPid?, termination, exitCode, exitStderr,
+/// killOutcome, elapsedMs, terminatedAtUtc, masterLogArchivePath?</c>; the same
+/// action, plus its outcome and attribution window, is published to the child as
+/// <c>diagnostics/transport-state.{hostId}.json</c>) ·
+/// <c>ssh_master_respawned</c> (<c>host_id, incidentId, alive</c>) ·
+/// <c>ssh_master_respawn_failed</c> (<c>host_id, incidentId, error, killOutcome?</c>) ·
+/// <c>transport_state_write_failed</c> / <c>ssh_master_log_archive_failed</c>
+/// (<c>error</c> plus the paths involved; a diagnostics write that failed) ·
+/// <c>forward_heal_attempt</c> (<see cref="Schema.Events.ForwardHealAttemptEvent"/>;
+/// one per heal cycle of <c>ForwardHealingHandler</c>; <c>heal_threw</c> carries the
+/// heal's stack trace) ·
+/// <c>forward_heal_threw</c> (<see cref="Schema.Events.ForwardHealThrewEvent"/>; a
+/// heal outside the handler — <c>DockerHost</c> daemon forward, <c>ManagedServer</c>
+/// watchdog — threw instead of returning a verdict; chain + stack trace) ·
+/// <c>container_log_stream_gap</c> / <c>container_stats_stream_gap</c>
+/// (<see cref="Schema.Events.StreamGapEvent"/>; a stream resumed after a silent gap
+/// above the reader's threshold — all streams of a host gapping together is a
+/// transport stall, one stream alone is a quiet container) ·
+/// <c>container_log_stream_reconnected</c> (<see cref="Schema.Events.StreamReconnectedEvent"/>;
+/// a log reader re-opened after a transport loss: <c>outageStartUtc, reconnectedAtUtc,
+/// gapMs, openFailures, lastLineTimestamp, incidentId?</c>) ·
+/// <c>container_log_stream_ended</c> (<see cref="Schema.Events.StreamEndedEvent"/>;
+/// every reader exit: <c>reason:"container_exited"|"open_failures_exhausted"|
+/// "cancelled"|"docker_down"|"line_handler_faulted", detail, faultType?, faultMessage?, faultChain?, lastLineTimestamp?,
+/// linesEmitted, reconnects, outageMs?, incidentId?</c>) ·
+/// <c>transport_state_unreadable</c> (<see cref="Schema.Events.TransportStateUnreadableEvent"/>:
+/// <c>path, exceptionType, error, label?, host_id?</c>; the child could not read the
+/// runner's <c>transport-state.{hostId}.json</c>, so the reader fell back to its
+/// default reconnect budget) ·
 /// <c>tunnel_forward_opened</c> (<c>host_id, coordinator_port, mapped_port?,
 /// remote_socket?, durationMs, attempts</c>) ·
+/// <c>tunnel_forward_reopened</c> / <c>tunnel_forward_reopen_failed</c>
+/// (<c>host_id, coordinator_port, mapped_port?, remote_socket?, durationMs,
+/// message?</c>; same-port restoration of this process's registered forwards
+/// after a master respawn or a canary-detected forward drop) ·
 /// <c>tunnel_forward_failed</c> (<c>host_id, coordinator_port?, mapped_port?,
 /// remote_socket?, reason:"forward_failed"|"probe_timeout"|"cancelled"|
 /// "port_collision_retry", message, attempt, attempts</c>; per attempt) ·
@@ -227,7 +318,11 @@ namespace JunimoServer.Tests.Helpers;
 /// <item><b>Discovery &amp; setup</b>:
 /// <c>config_discovery_completed</c> (once-per-process:
 /// <c>configCount, configs[], durationMs</c>) · <c>run_aborted</c>
-/// (<c>cause, exceptionType?, message?</c>) · <c>setup_ipc_read_deadline</c> /
+/// (<c>cause, exceptionType?, message?</c>) · <c>run_force_aborted</c>
+/// (<c>cause</c>; second abort signal) · <c>abort_phase_timings</c>
+/// (<c>cause, drained, gracefulWaitMs, childKillMs, cleanupMs</c>; per-phase
+/// elapsed times of the abort path, for tuning the FailFast backstop margin) ·
+/// <c>setup_ipc_read_deadline</c> /
 /// <c>setup_ipc_oversized_line</c> (SetupPipeServer hardening) ·
 /// <c>coordinator_address_resolved</c> (distributed runner only:
 /// <c>ip, source:"loopback"|"auto-detected", probedHost?</c>).</item>
@@ -298,17 +393,27 @@ namespace JunimoServer.Tests.Helpers;
 ///
 /// <item><b>Capacity &amp; exclusivity (broker scheduler)</b>:
 /// <c>capacity_acquired</c> · <c>capacity_released</c> · <c>pool_expansion</c> ·
-/// <c>server_acquired</c> (<c>server, instanceId, host_id, refCount, exclusive</c>) ·
+/// <c>server_acquired</c> (<c>server, instanceId, host_id, refCount, exclusive</c>;
+/// fires only for the test that took the lease) ·
+/// <c>test_instance_bound</c> (<c>serverInstanceId</c>; emitted per test method
+/// from <c>TestBase.BindToActiveInstance</c>, so the envelope <c>test</c> gives a
+/// per-test → instance binding in every isolation mode, including
+/// KeepConnected/adopted sessions where <c>server_acquired</c> doesn't re-fire) ·
 /// <c>exclusive_acquired</c> (<c>server, instanceId, test, refCount,
 /// kind:"with_ref"|"gate_only", inheritedFromClass</c>) ·
 /// <c>exclusive_released</c> (<c>server, instanceId,
 /// kind:"ended"|"passed_to_same_class", ownerClass?, waiters?</c>) ·
+/// <c>exclusive_release_rejected</c> (<c>server, instanceId, ownerClass,
+/// callerClass</c>; a stale cross-class release no-oped instead of erasing the gate) ·
 /// <c>session_created</c> · <c>session_disposed</c> ·
 /// <c>cancellation_detected</c> · <c>farmer_removal_waited</c>.</item>
 ///
 /// <item><b>Client pool</b>:
-/// <c>client_created</c> (<c>clientIndex, durationMs, reason:"prewarm"|"lease_demand"</c>) ·
-/// <c>client_create_failed</c> ·
+/// <c>client_created</c> (<c>clientIndex, durationMs, reason:"prewarm"|"lease_demand"|
+/// "steam_selfheal"|"blip_retry"</c>) · <c>client_create_failed</c> ·
+/// <c>steam_client_selfheal</c> (<c>availableInBag</c>; the last Steam-bearing client died
+/// via <c>client_marked_dead</c>, so the next Steam lease creates a replacement rather than
+/// waiting on a return that can never come) ·
 /// <c>client_acquired</c> (<c>clientIndex, instanceId, serverInstanceId?,
 /// serverKey, steamAccountIndex</c>) ·
 /// <c>client_returned</c> (<c>clientIndex, serverKey, poolAvailable</c>) ·
@@ -458,21 +563,6 @@ public static class InfrastructureEventLog
             writer = _asyncWriter;
         }
         return writer?.FlushAsync() ?? Task.CompletedTask;
-    }
-
-    /// <summary>
-    /// Drains the writer's channel and flushes the underlying file. Used by
-    /// the broker / runner shutdown paths where the next steps will tear down
-    /// containers and we want all in-flight events on disk first.
-    /// </summary>
-    public static Task DrainAsync(TimeSpan timeout)
-    {
-        AsyncJsonlWriter? writer;
-        lock (_lock)
-        {
-            writer = _asyncWriter;
-        }
-        return writer?.DrainAsync(timeout) ?? Task.CompletedTask;
     }
 
     /// <summary>

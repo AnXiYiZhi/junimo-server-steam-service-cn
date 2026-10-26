@@ -1,4 +1,4 @@
-FROM oven/bun:1.3.14-alpine
+FROM oven/bun:1.4.2-alpine
 
 WORKDIR /app
 
@@ -10,6 +10,11 @@ RUN bun install --frozen-lockfile --production
 
 # Copy source
 COPY src ./src
+
+# Dashboard ownership state lives in /data (named volume). A fresh volume
+# inherits the mountpoint's ownership from the image, so chown here is what
+# lets the non-root user write to it.
+RUN mkdir -p /data && chown bun:bun /data
 
 # Run as non-root user
 USER bun

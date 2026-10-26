@@ -10,19 +10,14 @@ How to connect to a JunimoServer-hosted farm.
 
 ## Invite Codes
 
-| Platform | Format | Example |
-|----------|--------|---------|
-| Steam | Starts with "S" | `S123456789` |
-| GOG Galaxy | Starts with "G" | `G1234567890ABCDEF` |
+One code works for everyone, whether you play on Steam or GOG. It looks like `S1234567890ABC` and comes from the server's status page, its Discord bot, or the admin.
 
-::: tip
-When both Steam and GOG codes are available, Steam is recommended for better connection reliability (~99% vs ~50% success rate).
-:::
+Your farmer is tied to how you join, so always use this code. On Steam, a code starting with "G" would create a separate farmer that this code never shows; see the [FAQ](/community/faq#can-another-player-take-over-my-farmer) if that has happened to you.
 
 ## How to Connect
 
 1. Launch Stardew Valley
-2. Click **Co-op** → **Enter Invite Code**
+2. Click **Co-op** → **Join** → **Enter Invite Code**
 3. Paste the invite code
 4. Click **OK**
 
@@ -43,14 +38,14 @@ Don't drop items while in the lobby. They will be lost.
 ## First Time vs Returning
 
 - **First time**: A cabin is created for you automatically
-- **Returning**: You spawn at your last saved position
+- **Returning**: You rejoin where your farmhand last slept, usually your cabin. If you reconnect on the same in-game day, you return to where you left off.
 
 ## Connection Methods
 
 | Method | Platform | Notes |
 |--------|----------|-------|
-| Steam SDR | Steam | Most reliable (~99% success) |
+| Steam relay | Steam | Most reliable (~99% success) |
 | GOG Galaxy | GOG | Works through most networks (~50% success) |
-| Direct IP | Any | Requires port forwarding |
+| Direct IP | Any | Disabled by default and [not recommended](/admins/operations/networking#direct-ip) |
 
-Most servers use Steam SDR or GOG Galaxy. No special setup needed on your end.
+Most servers use the Steam relay or GOG Galaxy. No special setup needed on your end. Admins can find ports and setup details under [Networking](/admins/operations/networking#connection-methods).

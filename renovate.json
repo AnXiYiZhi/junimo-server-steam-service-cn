@@ -1,19 +1,16 @@
 {
     "$schema": "https://docs.renovatebot.com/renovate-schema.json",
     "extends": ["config:recommended"],
-    "timezone": "Europe/Berlin",
-    "schedule": ["before 6am on monday"],
     "labels": ["dependencies"],
     "semanticCommits": "enabled",
     "semanticCommitType": "chore",
     "semanticCommitScope": "deps",
     "commitMessageTopic": "{{depName}}",
-    "rebaseWhen": "conflicted",
+    "rebaseWhen": "behind-base-branch",
     "automerge": true,
     "automergeType": "pr",
     "platformAutomerge": true,
-    "prHourlyLimit": 0,
-    "prConcurrentLimit": 0,
+    "minimumReleaseAge": "3 days",
     "dependencyDashboard": true,
     "lockFileMaintenance": {
         "enabled": false
@@ -37,9 +34,12 @@
             "groupName": "server"
         },
         {
-            "description": "steam-service — standalone Steam auth sidecar (NuGet).",
+            "description": "steam-service — standalone Steam auth sidecar and its unit tests (NuGet).",
             "matchManagers": ["nuget"],
-            "matchFileNames": ["tools/steam-service/SteamService.csproj"],
+            "matchFileNames": [
+                "tools/steam-service/SteamService.csproj",
+                "tests/SteamService.Tests/SteamService.Tests.csproj"
+            ],
             "semanticCommitScope": "deps/steam-service",
             "groupName": "steam-service"
         },
@@ -113,6 +113,13 @@
             "groupName": "github-actions"
         },
         {
+            "description": "dotnet-sdk — the .NET SDK version pinned via dotnet-version in .github/workflows/*.yml (the custom.regex manager below). Standalone, not folded into the docker or github-actions groups, so an SDK bump lands as one visible PR that runs full CI before automerge — the point of pinning the SDK instead of floating on 10.0.x. Must come after the docker group rule (last-match-wins) so it overrides that rule's custom.regex match, which would otherwise misroute the bump to deps/docker.",
+            "matchManagers": ["custom.regex"],
+            "matchPackageNames": ["dotnet-sdk"],
+            "semanticCommitScope": "deps/dotnet-sdk",
+            "groupName": "dotnet-sdk"
+        },
+        {
             "description": "PIN — test-client mod-builder .NET 6 must match the game's runtime. Scoped to tag 6.0 in this file only; the 10.0 stages here and in docker/Dockerfile stay updatable.",
             "matchManagers": ["dockerfile"],
             "matchFileNames": ["docker/Dockerfile.test-client"],
@@ -172,14 +179,29 @@
             "allowedVersions": "<2.0.0"
         },
         {
-            "description": "CAP — Microsoft.NET.Test.Sdk below 18.0 in the E2E test project. 18.x bundles Microsoft Testing Platform v2.0, but the default xunit.v3 package targets MTP v1, so the pair fails at runtime with TypeLoadException for IDataConsumer (xunit#3416, by design). Lift only as part of a coordinated migration to the xunit.v3.mtp-v2 packages and matching coverlet 10 (coverlet.collector is left ungated so it can move with that migration).",
+            "description": "CAP — Microsoft.NET.Test.Sdk below 18.0 in the xunit.v3 test projects. 18.x bundles Microsoft Testing Platform v2.0, but the default xunit.v3 package targets MTP v1, so the pair fails at runtime with TypeLoadException for IDataConsumer (xunit#3416, by design). Lift only as part of a coordinated migration to the xunit.v3.mtp-v2 packages and matching coverlet 10 (coverlet.collector is left ungated so it can move with that migration).",
             "matchManagers": ["nuget"],
             "matchFileNames": [
-                "tests/JunimoServer.Tests/JunimoServer.Tests.csproj"
+                "tests/JunimoServer.Tests/JunimoServer.Tests.csproj",
+                "tests/JunimoServer.UnitTests/JunimoServer.UnitTests.csproj",
+                "tests/SteamService.Tests/SteamService.Tests.csproj"
             ],
             "matchPackageNames": ["Microsoft.NET.Test.Sdk"],
             "versioning": "semver",
             "allowedVersions": "<18.0.0"
+        },
+        {
+            "description": "CAP — xunit.v3 stack below 4.0 (coordinated MTP-v2 major, deferred alongside the Test.Sdk 18 cap above). xunit.v3 (Tests, UnitTests, SteamService.Tests) + xunit.v3.runner.utility (TestRunner) must move together — split majors fail restore (NU1107, mismatched xunit.v3.runner.common) — and 4.x drops AssemblyRunnerOptions.ParallelizeTestCollections, set in TestRunner/Program.cs. xunit.runner.visualstudio is deliberately NOT capped: it has no xunit.v3 package dependency, and 4.0.0 runs xunit.v3 3.2.2 projects under VSTest (verified: SteamService.Tests 7/7 green on the runner-4.0 Renovate PR). versioning:semver — nuget silently no-ops allowedVersions on interleaved prereleases.",
+            "matchManagers": ["nuget"],
+            "matchFileNames": [
+                "tests/JunimoServer.Tests/JunimoServer.Tests.csproj",
+                "tests/JunimoServer.TestRunner/JunimoServer.TestRunner.csproj",
+                "tests/JunimoServer.UnitTests/JunimoServer.UnitTests.csproj",
+                "tests/SteamService.Tests/SteamService.Tests.csproj"
+            ],
+            "matchPackageNames": ["xunit.v3", "xunit.v3.runner.utility"],
+            "versioning": "semver",
+            "allowedVersions": "<4.0.0"
         },
         {
             "description": "CAP — SixLabors.ImageSharp below 4.0 in the E2E test project, pending a Six Labors license key in CI. 4.0 is the first release to enforce a build-time license key for direct package dependencies, so merging it breaks the build until the (free-to-apply for OSS) key is provisioned. Lift once the key is wired into the build. versioning:semver — the default nuget scheme can silently no-op allowedVersions for packages with interleaved prereleases.",
@@ -200,6 +222,16 @@
             "matchPackageNames": ["SixLabors.ImageSharp.Drawing"],
             "versioning": "semver",
             "allowedVersions": "<3.0.0"
+        },
+        {
+            "description": "CAP — typescript below 7.0 in test-ui and docs. TS 7 is the Go-native port: its npm package ships a platform binary plus a version stub (lib/ holds only tsc.js and version.cjs, and exports[\".\"] maps to lib/version.cjs), so the compiler JS API is gone until the API planned for 7.1. vue-tsc's engine @volar/typescript consumes that API, so `vue-tsc --noEmit` dies with ERR_PACKAGE_PATH_NOT_EXPORTED on './lib/tsc' — breaking `bun run build` in test-ui, which gates `make build-test-ui` and the Build test-UI SPA step in e2e-tests.yml. Verified against vue-tsc 3.3.9. vue-tsc's peer range (>=5.0.0) accepts 7.x, so nothing warns at install time. docs is capped in lockstep: its tsconfig includes .vitepress/**/*.vue, which tsgo cannot check, and vitepress build never invokes tsc — 7.x is all risk and no gain there. No versioning:semver here, unlike the nuget caps above: the bun manager uses npm versioning, which evaluates <7.0.0 correctly. Lift once Volar runs on the TS 7.1 API (vuejs/language-tools#5381).",
+            "matchManagers": ["bun"],
+            "matchFileNames": [
+                "tests/test-ui/package.json",
+                "docs/package.json"
+            ],
+            "matchPackageNames": ["typescript"],
+            "allowedVersions": "<7.0.0"
         },
         {
             "description": "MAJOR — every major update gets its own PR, no exceptions. Clears the per-module groupName for any major bump (last-match-wins), so each major lands standalone. Must stay last to override every group above.",
@@ -226,6 +258,15 @@
             "datasourceTemplate": "github-releases",
             "extractVersionTemplate": "^v(?<version>.+)$",
             "versioningTemplate": "deb"
+        },
+        {
+            "customType": "regex",
+            "description": "dotnet-sdk — the pinned dotnet-version in .github/workflows/*.yml. Matches both quote styles and captures only a concrete version (e.g. 10.0.400), never a floating 10.0.x. datasource dotnet-version resolves depName dotnet-sdk against Microsoft's SDK release index; it has no default versioning, so semver is set explicitly (SDK versions order correctly under it, and config:recommended's ignoreUnstable keeps previews out).",
+            "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
+            "matchStrings": ["dotnet-version:\\s*[\"'](?<currentValue>\\d+\\.\\d+\\.\\d+)[\"']"],
+            "depNameTemplate": "dotnet-sdk",
+            "datasourceTemplate": "dotnet-version",
+            "versioningTemplate": "semver"
         }
     ]
 }

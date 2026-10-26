@@ -34,8 +34,6 @@ public class AlwaysOnServerFestivals
         public Func<int> CountdownSeconds;
         public string AnnounceText;
         public Action OnAnnounce; // e.g. add the iridium starfruit to the Luau soup
-        public bool AutoEndAfterCountdown; // host ends the festival once the countdown elapses (Fair)
-        public string EndLogText; // logged when AutoEndAfterCountdown fires
 
         // Wall-clock backstop: end the festival and warp everyone home once this elapses
         // (from entry or after the main event)
@@ -84,8 +82,9 @@ public class AlwaysOnServerFestivals
 
         chatCommandService.RegisterCommand(
             "event",
-            "Tries to start the current festival's event.",
-            StartEventCommand
+            "Starts the current festival's event.",
+            StartEventCommand,
+            requiresAdmin: true
         );
     }
 
@@ -101,7 +100,7 @@ public class AlwaysOnServerFestivals
                 CountdownSeconds = () => Config.EggHuntCountdownSeconds,
                 AnnounceText = "The Egg Hunt will begin in {0:0.#} minutes.",
                 TimeoutStart = TimeoutStart.AfterMainEvent,
-                TimeoutSeconds = () => TicksToSeconds(Config.EggFestivalTimeOut + 180),
+                TimeoutSeconds = () => Config.EggFestivalTimeOutSeconds,
             },
             new FestivalSpec
             {
@@ -111,7 +110,7 @@ public class AlwaysOnServerFestivals
                 CountdownSeconds = () => Config.FlowerDanceCountdownSeconds,
                 AnnounceText = "The Flower Dance will begin in {0:0.#} minutes.",
                 TimeoutStart = TimeoutStart.AfterMainEvent,
-                TimeoutSeconds = () => TicksToSeconds(Config.FlowerDanceTimeOut + 90),
+                TimeoutSeconds = () => Config.FlowerDanceTimeOutSeconds,
             },
             new FestivalSpec
             {
@@ -122,7 +121,7 @@ public class AlwaysOnServerFestivals
                 AnnounceText = "The Soup Tasting will begin in {0:0.#} minutes.",
                 OnAnnounce = AddIridiumStarfruitToSoup,
                 TimeoutStart = TimeoutStart.AfterMainEvent,
-                TimeoutSeconds = () => TicksToSeconds(Config.LuauTimeOut + 80),
+                TimeoutSeconds = () => Config.LuauTimeOutSeconds,
             },
             new FestivalSpec
             {
@@ -132,7 +131,7 @@ public class AlwaysOnServerFestivals
                 CountdownSeconds = () => Config.JellyDanceCountdownSeconds,
                 AnnounceText = "The Dance of the Moonlight Jellies will begin in {0:0.#} minutes.",
                 TimeoutStart = TimeoutStart.AfterMainEvent,
-                TimeoutSeconds = () => TicksToSeconds(Config.DanceOfJelliesTimeOut + 180),
+                TimeoutSeconds = () => Config.DanceOfJelliesTimeOutSeconds,
             },
             new FestivalSpec
             {
@@ -142,10 +141,8 @@ public class AlwaysOnServerFestivals
                 HasMainEvent = true,
                 CountdownSeconds = () => Config.GrangeDisplayCountdownSeconds,
                 AnnounceText = "The Grange Judging will begin in {0:0.#} minutes.",
-                AutoEndAfterCountdown = true,
                 TimeoutStart = TimeoutStart.OnEntry,
-                TimeoutSeconds = () => TicksToSeconds(Config.FairTimeOut),
-                EndLogText = "Grange display finished, triggering festival end",
+                TimeoutSeconds = () => Config.FairTimeOutSeconds,
             },
             new FestivalSpec
             {
@@ -153,7 +150,7 @@ public class AlwaysOnServerFestivals
                 ResetCutoff = 2400,
                 RestoreHudOnReset = true,
                 HasMainEvent = false,
-                TimeoutSeconds = () => TicksToSeconds(Config.SpiritsEveTimeOut),
+                TimeoutSeconds = () => Config.SpiritsEveTimeOutSeconds,
             },
             new FestivalSpec
             {
@@ -163,22 +160,17 @@ public class AlwaysOnServerFestivals
                 CountdownSeconds = () => Config.IceFishingCountdownSeconds,
                 AnnounceText = "The Ice Fishing Contest will begin in {0:0.#} minutes.",
                 TimeoutStart = TimeoutStart.AfterMainEvent,
-                TimeoutSeconds = () => TicksToSeconds(Config.FestivalOfIceTimeOut + 180),
+                TimeoutSeconds = () => Config.FestivalOfIceTimeOutSeconds,
             },
             new FestivalSpec
             {
                 IsToday = SDateHelper.IsFeastOfWinterStarToday,
                 ResetCutoff = 1410,
                 HasMainEvent = false,
-                TimeoutSeconds = () => TicksToSeconds(Config.WinterStarTimeOut),
+                TimeoutSeconds = () => Config.WinterStarTimeOutSeconds,
             },
         };
     }
-
-    /// <summary>
-    /// Convert a config value (in ticks at 60 TPS) to seconds.
-    /// </summary>
-    private static double TicksToSeconds(int ticks) => ticks / 60.0;
 
     /// <summary>
     /// Get elapsed seconds since a start time, or 0 if not started.
@@ -264,7 +256,7 @@ public class AlwaysOnServerFestivals
             var numberReady = Game1.netReady.GetNumberReady("festivalStart");
             var numberRequired = Game1.netReady.GetNumberRequired("festivalStart");
             _monitor.Log(
-                $"[Festival] online={CountOnlineOtherPlayers()}, otherFarmers={Game1.otherFarmers.Count}, isFestival={Game1.CurrentEvent?.isFestival}, warping={_warpingToFestival}, ready={numberReady}/{numberRequired}, CheckOthersReady={CheckOthersReady("festivalStart")}",
+                $"[Festival] online={OnlineFarmers.CountOthers()}, otherFarmers={Game1.otherFarmers.Count}, isFestival={Game1.CurrentEvent?.isFestival}, warping={_warpingToFestival}, ready={numberReady}/{numberRequired}, CheckOthersReady={CheckOthersReady("festivalStart")}",
                 LogLevel.Trace
             );
         }
@@ -273,7 +265,7 @@ public class AlwaysOnServerFestivals
         // Consistent with the no-players end check; CurrentEvent is null here so otherFarmers
         // would be live, but use the same online count so a player disconnecting mid-warp-in is
         // seen immediately rather than one removeDisconnectedFarmers pass later.
-        if (CountOnlineOtherPlayers() == 0)
+        if (OnlineFarmers.CountOthers() == 0)
         {
             return;
         }
@@ -362,30 +354,6 @@ public class AlwaysOnServerFestivals
     }
 
     /// <summary>
-    /// Count online non-host players, excluding any mid-disconnect, mirroring how the game's
-    /// <c>DedicatedServer</c> builds its <c>onlineIds</c> set (DedicatedServer.cs:286-293).
-    ///
-    /// <para>
-    /// Do NOT use <c>Game1.otherFarmers.Count</c> for "is the festival empty?". A player who
-    /// disconnects mid-festival is only <i>marked</i> in <c>disconnectingFarmers</c>; the actual
-    /// <c>Game1.otherFarmers.Remove</c> runs in <c>Multiplayer.removeDisconnectedFarmers</c>, which
-    /// is gated on <c>Game1.CurrentEvent == null</c> (Multiplayer.cs:1821). So during a festival
-    /// the count never drops — and gating the no-players force-end on it would hang the festival
-    /// forever (event up → not removed → count stays 1 → never ends → event stays up).
-    /// <c>isDisconnecting</c> is the signal the engine itself uses to see through that.
-    /// </para>
-    /// </summary>
-    private static int CountOnlineOtherPlayers()
-    {
-        return Game1
-            .getOnlineFarmers()
-            .Count(f =>
-                f.UniqueMultiplayerID != Game1.player.UniqueMultiplayerID
-                && !Game1.Multiplayer.isDisconnecting(f)
-            );
-    }
-
-    /// <summary>
     /// Called once per second. Drives the active festival's main-event countdown
     /// (or, for leave-only festivals, just the timeout backstop).
     /// </summary>
@@ -407,8 +375,8 @@ public class AlwaysOnServerFestivals
     }
 
     /// <summary>
-    /// Announce a countdown, start the host-triggered main event when it elapses,
-    /// then (for the Fair) auto-end. !event short-circuits the countdown.
+    /// Announce a countdown, then start the host-triggered main event when it elapses.
+    /// !event short-circuits the countdown.
     /// </summary>
     private void RunMainEventCountdown(FestivalSpec spec)
     {
@@ -445,27 +413,23 @@ public class AlwaysOnServerFestivals
             _announced = true;
         }
 
-        if (!_started && elapsed >= countdownSeconds)
+        if (elapsed >= countdownSeconds)
         {
-            var festivalHost = GetFestivalHost();
-            if (festivalHost != null)
+            // Kick off the main event first, then start its timeout — the ordering here is what
+            // guarantees the event is triggered before the backstop begins.
+            if (!_started)
             {
-                Game1.CurrentEvent.answerDialogueQuestion(festivalHost, "yes");
+                var festivalHost = GetFestivalHost();
+                if (festivalHost != null)
+                {
+                    Game1.CurrentEvent.answerDialogueQuestion(festivalHost, "yes");
+                }
+                _started = true;
             }
-            _started = true;
-        }
 
-        // +5 ticks of slack so the main event has been kicked off before we start its timeout / auto-end
-        if (elapsed >= countdownSeconds + 5.0 / 60.0)
-        {
             if (spec.TimeoutStart == TimeoutStart.AfterMainEvent)
             {
                 RunFestivalTimeout(spec);
-            }
-
-            if (spec.AutoEndAfterCountdown && !_startedFestivalEnd)
-            {
-                EndFestival(spec.EndLogText, force: false);
             }
         }
     }
@@ -496,7 +460,6 @@ public class AlwaysOnServerFestivals
         double resetElapsed = ElapsedSeconds(_timeoutStartTime);
         double timeoutSeconds = spec.TimeoutSeconds();
 
-        // FestivalExitWarningSeconds is already seconds (unlike the *TimeOut configs, which are ticks)
         if (!_timeoutWarned && resetElapsed >= timeoutSeconds - Config.FestivalExitWarningSeconds)
         {
             _helper.SendPublicMessage(
@@ -529,12 +492,18 @@ public class AlwaysOnServerFestivals
             return;
         }
 
+        // TryStartEndFestivalDialogue (both graceful ends) no-ops while a host menu is open, but
+        // EndFestival latches _startedFestivalEnd unconditionally — so ending here while the grange
+        // results box is open would strand the festival. Gate on no menu; HandleDialogueBox clears
+        // that box on its next one-second pass. The wall-clock backstop force-ends regardless of any menu.
+        var noHostMenu = Game1.activeClickableMenu is null;
+
         // No online players left at the festival: end it so the host isn't stranded. Mirrors
         // DedicatedServer.Tick's onlineIds.Count == 0 branch (DedicatedServer.cs:294-308), which
         // ends via TryStartEndFestivalDialogue (force: false) — with no one else online the host's
         // own festivalEnd ready satisfies the check and the festival ends gracefully. Counts
-        // online non-disconnecting players, NOT otherFarmers.Count (see CountOnlineOtherPlayers).
-        if (CountOnlineOtherPlayers() == 0)
+        // online non-disconnecting players, NOT otherFarmers.Count (see OnlineFarmers).
+        if (OnlineFarmers.CountOthers() == 0 && noHostMenu)
         {
             EndFestival(
                 "No players remaining at festival, ending and sending host home",
@@ -549,12 +518,12 @@ public class AlwaysOnServerFestivals
             var endReady = Game1.netReady.GetNumberReady("festivalEnd");
             var endRequired = Game1.netReady.GetNumberRequired("festivalEnd");
             _monitor.Log(
-                $"[FestivalLeave] online={CountOnlineOtherPlayers()}, ready={endReady}/{endRequired}, CheckOthersReady={CheckOthersReady("festivalEnd")}",
+                $"[FestivalLeave] online={OnlineFarmers.CountOthers()}, ready={endReady}/{endRequired}, CheckOthersReady={CheckOthersReady("festivalEnd")}",
                 LogLevel.Trace
             );
         }
 
-        if (CheckOthersReady("festivalEnd"))
+        if (CheckOthersReady("festivalEnd") && noHostMenu)
         {
             EndFestival(
                 "Other players ready to leave festival, triggering end dialogue",

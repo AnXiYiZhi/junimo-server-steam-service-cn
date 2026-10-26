@@ -51,11 +51,12 @@ public class CabinPlacementValidationTests : TestBase
     [Fact]
     public async Task ValidPlacement_MovesCabinToFarmerTilePlusOne()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         await CreateNewGameOnServerAsync(farmType: 0, cabinStrategy: "CabinStack");
 
         var client = await Farmers.ConnectNewAsync(ct: ct);
         var ownerId = client.JoinResult.UniqueMultiplayerId;
+        await SettleJoinAsync(client, ct);
 
         await CabinPlacementHelper.WarpAndClearFootprintAsync(GameClient, ct);
 
@@ -88,11 +89,12 @@ public class CabinPlacementValidationTests : TestBase
     [Fact]
     public async Task ObstacleInFootprint_RejectsAndDoesNotMove()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         await CreateNewGameOnServerAsync(farmType: 0, cabinStrategy: "CabinStack");
 
         var client = await Farmers.ConnectNewAsync(ct: ct);
         var ownerId = client.JoinResult.UniqueMultiplayerId;
+        await SettleJoinAsync(client, ct);
 
         await CabinPlacementHelper.WarpAndClearFootprintAsync(GameClient, ct);
         var baseline = await GetOurCabinAsync(ownerId, ct);
@@ -107,16 +109,43 @@ public class CabinPlacementValidationTests : TestBase
         );
         Assert.True(pot?.Success == true, $"PlacePot failed: {pot?.Error}");
 
-        var rejected = await PollingHelper.WaitUntilAsync(
-            WaitName.Polling_CabinPlacement_Rejected,
-            // "Can't move cabin" (validator reply), not "Must be on Farm" (off-Farm
-            // bail); resends absorb server-location lag.
-            () => Chat.AssertResponseAsync("!cabin", "Can't move cabin"),
-            TestTimings.CabinAssignmentTimeout,
-            cancellationToken: ct
+        // Gate the single-shot !cabin on both server-side inputs to the validator, because this site
+        // can't resend to recover a mistimed send (a resent-then-accepted move masks the pot forever
+        // — see SendOnceAndCaptureAsync), so an early send silently mis-passes. Both the farmer's
+        // position (footprint origin, CabinCommand reads farmer.Tile) and the pot (the obstacle)
+        // are client actions that replicate to the server over several ticks; wait for each.
+        var farmerSettled = await ServerApi.WaitForFarmerServerTileAsync(
+            ownerId,
+            CabinPlacementHelper.FarmerTileX,
+            CabinPlacementHelper.FarmerTileY,
+            ct: ct
+        );
+        Assert.True(
+            farmerSettled,
+            "Our farmer did not replicate onto the Farm before the rejection check"
         );
 
-        Assert.True(rejected, "Expected a 'Can't move cabin' rejection reply");
+        var potVisible = await ServerApi.WaitForObjectAtServerTileAsync(
+            CabinPlacementHelper.ExpectedCabinTile.X + 1,
+            CabinPlacementHelper.ExpectedCabinTile.Y,
+            ct: ct
+        );
+        Assert.True(
+            potVisible,
+            "Garden Pot did not replicate to the server before the rejection check"
+        );
+
+        // "Can't move cabin" (validator reply), not "Must be on Farm" (off-Farm bail).
+        var rejection = await Chat.SendOnceAndCaptureAsync(
+            "!cabin",
+            "Can't move cabin",
+            replyFamilyPrefix: "Can't move cabin",
+            timeout: TestTimings.CabinAssignmentTimeout
+        );
+        Assert.True(
+            rejection.Matched,
+            $"Expected a 'Can't move cabin' rejection reply; {rejection.Describe()}"
+        );
 
         // Reply alone only proves a message; confirm the move was actually blocked.
         var after = await GetOurCabinAsync(ownerId, ct);
@@ -134,20 +163,26 @@ public class CabinPlacementValidationTests : TestBase
     [Fact]
     public async Task OffFarm_RejectsAndDoesNotMove()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         await CreateNewGameOnServerAsync(farmType: 0, cabinStrategy: "CabinStack");
 
         var client = await Farmers.ConnectNewAsync(ct: ct);
         var ownerId = client.JoinResult.UniqueMultiplayerId;
+        await SettleJoinAsync(client, ct);
         var baseline = await GetOurCabinAsync(ownerId, ct);
 
-        var rejected = await PollingHelper.WaitUntilAsync(
-            WaitName.Polling_CabinPlacement_Rejected,
-            () => Chat.AssertResponseAsync("!cabin", "Must be on Farm"),
-            TestTimings.CabinAssignmentTimeout,
-            cancellationToken: ct
+        // Static gate (fresh farmhand spawns off-Farm), no race — resend is harmless here, used for
+        // the self-identifying reply and one consistent pattern across the rejection sites.
+        var rejection = await Chat.ResendUntilResponseAsync(
+            "!cabin",
+            "Must be on Farm",
+            replyFamilyPrefix: "Must be on Farm",
+            timeout: TestTimings.CabinAssignmentTimeout
         );
-        Assert.True(rejected, "Expected a 'Must be on Farm' rejection reply");
+        Assert.True(
+            rejection.Matched,
+            $"Expected a 'Must be on Farm' rejection reply; {rejection.Describe()}"
+        );
 
         var after = await GetOurCabinAsync(ownerId, ct);
         Assert.True(after.IsHidden, "Cabin should still be hidden after an off-Farm reject");
@@ -172,11 +207,12 @@ public class CabinPlacementValidationTests : TestBase
     [Fact]
     public async Task AnotherPlayerInFootprint_RejectsAndDoesNotMove()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         await CreateNewGameOnServerAsync(farmType: 0, cabinStrategy: "CabinStack");
 
         var clientA = await Farmers.ConnectNewAsync(ct: ct);
         var ownerIdA = clientA.JoinResult.UniqueMultiplayerId;
+        await SettleJoinAsync(clientA, ct);
         await CabinPlacementHelper.WarpAndClearFootprintAsync(GameClient, ct);
         var baseline = await GetOurCabinAsync(ownerIdA, ct);
 
@@ -203,13 +239,19 @@ public class CabinPlacementValidationTests : TestBase
             "Farmer B's position did not replicate to the server before the rejection check"
         );
 
-        var rejected = await PollingHelper.WaitUntilAsync(
-            WaitName.Polling_CabinPlacement_Rejected,
-            () => Chat.AssertResponseAsync("!cabin", "another player is standing there"),
-            TestTimings.CabinAssignmentTimeout,
-            cancellationToken: ct
+        // Resend recovers a send that hit a one-tick-lagged server view. Safe (unlike the pot)
+        // because the gate above pins B in farm.farmers and a stationary farmer doesn't leave it,
+        // so no accepted-then-masked window opens — the gate, not the resend, is what makes it safe.
+        var rejection = await Chat.ResendUntilResponseAsync(
+            "!cabin",
+            "another player is standing there",
+            replyFamilyPrefix: "Can't move cabin",
+            timeout: TestTimings.CabinAssignmentTimeout
         );
-        Assert.True(rejected, "Expected an 'another player is standing there' rejection");
+        Assert.True(
+            rejection.Matched,
+            $"Expected an 'another player is standing there' rejection; {rejection.Describe()}"
+        );
 
         var after = await GetOurCabinAsync(ownerIdA, ct);
         Assert.True(after.IsHidden, "A's cabin should still be hidden after rejection");
@@ -218,7 +260,133 @@ public class CabinPlacementValidationTests : TestBase
         await Exceptions.AssertNoExceptionsAsync("after farmer-collision !cabin");
     }
 
+    /// <summary>
+    /// !cabin onto the shared stack spot is rejected as "reserved" before validation; the cabin
+    /// stays hidden and no intent is recorded.
+    /// </summary>
+    [Fact]
+    public async Task StackSpotTarget_RejectsAsReservedAndDoesNotMove()
+    {
+        var ct = TestCt;
+        await CreateNewGameOnServerAsync(farmType: 0, cabinStrategy: "CabinStack");
+
+        var client = await Farmers.ConnectNewAsync(ct: ct);
+        var ownerId = client.JoinResult.UniqueMultiplayerId;
+        await SettleJoinAsync(client, ct);
+        var baseline = await GetOurCabinAsync(ownerId, ct);
+
+        var cabinsBefore = await ServerApi.GetCabins(ct);
+        Assert.True(
+            cabinsBefore?.StackSpot != null,
+            "/cabins reports no StackSpot under CabinStack"
+        );
+        var stack = cabinsBefore!.StackSpot!;
+
+        // !cabin places at farmer.Tile + (1,0).
+        var farmerTileX = stack.TileX - 1;
+        var farmerTileY = stack.TileY;
+        var warp = await GameClient.Actions.Warp("Farm", farmerTileX, farmerTileY);
+        Assert.True(warp?.Success == true, $"Warp to Farm failed: {warp?.Error}");
+        var arrived = await GameClient.WaitForLocationAsync("^Farm$", ct: ct);
+        Assert.True(arrived is not null, "Client did not sync to Farm before the reserved check");
+
+        // The handler reads the server's farmer tile, which lags the client warp.
+        var farmerSettled = await ServerApi.WaitForFarmerServerTileAsync(
+            ownerId,
+            farmerTileX,
+            farmerTileY,
+            ct: ct
+        );
+        Assert.True(
+            farmerSettled,
+            "Our farmer did not replicate next to the stack spot before the reserved check"
+        );
+
+        // Resend is safe: a static check, nothing an early accept could mask.
+        var rejection = await Chat.ResendUntilResponseAsync(
+            "!cabin",
+            "reserved",
+            replyFamilyPrefix: "Can't move cabin",
+            timeout: TestTimings.CabinAssignmentTimeout
+        );
+        Assert.True(
+            rejection.Matched,
+            $"Expected a 'reserved' rejection reply; {rejection.Describe()}"
+        );
+
+        var after = await GetOurCabinAsync(ownerId, ct);
+        Assert.True(after.IsHidden, "Cabin should still be hidden after a reserved-spot reject");
+        Assert.Equal((baseline.TileX, baseline.TileY), (after.TileX, after.TileY));
+
+        var cabinsAfter = await ServerApi.GetCabins(ct);
+        Assert.NotNull(cabinsAfter);
+        Assert.DoesNotContain(ownerId, cabinsAfter.SavedPositionPlayerIds);
+
+        await Exceptions.AssertNoExceptionsAsync("after reserved-spot !cabin");
+    }
+
+    /// <summary>
+    /// The reservation is CabinStack-only: under FarmhouseStack nothing renders at the stack
+    /// spot, so !cabin onto it is an ordinary accepted move.
+    /// </summary>
+    [Fact]
+    public async Task StackSpotTarget_FarmhouseStack_AcceptsMove()
+    {
+        var ct = TestCt;
+        await CreateNewGameOnServerAsync(farmType: 0, cabinStrategy: "FarmhouseStack");
+
+        var client = await Farmers.ConnectNewAsync(ct: ct);
+        var ownerId = client.JoinResult.UniqueMultiplayerId;
+        await SettleJoinAsync(client, ct);
+
+        var spot = CabinPlacementHelper.StandardFarmStackSpot;
+        await CabinPlacementHelper.WarpAndClearFootprintAsync(GameClient, spot.X - 1, spot.Y, ct);
+
+        CabinInfoResponse? moved = null;
+        var ok = await PollingHelper.WaitUntilAsync(
+            WaitName.Polling_CabinPlacement_Moved,
+            async () =>
+            {
+                await GameClient.SendChat("!cabin");
+                moved = await GetOurCabinAsync(ownerId, ct);
+                return !moved.IsHidden;
+            },
+            TestTimings.CabinAssignmentTimeout,
+            cancellationToken: ct
+        );
+
+        Assert.True(ok, "Cabin did not move onto the stack spot under FarmhouseStack");
+        Assert.Equal(spot, (moved!.TileX, moved.TileY));
+
+        await Exceptions.AssertNoExceptionsAsync("after FarmhouseStack stack-spot !cabin");
+    }
+
     #region Helpers
+
+    /// <summary>
+    /// Blocks until the just-joined farmhand is customized server-side. ConnectNewAsync returns
+    /// on the join handshake, but the join then keeps churning: the cabin backfill assigns the
+    /// slot and the farmhand's Farmer root finishes registering over the next ticks. Mutating the
+    /// world (warp, place a pot) during that window is unreliable — a client-placed object reaches
+    /// the server, then the still-settling join drops it, so the validator sees a clear footprint
+    /// and !cabin is silently accepted. Customized-in-/farmhands is the settled signal (built from
+    /// getAllFarmhands, per tests-assert-via-http-api.md), reached only once the join is done.
+    /// </summary>
+    private async Task SettleJoinAsync(
+        Infrastructure.Fixture.FarmerTestHelper.ClientConnection client,
+        CancellationToken ct
+    )
+    {
+        var settled = await ServerApi.WaitForFarmhandByNameAsync(
+            client.FarmerName,
+            requireCustomized: true,
+            ct: ct
+        );
+        Assert.True(
+            settled,
+            $"Farmhand '{client.FarmerName}' was not customized server-side before world setup"
+        );
+    }
 
     private async Task<CabinInfoResponse> GetOurCabinAsync(long ownerId, CancellationToken ct)
     {

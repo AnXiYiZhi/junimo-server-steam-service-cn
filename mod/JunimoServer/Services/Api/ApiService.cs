@@ -6,17 +6,22 @@ using System.Linq;
 using System.Net;
 using System.Net.WebSockets;
 using System.Reflection;
+using System.Runtime.Serialization;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using JunimoServer.Services.Auth;
 using JunimoServer.Services.CabinManager;
+using JunimoServer.Services.Commands;
 using JunimoServer.Services.GameCreator;
 using JunimoServer.Services.GameManager;
+using JunimoServer.Services.GameThread;
 using JunimoServer.Services.PasswordProtection;
 using JunimoServer.Services.PersistentOption;
 using JunimoServer.Services.Roles;
 using JunimoServer.Services.ServerOptim;
 using JunimoServer.Services.Settings;
+using JunimoServer.Services.SteamGameServer;
 using JunimoServer.Shared;
 using JunimoServer.Util;
 using Newtonsoft.Json;
@@ -27,7 +32,6 @@ using StardewModdingAPI.Events;
 using StardewValley;
 using StardewValley.Buildings;
 using StardewValley.Locations;
-using StardewValley.SDKs.GogGalaxy;
 
 namespace JunimoServer.Services.Api;
 
@@ -44,14 +48,40 @@ public class ServerStatus
     /// <summary>Maximum allowed players.</summary>
     public int MaxPlayers { get; set; }
 
-    /// <summary>Steam invite code (S-prefixed). Only available when Steam SDR is enabled.</summary>
-    public string? SteamInviteCode { get; set; }
+    /// <summary>
+    /// The invite code to hand to players (S-prefixed, universal). Present whenever a Galaxy lobby
+    /// exists — GOG clients join it immediately; Steam clients join once <see cref="SteamRelayReady"/>
+    /// is true. Null when no lobby exists yet. The G-code is never exposed.
+    /// </summary>
+    public string? InviteCode { get; set; }
 
-    /// <summary>GOG/Galaxy invite code (G-prefixed). Always available when server is online.</summary>
-    public string? GogInviteCode { get; set; }
+    /// <summary>
+    /// Whether Steam clients can join using the code yet (the Galaxy lobby carries the relay stamp).
+    /// Does NOT gate whether the code is shown.
+    /// </summary>
+    public bool SteamRelayReady { get; set; }
+
+    /// <summary>Galaxy lobby state: "connected" | "recovering" | "down". Null when Steam auth is not configured.</summary>
+    public string? GalaxyLobbyState { get; set; }
+
+    /// <summary>Steam GameServer session state: "connected" | "lost".</summary>
+    public string SteamSessionState { get; set; } = "lost";
+
+    /// <summary>Sidecar auth/token health: "unknown" (no poll has reached the sidecar yet) | "ok" | "expiring" | "unavailable". Null when Steam auth is not configured.</summary>
+    public string? AuthReadiness { get; set; }
+
+    /// <summary>
+    /// Whether <see cref="InviteCode"/> is usable and by whom, derived from the signals above:
+    /// "ready" | "steamRelayPending" | "reconnecting" | "starting" | "steamSessionDown" |
+    /// "inviteUnavailable". Displays map this one field to text; the raw signals stay for diagnostics.
+    /// </summary>
+    public string ConnectionStatusCode { get; set; } = "starting";
 
     /// <summary>Server mod version.</summary>
     public string ServerVersion { get; set; } = "";
+
+    /// <summary>Stardew Valley game version (Game1.version, e.g. "1.6.15").</summary>
+    public string GameVersion { get; set; } = "";
 
     /// <summary>Whether the server is online and hosting.</summary>
     public bool IsOnline { get; set; }
@@ -64,7 +94,7 @@ public class ServerStatus
     /// the host is back in normal play — UNLIKE <see cref="IsReady"/>, this ignores post-transition
     /// festival/wedding activity. Lets a post-day-change settle proceed once the transition itself is
     /// done instead of dead-waiting through a festival or wedding. Equals <see cref="IsReady"/> on an
-    /// ordinary day. See ApiService.ComputeDayTransitionComplete.
+    /// ordinary day. See GameManagerService.IsDayTransitionComplete.
     /// </summary>
     public bool DayTransitionComplete { get; set; }
 
@@ -73,6 +103,12 @@ public class ServerStatus
 
     /// <summary>Name of the farm.</summary>
     public string FarmName { get; set; } = "";
+
+    /// <summary>Display name of this deployment (SERVER_NAME). Empty when unset.</summary>
+    public string ServerName { get; set; } = "";
+
+    /// <summary>ISO 8601 UTC time the server process started, or null if not yet known.</summary>
+    public string? StartedAtUtc { get; set; }
 
     /// <summary>Current day of the month (1-28).</summary>
     public int Day { get; set; }
@@ -92,13 +128,16 @@ public class ServerStatus
     /// <summary>Whether the game clock is currently paused (no players connected, or time not passing).</summary>
     public bool IsPaused { get; set; }
 
+    /// <summary>Measured game ticks per second over at least the last 30 seconds (see /stats for the instant value and target).</summary>
+    public double Tps { get; set; }
+
     /// <summary>
-    /// Monotonic snapshot version used by /wait/* long-poll endpoints to
+    /// Monotonic snapshot sequence used by /wait/* long-poll endpoints to
     /// detect a changed snapshot. Test clients pass this back as
     /// <c>?since=N</c> so the server only returns when a newer snapshot
     /// satisfies the requested filters.
     /// </summary>
-    public long Version { get; set; }
+    public long Sequence { get; set; }
 }
 
 /// <summary>
@@ -114,6 +153,12 @@ public class PlayerInfo
 
     /// <summary>Whether the player is currently online.</summary>
     public bool IsOnline { get; set; }
+
+    /// <summary>
+    /// Unique name of the location the player is in, or is arriving in (the replicated
+    /// destination, ahead of the netcode interpolation window). Empty when unresolved.
+    /// </summary>
+    public string Location { get; set; } = "";
 }
 
 /// <summary>
@@ -125,23 +170,11 @@ public class PlayersResponse
     public List<PlayerInfo> Players { get; set; } = new();
 
     /// <summary>
-    /// Monotonic snapshot version (same field as <see cref="ServerStatus.Version"/>).
+    /// Monotonic snapshot sequence (same field as <see cref="ServerStatus.Sequence"/>).
     /// Test clients pass this back as <c>?since=N</c> on /wait/players to wait
     /// for a newer snapshot.
     /// </summary>
-    public long Version { get; set; }
-}
-
-/// <summary>
-/// Response containing the server invite code.
-/// </summary>
-public class InviteCodeResponse
-{
-    /// <summary>The invite code, or null if not available.</summary>
-    public string? InviteCode { get; set; }
-
-    /// <summary>Error message if invite code is not available.</summary>
-    public string? Error { get; set; }
+    public long Sequence { get; set; }
 }
 
 /// <summary>
@@ -180,13 +213,20 @@ public class DiagnosticsStateResponse
     /// <summary>UMIs in <c>Multiplayer.disconnectingFarmers</c> (mid-disconnect).</summary>
     public long[] DisconnectingFarmers { get; set; } = System.Array.Empty<long>();
 
-    // ── Save-import assertion probes (counts/booleans/small ints only; unauthenticated-safe). ──
-    // The post-swap Server-host FarmHouse must be empty after the contents/NPC move.
+    // ── Save-import assertion probes ──
+    // The post-swap Server-host FarmHouse must hold nothing but the default bed after the
+    // contents/NPC move.
     /// <summary>Placed-object count in the host FarmHouse (must be 0 after a swap import).</summary>
     public int FarmHouseObjectCount { get; set; }
 
-    /// <summary>Furniture count in the host FarmHouse (must be 0 after a swap import).</summary>
+    /// <summary>Furniture count in the host FarmHouse (must be 1, the default bed, after a swap import).</summary>
     public int FarmHouseFurnitureCount { get; set; }
+
+    /// <summary>Whether <c>FarmHouse.GetPlayerBed()</c> finds a bed in the host FarmHouse.</summary>
+    public bool FarmHouseHasPlayerBed { get; set; }
+
+    /// <summary>The host's current location (<c>Game1.currentLocation.NameOrUniqueName</c>).</summary>
+    public string HostLocation { get; set; } = "";
 
     /// <summary>Fridge-item count in the host FarmHouse (must be 0 after a swap import).</summary>
     public int FarmHouseFridgeItemCount { get; set; }
@@ -247,9 +287,16 @@ public class DiagnosticsCabinState
     /// <summary>Whether the owner has a platform ID (Steam/GOG) stamped; true with
     /// OwnerIsCustomized=false is the abandoned-claim state. Resolved via cabin.owner, which
     /// yields the live otherFarmers copy while the owner is connected (so the in-flight userID
-    /// stamp is visible here before disconnect persists it to farmhandData). Exposed as a bool,
-    /// not the raw ID: /diagnostics/state is unauthenticated and the ID is a stable identifier.</summary>
+    /// stamp is visible here before disconnect persists it to farmhandData).</summary>
     public bool OwnerHasUserId { get; set; }
+
+    /// <summary>Whether the cabin owner (its farmhand) has a server-side ownership record
+    /// (recorded at the join gate's approve moment or by a save-import bind).</summary>
+    public bool OwnerHasOwner { get; set; }
+
+    /// <summary>Platform tag of the cabin owner's ownership record ("steam"/"galaxy"), or ""
+    /// when unowned.</summary>
+    public string OwnerPlatform { get; set; } = "";
 
     public string HomeLocationOfOwner { get; set; } = "";
     public bool FarmhandReferenceDefined { get; set; }
@@ -257,7 +304,7 @@ public class DiagnosticsCabinState
 
     /// <summary>Count of placed objects (chests/machines) in the cabin interior. Used by the
     /// save-import contents-move test to assert the owner's chests moved into the cabin. Count
-    /// only (not contents) — /diagnostics/state is unauthenticated.</summary>
+    /// only, not contents.</summary>
     public int ObjectCount { get; set; }
 
     /// <summary>Count of items in the cabin fridge (save-import contents move).</summary>
@@ -282,9 +329,19 @@ public class DiagnosticsFarmhandState
     public string LastSleepLocation { get; set; } = "";
 
     /// <summary>Whether a platform ID (Steam/GOG) is stamped on this slot; true with
-    /// IsCustomized=false is the abandoned-claim state. Exposed as a bool, not the raw ID:
-    /// /diagnostics/state is unauthenticated and the ID is a stable identifier.</summary>
+    /// IsCustomized=false is the abandoned-claim state.</summary>
     public bool HasUserId { get; set; }
+
+    /// <summary>Whether this slot has a server-side ownership record (recorded at the join
+    /// gate's approve moment or by a save-import bind).</summary>
+    public bool HasOwner { get; set; }
+
+    /// <summary>Platform tag of the ownership record ("steam"/"galaxy"), or "" when unowned.</summary>
+    public string OwnerPlatform { get; set; } = "";
+
+    /// <summary>Whether the slot is operator-released: claimable by any transport, first
+    /// successful claim becomes the owner.</summary>
+    public bool Released { get; set; }
 }
 
 public class ReadyCheckState
@@ -338,6 +395,27 @@ public class HealthResponse
     /// a server whose HTTP listener is up but whose game loop has stalled.
     /// </summary>
     public bool IsFrozen { get; set; }
+
+    // ── Connectivity / joinability summary (body-only) ──
+    // These let a monitor tell "alive" from "actually joinable". They do NOT affect Status or the
+    // HTTP status code: /health must stay 200 for an alive server, or the Docker HEALTHCHECK +
+    // restart:unless-stopped + the deploy `grep unhealthy` gate would restart it on a transient
+    // Galaxy/Steam blip.
+
+    /// <summary>Steam GameServer session state: "connected" | "lost".</summary>
+    public string SteamSessionState { get; set; } = "lost";
+
+    /// <summary>Galaxy lobby state: "connected" | "recovering" | "down". Null when Steam auth is not configured.</summary>
+    public string? GalaxyLobbyState { get; set; }
+
+    /// <summary>Whether Steam clients can join using the code yet (the Galaxy lobby carries the relay stamp).</summary>
+    public bool SteamRelayReady { get; set; }
+
+    /// <summary>Whether an invite code is currently exposed (a Galaxy lobby exists).</summary>
+    public bool InviteCodePresent { get; set; }
+
+    /// <summary>Sidecar auth/token health: "unknown" (no poll has reached the sidecar yet) | "ok" | "expiring" | "unavailable". Null when Steam auth is not configured.</summary>
+    public string? AuthReadiness { get; set; }
 }
 
 /// <summary>
@@ -374,6 +452,12 @@ public class StatsResponse
 
     /// <summary>Rolling average game thread wait time in milliseconds (60-sample window).</summary>
     public double GameThreadWaitMs { get; set; }
+
+    /// <summary>ISO 8601 UTC time the mod started, or null if not yet available.</summary>
+    public string? StartedAtUtc { get; set; }
+
+    /// <summary>Seconds the mod has been running, or null if the start time isn't available.</summary>
+    public long? UptimeSeconds { get; set; }
 }
 
 /// <summary>
@@ -415,11 +499,11 @@ public class FarmhandsResponse
     public List<FarmhandInfo> Farmhands { get; set; } = new();
 
     /// <summary>
-    /// Monotonic snapshot version (same field as <see cref="ServerStatus.Version"/>).
+    /// Monotonic snapshot sequence (same field as <see cref="ServerStatus.Sequence"/>).
     /// Test clients pass this back as <c>?since=N</c> on /wait/farmhands to wait
     /// for a newer snapshot.
     /// </summary>
-    public long Version { get; set; }
+    public long Sequence { get; set; }
 }
 
 /// <summary>
@@ -578,6 +662,9 @@ public class ServerRuntimeSettingsInfo
 
     /// <summary>How to handle existing visible cabins: KeepExisting or MoveToStack.</summary>
     public string ExistingCabinBehavior { get; set; } = "";
+
+    /// <summary>Whether players may relocate their cabin via the !cabin command.</summary>
+    public bool AllowCabinRelocation { get; set; }
 }
 
 /// <summary>
@@ -606,6 +693,75 @@ public class CabinsResponse
     /// MoveToStack / strategy-migration sweep. Cleared when the farmhand is deleted.
     /// </summary>
     public List<long> SavedPositionPlayerIds { get; set; } = new();
+
+    /// <summary>
+    /// Active staged strategy migration ('cabins migrate'), or null when none is staged.
+    /// </summary>
+    public CabinMigrationInfo? Migration { get; set; }
+
+    /// <summary>
+    /// The CabinStack shared stack spot (the tile each player's ghost cabin renders at),
+    /// or null when the active strategy is not CabinStack.
+    /// </summary>
+    public StackSpotInfo? StackSpot { get; set; }
+
+    /// <summary>
+    /// The main farmhouse's front-door entry tile (<c>Game1.getFarm().GetMainFarmHouseEntry()</c>);
+    /// null when no game is loaded. Under FarmhouseStack a stacked cabin's exit warp lands here, so
+    /// tests can assert the exit-warp repoint against the authoritative tile, not just any on-map
+    /// target.
+    /// </summary>
+    public TilePoint? MainFarmHouseEntry { get; set; }
+}
+
+/// <summary>A tile coordinate on <see cref="CabinsResponse"/>.</summary>
+public class TilePoint
+{
+    /// <summary>Tile X.</summary>
+    public int X { get; set; }
+
+    /// <summary>Tile Y.</summary>
+    public int Y { get; set; }
+}
+
+/// <summary>
+/// The CabinStack shared stack spot on <see cref="CabinsResponse"/>.
+/// </summary>
+public class StackSpotInfo
+{
+    /// <summary>Tile X of the spot.</summary>
+    public int TileX { get; set; }
+
+    /// <summary>Tile Y of the spot.</summary>
+    public int TileY { get; set; }
+
+    /// <summary>True when an admin-set override is active (vs the map default).</summary>
+    public bool IsOverride { get; set; }
+
+    /// <summary>True when a cabin footprint at the spot currently fails placement validation.</summary>
+    public bool IsObstructed { get; set; }
+}
+
+/// <summary>
+/// Staged strategy-migration status. Present on <see cref="CabinsResponse"/> only while a
+/// 'cabins migrate' staging is active; the old strategy stays live until commit.
+/// </summary>
+public class CabinMigrationInfo
+{
+    /// <summary>The strategy the migration started from (still live during staging).</summary>
+    public string FromStrategy { get; set; } = "";
+
+    /// <summary>The strategy the migration commits to.</summary>
+    public string ToStrategy { get; set; } = "";
+
+    /// <summary>Number of staging placements done so far (auto + manual).</summary>
+    public int PlacedCount { get; set; }
+
+    /// <summary>
+    /// Placements still required before commit, computed live (hidden non-lobby cabins for
+    /// a migration to None; the unresolved shared-stack spot for FarmhouseStack→CabinStack).
+    /// </summary>
+    public int RemainingCount { get; set; }
 }
 
 /// <summary>
@@ -705,6 +861,9 @@ public class NewGameRequest
 
     /// <summary>Whether each player has a separate wallet.</summary>
     public bool? SeparateWallets { get; set; }
+
+    /// <summary>Whether players may relocate their cabin via the !cabin command.</summary>
+    public bool? AllowCabinRelocation { get; set; }
 }
 
 /// <summary>
@@ -757,6 +916,7 @@ public partial class ApiService : ModService
     private readonly PasswordProtectionService? _passwordProtectionService;
     private readonly SaveImport.SaveImportService _saveImportService;
     private readonly NpcIntegrity.NpcSpriteIntegrityService _npcSpriteIntegrity;
+    private readonly Auth.FarmhandOwnershipService _farmhandOwnership;
 
     // WebSocket client management
     private readonly List<WebSocket> _wsClients = new();
@@ -764,15 +924,10 @@ public partial class ApiService : ModService
     private Timer? _wsCleanupTimer;
 
     /// <summary>
-    /// Queue of actions to execute on the main game thread.
-    /// Used for game state modifications that would cause collection modification errors
-    /// if executed from the async HTTP thread (e.g., removing buildings during draw).
-    /// Each action includes a TaskCompletionSource to signal completion back to the caller.
+    /// Game-thread marshaling for mutating handlers (see <see cref="RunOnGameThreadAsync"/>);
+    /// the game-state snapshot is refreshed after every drain that ran an action.
     /// </summary>
-    private readonly ConcurrentQueue<(
-        Action Action,
-        TaskCompletionSource<bool> Completion
-    )> _pendingGameActions = new();
+    private readonly GameThreadDispatcher _dispatcher;
 
     /// <summary>
     /// Ticks timestamp of the last OnUpdateTicked call, used by /health to detect game thread stalls.
@@ -801,9 +956,7 @@ public partial class ApiService : ModService
 
     // ── Performance metrics for /stats endpoint ──
     private double _lastTickMs;
-    private double _avgTickMs;
-    private readonly Queue<double> _tickHistory = new();
-    private const int TickHistorySize = 60;
+    private readonly RollingAverage _avgTickMs = new(60);
     private readonly Stopwatch _tickStopwatch = new();
     private int _frameCount;
     private double _currentFps;
@@ -812,14 +965,16 @@ public partial class ApiService : ModService
     private double _currentTps;
     private DateTime _lastTpsUpdate = DateTime.UtcNow;
 
+    // For /status; the window matches the public widget's 30-second poll.
+    /// <summary>
+    /// Ticks and seconds per sample interval, averaged over the same window: their ratio is the
+    /// tick rate over the last 30 intervals (30+ seconds), so a long stall weighs by its duration.
+    /// </summary>
+    private readonly RollingAverage _tpsTicks = new(30);
+    private readonly RollingAverage _tpsSeconds = new(30);
+
     // ── Game thread wait time tracking for /stats endpoint ──
-    // Ring buffer + running sum for O(1) average with zero allocations.
-    private double _avgGameThreadWaitMs;
-    private const int GameThreadWaitBufferSize = 60;
-    private readonly double[] _gameThreadWaitBuffer = new double[GameThreadWaitBufferSize];
-    private int _gameThreadWaitIndex;
-    private int _gameThreadWaitCount;
-    private double _gameThreadWaitSum;
+    private readonly RollingAverage _avgGameThreadWaitMs = new(60);
     private readonly ConcurrentQueue<double> _completedWaitTimes = new();
 
     // ── Game state snapshot for read-only endpoints ──
@@ -830,10 +985,16 @@ public partial class ApiService : ModService
     private volatile GameStateSnapshot _snapshot = new();
     private DateTime _lastSnapshotUpdate;
 
-    // Monotonic snapshot version. Incremented every time a new snapshot is
+    // Set in the constructor (DI singleton — single construction) so GameManagerService
+    // can republish the snapshot at /reload and /newgame completion via the static
+    // RefreshSnapshotAtLoadCompletion hook, the same static-access shape as
+    // GameManagerService.Instance.
+    private static ApiService? _instance;
+
+    // Monotonic snapshot sequence. Incremented every time a new snapshot is
     // published; used by /wait/* long-poll endpoints to let clients block
     // until the snapshot they care about has changed.
-    private long _snapshotVersion;
+    private long _snapshotSequence;
 
     // TCS that long-poll waiters await. Rotated atomically on every
     // snapshot publish: capture the old TCS, allocate a new one, publish
@@ -891,6 +1052,7 @@ public partial class ApiService : ModService
         public int Year;
         public int TimeOfDay;
         public string FarmTypeKey = "";
+        public string GameVersion = "";
         public bool IsPaused;
 
         // /players
@@ -904,6 +1066,9 @@ public partial class ApiService : ModService
         public int CabinAssignedCount;
         public int CabinAvailableCount;
         public List<CabinInfo> Cabins = new();
+        public CabinMigrationInfo? CabinMigration;
+        public StackSpotInfo? CabinStackSpot;
+        public TilePoint? CabinMainFarmHouseEntry;
 
         // /auth
         public int AuthenticatedCount;
@@ -923,7 +1088,7 @@ public partial class ApiService : ModService
         /// Stamped at publish time so a waiter can compare against an
         /// inbound `?since=N` parameter.
         /// </summary>
-        public long Version;
+        public long Sequence;
 
         // ── Per-field change-time tracking ────────────────────────────────
         //
@@ -1009,6 +1174,19 @@ public partial class ApiService : ModService
     /// </summary>
     private static readonly bool _authEnabled = !string.IsNullOrEmpty(Env.ApiKey);
 
+    private static readonly HashSet<(string Method, string Path)> _publicEndpoints =
+        typeof(ApiService)
+            .GetMethods(
+                BindingFlags.Instance
+                    | BindingFlags.Static
+                    | BindingFlags.NonPublic
+                    | BindingFlags.Public
+            )
+            .Select(m => m.GetCustomAttribute<ApiEndpointAttribute>())
+            .Where(ep => ep is { Public: true } && !IsTestPath(ep.Path))
+            .Select(ep => (ep!.Method, ep.Path))
+            .ToHashSet();
+
     public ApiService(
         IModHelper helper,
         IMonitor monitor,
@@ -1018,17 +1196,22 @@ public partial class ApiService : ModService
         RoleService roleService,
         SaveImport.SaveImportService saveImportService,
         NpcIntegrity.NpcSpriteIntegrityService npcSpriteIntegrity,
+        Auth.FarmhandOwnershipService farmhandOwnership,
+        GameThreadDispatcher dispatcher,
         PasswordProtectionService? passwordProtectionService = null
     )
         : base(helper, monitor)
     {
+        _dispatcher = dispatcher;
         _settings = settings;
         _persistentOptions = persistentOptions;
         _cabinManager = cabinManager;
         _roleService = roleService;
         _saveImportService = saveImportService;
         _npcSpriteIntegrity = npcSpriteIntegrity;
+        _farmhandOwnership = farmhandOwnership;
         _passwordProtectionService = passwordProtectionService;
+        _instance = this;
     }
 
     public override void Entry()
@@ -1041,6 +1224,10 @@ public partial class ApiService : ModService
 
         Helper.Events.GameLoop.GameLaunched += OnGameLaunched;
         Helper.Events.GameLoop.UpdateTicked += OnUpdateTicked;
+        // Mutations (DELETE /farmhands, POST /time, etc.) change game state that read-only
+        // endpoints serve from the snapshot. Refresh immediately after a drain so subsequent
+        // reads see the updated state without waiting up to 1 second.
+        _dispatcher.Drained += TakeGameStateSnapshot;
         Helper.Events.Specialized.UnvalidatedUpdateTicking += OnUnvalidatedUpdateTicking;
         Helper.Events.Specialized.UnvalidatedUpdateTicked += OnUnvalidatedUpdateTicked;
         Helper.Events.Display.Rendered += OnRendered;
@@ -1124,52 +1311,9 @@ public partial class ApiService : ModService
 
     private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
     {
-        // Process pending game actions on the main thread.
-        // Intentionally in UpdateTicked (not UnvalidatedUpdateTicked). SMAPI
-        // suppresses this during saving, which prevents mutating API callbacks
-        // (POST /time, /newgame, DELETE /farmhands) from corrupting save data.
-        // Read-only endpoints use the periodic snapshot instead (see TakeGameStateSnapshot).
-        var actionsProcessed = false;
-        while (_pendingGameActions.TryDequeue(out var item))
-        {
-            actionsProcessed = true;
-            try
-            {
-                item.Action();
-                item.Completion.TrySetResult(true);
-            }
-            catch (Exception ex)
-            {
-                Monitor.Log($"Error executing pending game action: {ex}", LogLevel.Error);
-                item.Completion.TrySetException(ex);
-            }
-        }
-
-        // Mutations (DELETE /farmhands, POST /time, etc.) change game state that
-        // read-only endpoints serve from the snapshot. Refresh immediately so
-        // subsequent reads see the updated state without waiting up to 1 second.
-        if (actionsProcessed)
-        {
-            TakeGameStateSnapshot();
-        }
-
-        // Drain completed wait times and update rolling average (zero-allocation ring buffer)
         while (_completedWaitTimes.TryDequeue(out var waitMs))
         {
-            if (_gameThreadWaitCount == GameThreadWaitBufferSize)
-            {
-                _gameThreadWaitSum -= _gameThreadWaitBuffer[_gameThreadWaitIndex];
-            }
-            else
-            {
-                _gameThreadWaitCount++;
-            }
-
-            _gameThreadWaitBuffer[_gameThreadWaitIndex] = waitMs;
-            _gameThreadWaitSum += waitMs;
-            _gameThreadWaitIndex = (_gameThreadWaitIndex + 1) % GameThreadWaitBufferSize;
-
-            Volatile.Write(ref _avgGameThreadWaitMs, _gameThreadWaitSum / _gameThreadWaitCount);
+            _avgGameThreadWaitMs.Add(waitMs);
         }
     }
 
@@ -1198,14 +1342,8 @@ public partial class ApiService : ModService
         // Record tick timing for /stats
         _tickStopwatch.Stop();
         var tickMs = _tickStopwatch.Elapsed.TotalMilliseconds;
-        _tickHistory.Enqueue(tickMs);
-        if (_tickHistory.Count > TickHistorySize)
-        {
-            _tickHistory.Dequeue();
-        }
-
         Volatile.Write(ref _lastTickMs, tickMs);
-        Volatile.Write(ref _avgTickMs, _tickHistory.Average());
+        _avgTickMs.Add(tickMs);
 
         // TPS tracking (same pattern as FPS but for game ticks)
         _tickCount++;
@@ -1213,7 +1351,10 @@ public partial class ApiService : ModService
         var tpsElapsed = (tpsNow - _lastTpsUpdate).TotalSeconds;
         if (tpsElapsed >= 1.0)
         {
-            Volatile.Write(ref _currentTps, _tickCount / tpsElapsed);
+            var sample = _tickCount / tpsElapsed;
+            Volatile.Write(ref _currentTps, sample);
+            _tpsTicks.Add(_tickCount);
+            _tpsSeconds.Add(tpsElapsed);
             _tickCount = 0;
             _lastTpsUpdate = tpsNow;
         }
@@ -1255,7 +1396,7 @@ public partial class ApiService : ModService
     /// </summary>
     private void PublishSnapshot(GameStateSnapshot snap)
     {
-        snap.Version = Interlocked.Increment(ref _snapshotVersion);
+        snap.Sequence = Interlocked.Increment(ref _snapshotSequence);
         // Rotate the TCS: install a fresh one for future waiters BEFORE
         // signaling the old one. Otherwise a fast waiter that completes
         // its post-resume snapshot read could observe the new snapshot
@@ -1276,7 +1417,7 @@ public partial class ApiService : ModService
     /// <item><see cref="OnUnvalidatedUpdateTicked"/> (periodic, 1/sec) -- fires even during
     /// game thread stalls but skipped during day transitions to avoid concurrent access
     /// with the save task's farmhand/cabin mutations.</item>
-    /// <item><see cref="OnUpdateTicked"/> (after mutations) -- ensures changes from
+    /// <item><see cref="GameThreadDispatcher.Drained"/> (after mutations) -- ensures changes from
     /// mutating endpoints are immediately visible to subsequent reads.</item>
     /// </list>
     /// HTTP threads read the published snapshot without blocking.
@@ -1295,6 +1436,10 @@ public partial class ApiService : ModService
                 CapturedAt = capturedAt.ToString("o"),
                 CapturedAtUtc = capturedAt,
             };
+
+            // Game version is a process-wide engine constant (Game1.version), available before a
+            // save loads — set it before the offline early-return so /status reports it even offline.
+            snap.GameVersion = Game1.version ?? "";
 
             // IsOnline always tracked (its change is observable independently
             // of the early-return branch below).
@@ -1320,7 +1465,7 @@ public partial class ApiService : ModService
             );
             snap.MaxPlayers = Game1.netWorldState.Value?.CurrentPlayerLimit ?? 4;
             snap.IsReady = Game1.server?.isGameAvailable() ?? false;
-            snap.DayTransitionComplete = ComputeDayTransitionComplete();
+            snap.DayTransitionComplete = GameManagerService.IsDayTransitionComplete();
             snap.FarmName = Game1.player?.farmName.Value ?? "";
             snap.Day = Game1.dayOfMonth;
             snap.Season = Game1.currentSeason ?? "";
@@ -1396,6 +1541,7 @@ public partial class ApiService : ModService
                         Id = farmer.UniqueMultiplayerID,
                         Name = farmer.Name ?? farmer.displayName ?? "Unknown",
                         IsOnline = true,
+                        Location = farmer.GetTargetLocation()?.NameOrUniqueName ?? "",
                     }
                 );
             }
@@ -1612,46 +1758,18 @@ public partial class ApiService : ModService
     }
 
     /// <summary>
-    /// True once the day-transition machinery is finished and the host is back in normal play —
-    /// the transition-only subset of <c>GameServer.isGameAvailable</c>
-    /// (decompiled <c>Network/GameServer.cs:459-470</c>). Mirrors that method's
-    /// <c>flag</c> (intro/day-0), <c>flag3</c> (<c>newDaySync</c> in progress), and
-    /// <c>gameMode == loadingMode</c> checks, but DELIBERATELY OMITS the wedding (<c>flag2</c> +
-    /// <c>weddingsToday</c>), festival (<c>isFestival()</c>), and demolish-lock (<c>flag4</c>)
-    /// factors — those keep <c>isGameAvailable</c> (and thus <c>IsReady</c>) false through a
-    /// festival/wedding that runs AFTER the transition itself completed. A post-day-change settle
-    /// only needs the transition (sync barrier + save + map load) done; the test's own
-    /// festival/wedding polling handles the rest. On an ordinary day this equals <c>IsReady</c>.
-    /// If the decompiled <c>isGameAvailable</c> gains a new transition-phase factor, mirror it here.
-    ///
-    /// Public so <see cref="GameManager.GameManagerService"/> gates /newgame completion on the same
-    /// predicate — its deferred new-day save must finish before the API reports the game created.
+    /// Republishes the read-only-endpoint snapshot at /reload and /newgame completion, called by
+    /// <see cref="GameManager.GameManagerService"/> on the resolve tick — the point the completion
+    /// contract already guarantees the SaveLoaded chain (cabin migration/sync/sweep,
+    /// EnsureAtLeastXCabins) has run. Runs on the game thread (same serialization as the two other
+    /// <c>TakeGameStateSnapshot</c> call sites) and doesn't reset the 1 Hz timer, so a test's first
+    /// post-reload read sees the migrated world instead of a snapshot captured mid-load.
+    /// With API disabled it still republishes (<c>_instance</c> is ctor-set, not gated by
+    /// <c>Entry</c>), which is harmless — a snapshot with no HTTP listener is never read.
+    /// A build failure inside <c>TakeGameStateSnapshot</c> is swallowed there (keeping the prior
+    /// snapshot) as at every call site; completion resolves regardless, by that shared contract.
     /// </summary>
-    public static bool ComputeDayTransitionComplete()
-    {
-        if (Game1.gameMode == Game1.loadingMode)
-        {
-            return false; // mid load/save
-        }
-
-        // Intro minigame or the pre-first-day sentinel — not a completed day yet.
-        if (Game1.currentMinigame is StardewValley.Minigames.Intro || Game1.Date.DayOfMonth == 0)
-        {
-            return false;
-        }
-
-        // The day-transition sync barrier (save + per-player newDay handshake) is still running.
-        if (
-            Game1.newDaySync != null
-            && Game1.newDaySync.hasInstance()
-            && !Game1.newDaySync.hasFinished()
-        )
-        {
-            return false;
-        }
-
-        return true;
-    }
+    public static void RefreshSnapshotAtLoadCompletion() => _instance?.TakeGameStateSnapshot();
 
     /// <summary>
     /// Populates cabin data in the snapshot. Reads cabin ownership from farmhandReference,
@@ -1721,6 +1839,41 @@ public partial class ApiService : ModService
             snap.CabinTotalCount = snap.Cabins.Count;
             snap.CabinAssignedCount = snap.Cabins.Count(c => c.IsAssigned);
             snap.CabinAvailableCount = snap.CabinTotalCount - snap.CabinAssignedCount;
+
+            // Authoritative main-farmhouse door tile — the target a stacked FarmhouseStack cabin's
+            // exit warp is repointed to. E2E asserts the repoint against this exact tile.
+            var entry = farm.GetMainFarmHouseEntry();
+            snap.CabinMainFarmHouseEntry = new TilePoint { X = entry.X, Y = entry.Y };
+
+            // CabinStack shared stack spot (null under other strategies). E2E surface for
+            // the 'cabins stackspot' / '!stackspot' commands.
+            var stackSpot = _cabinManager.GetStackSpotStatus();
+            if (stackSpot != null)
+            {
+                var spot = stackSpot.Value;
+                snap.CabinStackSpot = new StackSpotInfo
+                {
+                    TileX = spot.Spot.X,
+                    TileY = spot.Spot.Y,
+                    IsOverride = spot.IsOverride,
+                    IsObstructed = spot.IsObstructed,
+                };
+            }
+
+            // Staged strategy migration (null when none is active). E2E gates staging
+            // state on this — mod events are diagnostics only.
+            var migration = _cabinManager.GetMigrationStatus();
+            if (migration != null)
+            {
+                var m = migration.Value;
+                snap.CabinMigration = new CabinMigrationInfo
+                {
+                    FromStrategy = m.FromStrategy.ToString(),
+                    ToStrategy = m.ToStrategy.ToString(),
+                    PlacedCount = m.PlacedCount,
+                    RemainingCount = m.RemainingCount,
+                };
+            }
         }
         catch (Exception ex)
         {
@@ -1743,40 +1896,19 @@ public partial class ApiService : ModService
 
     /// <summary>
     /// Queues an action to run on the main game thread and waits for it to complete.
-    /// Use this for game state modifications from async HTTP handlers.
-    /// Captures the ambient ModRequestContext.RequestId at queue time and
-    /// re-binds it on the game-thread side so structured events emitted
-    /// inside <paramref name="action"/> carry the triggering request id.
-    /// AsyncLocal does not flow across the external pump boundary.
+    /// Use this for game state modifications from async HTTP handlers. Throws
+    /// <see cref="TaskCanceledException"/> if the action is still queued after
+    /// <paramref name="timeoutMs"/>. The measured wait feeds the /stats rolling average;
+    /// a timed-out or faulted call is not recorded (not representative of normal wait times).
     /// </summary>
     private async Task RunOnGameThreadAsync(Action action, int timeoutMs = 5000)
     {
         var sw = Stopwatch.StartNew();
-        var tcs = new TaskCompletionSource<bool>(
-            TaskCreationOptions.RunContinuationsAsynchronously
-        );
-        var capturedRequestId = Diagnostics.ModRequestContext.RequestId;
-        Action wrapped = () =>
-        {
-            using var _correlationScope = Diagnostics.ModRequestContext.Bind(capturedRequestId);
-            action();
-        };
-        _pendingGameActions.Enqueue((wrapped, tcs));
-
-        using var cts = new CancellationTokenSource(timeoutMs);
-        using var registration = cts.Token.Register(() => tcs.TrySetCanceled());
-
-        try
-        {
-            await tcs.Task.ConfigureAwait(false);
-            sw.Stop();
-            _completedWaitTimes.Enqueue(sw.Elapsed.TotalMilliseconds);
-        }
-        catch (TaskCanceledException)
-        {
-            // Timeout: don't record (not representative of normal wait times)
-            throw;
-        }
+        await _dispatcher
+            .RunAsync(action, TimeSpan.FromMilliseconds(timeoutMs))
+            .ConfigureAwait(false);
+        sw.Stop();
+        _completedWaitTimes.Enqueue(sw.Elapsed.TotalMilliseconds);
     }
 
     private void OnGameLaunched(object? sender, GameLaunchedEventArgs e)
@@ -1849,7 +1981,6 @@ public partial class ApiService : ModService
             // Generate OpenAPI spec. Test-only endpoints are spec-visible iff they are
             // runtime-reachable (Env.IsTest) — the same gate the dispatcher uses, so the
             // published contract and the routing cannot drift.
-            // SEAM: if INCLUDE_TEST_ENDPOINTS is introduced, wrap this predicate's IsTestPath/Env.IsTest use.
             var document = OpenApiGenerator.Generate(
                 typeof(ApiService),
                 "Stardew Dedicated Server API",
@@ -1863,7 +1994,9 @@ public partial class ApiService : ModService
             );
             _openApiSpec = document.ToJson();
 
-            // Create and configure listener
+            // Take the port from the startup script's phase responder right before binding, so
+            // it is never unanswered in between.
+            ApiPortHandoff.TakeOver(Env.ApiHandoffPidFile, Env.ApiPort, Monitor);
             _listener = new HttpListener();
             _listener.Prefixes.Add($"http://+:{Env.ApiPort}/");
             _listener.Start();
@@ -1888,10 +2021,7 @@ public partial class ApiService : ModService
             );
             if (_authEnabled)
             {
-                Monitor.Log(
-                    "API authentication enabled - all endpoints require Authorization header",
-                    LogLevel.Info
-                );
+                Monitor.Log("API authentication enabled", LogLevel.Info);
             }
             else
             {
@@ -1987,6 +2117,11 @@ public partial class ApiService : ModService
         // (the mod runs outside tests too).
         var requestId = request.Headers["X-Request-Id"];
 
+        // Sent by the harness on every request regardless of tracing level
+        // (unlike X-Request-Id), so every server event during the request is
+        // attributable to its test. Null in production.
+        var testId = request.Headers["X-Test-Id"];
+
         // Echo the same id on the response so the client-side
         // TracingHandler can confirm the round-trip and the mod's view
         // of the id matches the caller's. Header writes must happen
@@ -2031,7 +2166,7 @@ public partial class ApiService : ModService
             Monitor.Log($"[API] Failed to emit X-Snapshot-Age-Ms: {ex.Message}", LogLevel.Debug);
         }
 
-        using var _correlationScope = Diagnostics.ModRequestContext.Bind(requestId);
+        using var _correlationScope = RequestContext.Bind(requestId, testId);
 
         // Per-request stopwatch fed into the http_served event in the
         // finally block. Captured here so early-return paths (WebSocket
@@ -2052,34 +2187,14 @@ public partial class ApiService : ModService
                 return;
             }
 
-            // Public endpoints (no auth required).
-            // /diagnostics/state is public because it is a test-harness
-            // failure-diagnosis endpoint: callers are the test containers
-            // inside the Testcontainers network, not external Internet
-            // clients. Exposing it unauthenticated lets a timed-out poll
-            // grab ground-truth state without having to pass the API key.
-            var isPublicEndpoint =
-                path == "/health"
-                || path == "/wait/health"
-                || path == "/stats"
-                || path == "/docs"
-                || path == "/swagger/v1/swagger.json"
-                || path == "/diagnostics/state";
-
-            // Validate API key for protected endpoints
-            if (!isPublicEndpoint && !ValidateApiKey(request))
+            if (!_publicEndpoints.Contains((method, path)) && !ValidateApiKey(request))
             {
                 await WriteUnauthorizedAsync(response);
                 return;
             }
 
-            // Test-only routes — a third early-return gate, mirroring the WebSocket and auth
-            // gates above. Placed AFTER auth so production behaves identically to an unknown
-            // route: an unauthenticated caller already got 401 (same as any non-public path),
-            // and an authenticated caller gets the same 404 a missing route gets.
-            // DO NOT add /test/* to isPublicEndpoint — that would both unauthenticate these
-            // routes AND leak their existence (404 vs 401) in production.
-            // SEAM: if INCLUDE_TEST_ENDPOINTS is introduced, wrap this block.
+            // After auth on purpose: in production a /test/* path must look like any other
+            // unknown route (401 without a key, 404 with one).
             if (IsTestPath(path))
             {
                 if (!Env.IsTest)
@@ -2102,9 +2217,6 @@ public partial class ApiService : ModService
                     case "/players":
                         await WriteJsonAsync(response, HandleGetPlayers());
                         break;
-                    case "/invite-code":
-                        await WriteJsonAsync(response, HandleGetInviteCode());
-                        break;
                     case "/farmhands":
                         await ProfileFarmhandsAsync(response);
                         break;
@@ -2112,16 +2224,16 @@ public partial class ApiService : ModService
                         await WriteJsonAsync(response, HandleGetHealth());
                         break;
                     case "/wait/status":
-                        await HandleWaitStatusAsync(request, response, requestId);
+                        await HandleWaitStatusAsync(request, response);
                         break;
                     case "/wait/players":
-                        await HandleWaitPlayersAsync(request, response, requestId);
+                        await HandleWaitPlayersAsync(request, response);
                         break;
                     case "/wait/health":
-                        await HandleWaitHealthAsync(request, response, requestId);
+                        await HandleWaitHealthAsync(request, response);
                         break;
                     case "/wait/farmhands":
-                        await HandleWaitFarmhandsAsync(request, response, requestId);
+                        await HandleWaitFarmhandsAsync(request, response);
                         break;
                     case "/diagnostics/state":
                         await WriteJsonAsync(
@@ -2130,7 +2242,7 @@ public partial class ApiService : ModService
                         );
                         break;
                     case "/diagnostics/handler-timing":
-                        await WriteJsonAsync(response, BuildHandlerTimingReport());
+                        await WriteJsonAsync(response, HandleGetHandlerTiming());
                         break;
                     case "/stats":
                         await WriteJsonAsync(response, HandleGetStats());
@@ -2151,10 +2263,10 @@ public partial class ApiService : ModService
                         await WriteJsonAsync(response, HandleGetAuthStatus());
                         break;
                     case "/swagger/v1/swagger.json":
-                        await WriteJsonRawAsync(response, _openApiSpec ?? "{}");
+                        await WriteJsonRawAsync(response, HandleGetOpenApiSpec());
                         break;
                     case "/docs":
-                        await WriteHtmlAsync(response, GetScalarHtml());
+                        await WriteHtmlAsync(response, HandleGetDocs());
                         break;
                     default:
                         await WriteNotFoundAsync(response, path);
@@ -2696,27 +2808,37 @@ public partial class ApiService : ModService
     /// Invite code derivation and version are computed per-request (both thread-safe).
     /// Game state fields come from <see cref="TakeGameStateSnapshot"/>.
     /// </summary>
-    [ApiEndpoint("GET", "/status", Summary = "Get server status", Tag = "Server")]
+    [ApiEndpoint("GET", "/status", Summary = "Get server status", Tag = "Server", Public = true)]
     [ApiResponse(typeof(ServerStatus), 200, Description = "Server status and game state")]
-    private ServerStatus HandleGetStatus()
+    private ServerStatus HandleGetStatus() => HandleGetStatus(_snapshot);
+
+    /// <summary>
+    /// Builds the <c>/status</c> response from <paramref name="snap"/>. The wait endpoints pass
+    /// the snapshot that satisfied their filter so the body never reflects a later publication
+    /// that no longer matches.
+    /// </summary>
+    private ServerStatus HandleGetStatus(GameStateSnapshot snap)
     {
         var modInfo = Helper.ModRegistry.Get("JunimoHost.Server");
         var version = modInfo?.Manifest?.Version?.ToString() ?? "unknown";
-        var snap = _snapshot;
+        var tpsSeconds = _tpsSeconds.Average;
+        var tps = tpsSeconds > 0 ? Math.Round(_tpsTicks.Average / tpsSeconds, 1) : 0;
 
-        // Derive invite codes from file (thread-safe file read)
-        var inviteCode = InviteCodeFile.Read(Monitor);
-        string? steamInviteCode = null;
-        string? gogInviteCode = null;
-        if (!string.IsNullOrEmpty(inviteCode))
-        {
-            var baseCode = inviteCode.Length > 1 ? inviteCode.Substring(1) : inviteCode;
-            gogInviteCode = GalaxyNetHelper.GalaxyInvitePrefix + baseCode;
-            if (SteamGameServer.SteamGameServerService.IsInitialized)
-            {
-                steamInviteCode = GalaxyNetHelper.SteamInvitePrefix + baseCode;
-            }
-        }
+        // The invite code mirrors the live Galaxy lobby (the mod's static properties, not the file).
+        // It is shown whenever a lobby exists; SteamRelayReady reports whether Steam clients can use it
+        // right now. The G-code is never exposed.
+        // One snapshot of the signals feeds both the raw fields and the derived code, so a response
+        // never carries a code that disagrees with its own signals.
+        var inviteCode = InviteCodes.Joinable;
+        var steamRelayReady = GalaxyAuthService.SteamLobbyPublished;
+        var galaxyLobby = GalaxyAuthService.GalaxyLobby;
+        var steamSession = SteamGameServerService.SteamSession;
+        var galaxyLobbyState = galaxyLobby.ToWire();
+        var authReadiness = GalaxyAuthService.AuthTokenHealth.ToWire();
+        var steamSessionState = steamSession.ToWire();
+        var connectionStatusCode = ConnectionStatus
+            .Compute(inviteCode != null, steamRelayReady, galaxyLobby, steamSession)
+            .ToWire();
 
         if (!snap.IsOnline)
         {
@@ -2725,11 +2847,21 @@ public partial class ApiService : ModService
                 PlayerCount = 0,
                 MaxPlayers = 4,
                 ServerVersion = version,
+                GameVersion = snap.GameVersion,
                 IsOnline = false,
                 IsReady = false,
                 DayTransitionComplete = false,
                 LastUpdated = snap.CapturedAt,
-                Version = snap.Version,
+                ServerName = Env.ServerName,
+                StartedAtUtc = ServerCommand.StartTimeUtc?.ToString("o"),
+                Tps = tps,
+                Sequence = snap.Sequence,
+                InviteCode = inviteCode,
+                SteamRelayReady = steamRelayReady,
+                GalaxyLobbyState = galaxyLobbyState,
+                SteamSessionState = steamSessionState,
+                AuthReadiness = authReadiness,
+                ConnectionStatusCode = connectionStatusCode,
             };
         }
 
@@ -2737,43 +2869,40 @@ public partial class ApiService : ModService
         {
             PlayerCount = snap.PlayerCount,
             MaxPlayers = snap.MaxPlayers,
-            SteamInviteCode = steamInviteCode,
-            GogInviteCode = gogInviteCode,
+            InviteCode = inviteCode,
+            SteamRelayReady = steamRelayReady,
+            GalaxyLobbyState = galaxyLobbyState,
+            SteamSessionState = steamSessionState,
+            AuthReadiness = authReadiness,
+            ConnectionStatusCode = connectionStatusCode,
             ServerVersion = version,
+            GameVersion = snap.GameVersion,
             IsOnline = true,
             IsReady = snap.IsReady,
             DayTransitionComplete = snap.DayTransitionComplete,
             LastUpdated = snap.CapturedAt,
             FarmName = snap.FarmName,
+            ServerName = Env.ServerName,
+            StartedAtUtc = ServerCommand.StartTimeUtc?.ToString("o"),
             Day = snap.Day,
             Season = snap.Season,
             Year = snap.Year,
             TimeOfDay = snap.TimeOfDay,
             FarmTypeKey = snap.FarmTypeKey,
             IsPaused = snap.IsPaused,
-            Version = snap.Version,
+            Tps = tps,
+            Sequence = snap.Sequence,
         };
     }
 
     /// <summary>Reads from periodic snapshot. See <see cref="TakeGameStateSnapshot"/>.</summary>
     [ApiEndpoint("GET", "/players", Summary = "Get connected players", Tag = "Server")]
     [ApiResponse(typeof(PlayersResponse), 200, Description = "List of connected players")]
-    private PlayersResponse HandleGetPlayers()
-    {
-        var snap = _snapshot;
-        return new PlayersResponse { Players = snap.Players, Version = snap.Version };
-    }
+    private PlayersResponse HandleGetPlayers() => HandleGetPlayers(_snapshot);
 
-    [ApiEndpoint("GET", "/invite-code", Summary = "Get invite code", Tag = "Server")]
-    [ApiResponse(typeof(InviteCodeResponse), 200, Description = "Current server invite code")]
-    private InviteCodeResponse HandleGetInviteCode()
+    private static PlayersResponse HandleGetPlayers(GameStateSnapshot snap)
     {
-        var inviteCode = InviteCodeFile.Read(Monitor);
-        if (string.IsNullOrEmpty(inviteCode))
-        {
-            return new InviteCodeResponse { InviteCode = null, Error = "No invite code available" };
-        }
-        return new InviteCodeResponse { InviteCode = inviteCode };
+        return new PlayersResponse { Players = snap.Players, Sequence = snap.Sequence };
     }
 
     /// <summary>
@@ -2874,7 +3003,7 @@ public partial class ApiService : ModService
             resp.FailedFields,
             () =>
             {
-                resp.AvgGameThreadWaitMs = Volatile.Read(ref _avgGameThreadWaitMs);
+                resp.AvgGameThreadWaitMs = _avgGameThreadWaitMs.Average;
             }
         );
         TryRead(
@@ -2990,10 +3119,20 @@ public partial class ApiService : ModService
                             var fh = Game1.getLocationFromName("FarmHouse") as FarmHouse;
                             resp.FarmHouseObjectCount = fh?.objects?.Count() ?? 0;
                             resp.FarmHouseFurnitureCount = fh?.furniture?.Count ?? 0;
+                            resp.FarmHouseHasPlayerBed = fh?.GetPlayerBed() != null;
                             resp.FarmHouseFridgeItemCount =
                                 fh?.fridge?.Value?.Items?.Count(i => i != null) ?? 0;
                             var masterCellar = Game1.getLocationFromName("Cellar");
                             resp.MasterCellarObjectCount = masterCellar?.objects?.Count() ?? 0;
+                        }
+                    );
+
+                    TryRead(
+                        "hostLocation",
+                        resp.FailedFields,
+                        () =>
+                        {
+                            resp.HostLocation = Game1.currentLocation?.NameOrUniqueName ?? "";
                         }
                     );
 
@@ -3053,7 +3192,7 @@ public partial class ApiService : ModService
         return resp;
     }
 
-    private static List<DiagnosticsCabinState> ReadCabinDiagnostics()
+    private List<DiagnosticsCabinState> ReadCabinDiagnostics()
     {
         var list = new List<DiagnosticsCabinState>();
         var farm = Game1.getFarm();
@@ -3073,6 +3212,11 @@ public partial class ApiService : ModService
 
                 var cabin = building.GetIndoors<StardewValley.Locations.Cabin>();
                 var owner = cabin?.owner;
+                Auth.FarmhandOwnerRecord ownerRecord = null;
+                if (owner != null)
+                {
+                    _farmhandOwnership.TryGetOwner(owner.UniqueMultiplayerID, out ownerRecord);
+                }
                 list.Add(
                     new DiagnosticsCabinState
                     {
@@ -3083,6 +3227,8 @@ public partial class ApiService : ModService
                         OwnerName = owner?.Name ?? "",
                         OwnerIsCustomized = owner?.isCustomized?.Value ?? false,
                         OwnerHasUserId = !string.IsNullOrEmpty(owner?.userID?.Value),
+                        OwnerHasOwner = ownerRecord != null,
+                        OwnerPlatform = ownerRecord?.Platform ?? "",
                         HomeLocationOfOwner = owner?.homeLocation?.Value ?? "",
                         FarmhandReferenceDefined =
                             cabin?.farmhandReference?.defined?.Value ?? false,
@@ -3118,7 +3264,7 @@ public partial class ApiService : ModService
         return cellar?.objects?.Count() ?? 0;
     }
 
-    private static List<DiagnosticsFarmhandState> ReadFarmhandDiagnostics()
+    private List<DiagnosticsFarmhandState> ReadFarmhandDiagnostics()
     {
         var list = new List<DiagnosticsFarmhandState>();
         var farmhandData = Game1.netWorldState?.Value?.farmhandData;
@@ -3137,6 +3283,8 @@ public partial class ApiService : ModService
                     continue;
                 }
 
+                Auth.FarmhandOwnerRecord ownerRecord = null;
+                _farmhandOwnership.TryGetOwner(f.UniqueMultiplayerID, out ownerRecord);
                 list.Add(
                     new DiagnosticsFarmhandState
                     {
@@ -3146,6 +3294,9 @@ public partial class ApiService : ModService
                         HomeLocation = f.homeLocation?.Value ?? "",
                         LastSleepLocation = f.lastSleepLocation?.Value ?? "",
                         HasUserId = !string.IsNullOrEmpty(f.userID?.Value),
+                        HasOwner = ownerRecord != null,
+                        OwnerPlatform = ownerRecord?.Platform ?? "",
+                        Released = _farmhandOwnership.IsReleased(f.UniqueMultiplayerID),
                     }
                 );
             }
@@ -3320,7 +3471,7 @@ public partial class ApiService : ModService
         return s;
     }
 
-    [ApiEndpoint("GET", "/health", Summary = "Health check", Tag = "Health")]
+    [ApiEndpoint("GET", "/health", Summary = "Health check", Tag = "Health", Public = true)]
     [ApiResponse(typeof(HealthResponse), 200, Description = "Health status")]
     private HealthResponse HandleGetHealth()
     {
@@ -3332,7 +3483,7 @@ public partial class ApiService : ModService
                     (DateTime.UtcNow - new DateTime(tickTicks, DateTimeKind.Utc)).TotalMilliseconds
                 : null;
 
-        var pendingActions = _pendingGameActions.Count;
+        var pendingActions = _dispatcher.PendingCount;
 
         bool? gameAvailable = null;
         try
@@ -3372,6 +3523,12 @@ public partial class ApiService : ModService
             GameAvailable = gameAvailable,
             TickCount = totalTicks,
             IsFrozen = isFrozen,
+            // Body-only joinability summary; Status above stays tick-liveness only (200 for alive).
+            SteamSessionState = SteamGameServerService.SteamSession.ToWire(),
+            GalaxyLobbyState = GalaxyAuthService.GalaxyLobby.ToWire(),
+            SteamRelayReady = GalaxyAuthService.SteamLobbyPublished,
+            InviteCodePresent = InviteCodes.Joinable != null,
+            AuthReadiness = GalaxyAuthService.AuthTokenHealth.ToWire(),
         };
     }
 
@@ -3389,7 +3546,7 @@ public partial class ApiService : ModService
     /// <summary>
     /// Long-poll variant of <c>/status</c>. Query params:
     /// <list type="bullet">
-    /// <item><c>since=N</c> — last observed snapshot version. Required.</item>
+    /// <item><c>since=N</c> — last observed snapshot sequence. Required.</item>
     /// <item><c>isReady=true|false</c> — wait until the snapshot's IsReady matches.</item>
     /// <item><c>isPaused=true|false</c> — wait until the snapshot's IsPaused matches.</item>
     /// <item><c>day=N</c> — wait until the snapshot's Day matches.</item>
@@ -3399,10 +3556,12 @@ public partial class ApiService : ModService
     /// Returns 200 + current /status response when filters match a newer
     /// snapshot, or 408 if the timeout elapses with no match.
     /// </summary>
+    [ApiEndpoint("GET", "/wait/status", Summary = "Long-poll server status", Tag = "Server")]
+    [ApiResponse(typeof(ServerStatus), 200, Description = "Server status once the filters match")]
+    [ApiResponse(typeof(void), 408, Description = "Timeout elapsed with no match")]
     private async Task HandleWaitStatusAsync(
         HttpListenerRequest request,
-        HttpListenerResponse response,
-        string? requestId
+        HttpListenerResponse response
     )
     {
         var qs = request.QueryString;
@@ -3416,7 +3575,7 @@ public partial class ApiService : ModService
 
         bool Matches(GameStateSnapshot snap)
         {
-            if (snap.Version <= since)
+            if (snap.Sequence <= since)
             {
                 return false;
             }
@@ -3449,7 +3608,7 @@ public partial class ApiService : ModService
             return true;
         }
 
-        var matched = await WaitForSnapshotAsync(Matches, timeout, requestId);
+        var matched = await WaitForSnapshotAsync(Matches, timeout);
         if (matched == null)
         {
             response.StatusCode = 408;
@@ -3490,12 +3649,11 @@ public partial class ApiService : ModService
 
         EmitPredicateChangedAtHeader(response, changedAt);
 
-        // Delegate to the regular status handler so the response shape is
-        // identical to /status (caller's deserializer doesn't need a
-        // separate type). HandleGetStatus reads _snapshot atomically; the
-        // snapshot version may have advanced since Matches saw it, but the
-        // returned data is at least as fresh as what the predicate matched.
-        await WriteJsonAsync(response, HandleGetStatus());
+        // Same response shape as /status (caller's deserializer doesn't need a
+        // separate type), built from the snapshot the predicate matched: the
+        // caller treats a 200 as "filter satisfied", so a re-read of _snapshot
+        // could hand back a later publication that no longer matches.
+        await WriteJsonAsync(response, HandleGetStatus(matched));
     }
 
     private static DateTime MaxUtc(DateTime a, DateTime b) => a > b ? a : b;
@@ -3503,7 +3661,7 @@ public partial class ApiService : ModService
     /// <summary>
     /// Long-poll variant of <c>/players</c>. Query params:
     /// <list type="bullet">
-    /// <item><c>since=N</c> — last observed snapshot version.</item>
+    /// <item><c>since=N</c> — last observed snapshot sequence.</item>
     /// <item><c>playerId=N</c> — wait until the snapshot's Players list contains the id.</item>
     /// <item><c>timeout=ms</c> — bounded by <see cref="WaitMaxTimeout"/>.</item>
     /// </list>
@@ -3582,7 +3740,14 @@ public partial class ApiService : ModService
 
     private static long ToUs(TimeSpan ts) => (long)(ts.TotalMilliseconds * 1000.0);
 
-    private HandlerTimingReport BuildHandlerTimingReport()
+    [ApiEndpoint(
+        "GET",
+        "/diagnostics/handler-timing",
+        Summary = "Per-handler request timing averages",
+        Tag = "Diagnostics"
+    )]
+    [ApiResponse(typeof(HandlerTimingReport), 200)]
+    private HandlerTimingReport HandleGetHandlerTiming()
     {
         var report = new HandlerTimingReport();
         foreach (var (name, acc) in _handlerTimings)
@@ -3609,10 +3774,12 @@ public partial class ApiService : ModService
         return report;
     }
 
+    [ApiEndpoint("GET", "/wait/players", Summary = "Long-poll connected players", Tag = "Server")]
+    [ApiResponse(typeof(PlayersResponse), 200, Description = "Player list once the filters match")]
+    [ApiResponse(typeof(void), 408, Description = "Timeout elapsed with no match")]
     private async Task HandleWaitPlayersAsync(
         HttpListenerRequest request,
-        HttpListenerResponse response,
-        string? requestId
+        HttpListenerResponse response
     )
     {
         var qs = request.QueryString;
@@ -3622,7 +3789,7 @@ public partial class ApiService : ModService
 
         bool Matches(GameStateSnapshot snap)
         {
-            if (snap.Version <= since)
+            if (snap.Sequence <= since)
             {
                 return false;
             }
@@ -3646,7 +3813,7 @@ public partial class ApiService : ModService
             return true;
         }
 
-        var matched = await WaitForSnapshotAsync(Matches, timeout, requestId);
+        var matched = await WaitForSnapshotAsync(Matches, timeout);
         if (matched == null)
         {
             response.StatusCode = 408;
@@ -3654,9 +3821,9 @@ public partial class ApiService : ModService
         }
 
         // Predicate-transition time: for the playerId filter, when that
-        // player first appeared in any snapshot. For the version-only case
-        // (no playerId filter), the snapshot's capture time is the best
-        // we can do — there's no single "field that changed" to report.
+        // player first appeared in any snapshot. For the sequence-only case
+        // (no playerId filter) there is no single changed field to report,
+        // so the snapshot's capture time is the best available.
         if (
             playerIdFilter is long matchedPid
             && matched.PlayerFirstSeenAtUtc.TryGetValue(matchedPid, out var firstSeen)
@@ -3664,14 +3831,14 @@ public partial class ApiService : ModService
         {
             EmitPredicateChangedAtHeader(response, firstSeen);
         }
-        await WriteJsonAsync(response, HandleGetPlayers());
+        await WriteJsonAsync(response, HandleGetPlayers(matched));
     }
 
     /// <summary>
     /// Long-poll variant of <c>/farmhands</c>. Snapshot-backed; reuses
     /// <see cref="WaitForSnapshotAsync"/>. Query params:
     /// <list type="bullet">
-    /// <item><c>since=N</c> — last observed snapshot version.</item>
+    /// <item><c>since=N</c> — last observed snapshot sequence.</item>
     /// <item><c>farmhandCount=N</c> — wait until the snapshot's farmhand list
     /// contains exactly N entries.</item>
     /// <item><c>hasFarmhand=&lt;name&gt;</c> — wait until a farmhand with the
@@ -3682,10 +3849,16 @@ public partial class ApiService : ModService
     /// <item><c>timeout=ms</c> — bounded by <see cref="WaitMaxTimeout"/>.</item>
     /// </list>
     /// </summary>
+    [ApiEndpoint("GET", "/wait/farmhands", Summary = "Long-poll farmhand slots", Tag = "Farmhands")]
+    [ApiResponse(
+        typeof(FarmhandsResponse),
+        200,
+        Description = "Farmhand list once the filters match"
+    )]
+    [ApiResponse(typeof(void), 408, Description = "Timeout elapsed with no match")]
     private async Task HandleWaitFarmhandsAsync(
         HttpListenerRequest request,
-        HttpListenerResponse response,
-        string? requestId
+        HttpListenerResponse response
     )
     {
         var qs = request.QueryString;
@@ -3697,7 +3870,7 @@ public partial class ApiService : ModService
 
         bool Matches(GameStateSnapshot snap)
         {
-            if (snap.Version <= since)
+            if (snap.Sequence <= since)
             {
                 return false;
             }
@@ -3739,7 +3912,7 @@ public partial class ApiService : ModService
             return true;
         }
 
-        var matched = await WaitForSnapshotAsync(Matches, timeout, requestId);
+        var matched = await WaitForSnapshotAsync(Matches, timeout);
         if (matched == null)
         {
             response.StatusCode = 408;
@@ -3783,7 +3956,7 @@ public partial class ApiService : ModService
         }
         EmitPredicateChangedAtHeader(response, changedAt);
 
-        await WriteJsonAsync(response, HandleGetFarmhands());
+        await WriteJsonAsync(response, HandleGetFarmhands(matched));
     }
 
     /// <summary>
@@ -3802,10 +3975,18 @@ public partial class ApiService : ModService
     /// <see cref="WaitMaxTimeout"/>; callers must wrap in an outer
     /// re-issue loop.
     /// </summary>
+    [ApiEndpoint(
+        "GET",
+        "/wait/health",
+        Summary = "Long-poll health",
+        Tag = "Health",
+        Public = true
+    )]
+    [ApiResponse(typeof(HealthResponse), 200, Description = "Health status once the filters match")]
+    [ApiResponse(typeof(void), 408, Description = "Timeout elapsed with no match")]
     private async Task HandleWaitHealthAsync(
         HttpListenerRequest request,
-        HttpListenerResponse response,
-        string? requestId
+        HttpListenerResponse response
     )
     {
         var qs = request.QueryString;
@@ -3860,11 +4041,6 @@ public partial class ApiService : ModService
                 response.StatusCode = 408;
                 return;
             }
-
-            // Re-bind requestId for any downstream emits — the continuation
-            // may have resumed on a fresh thread-pool worker that didn't
-            // flow our AsyncLocal cleanly. See .claude/rules/asynclocal-pitfalls.md.
-            using var _ = Diagnostics.ModRequestContext.Bind(requestId);
         }
     }
 
@@ -3910,8 +4086,7 @@ public partial class ApiService : ModService
 
     private async Task<GameStateSnapshot?> WaitForSnapshotAsync(
         Func<GameStateSnapshot, bool> predicate,
-        TimeSpan timeout,
-        string? requestId
+        TimeSpan timeout
     )
     {
         var deadline = DateTime.UtcNow + timeout;
@@ -3944,11 +4119,6 @@ public partial class ApiService : ModService
             {
                 return null;
             }
-
-            // Continuation may have resumed on a fresh thread-pool worker;
-            // re-bind so any structured event we emit below carries the
-            // caller's requestId.
-            using var _ = Diagnostics.ModRequestContext.Bind(requestId);
         }
     }
 
@@ -3985,27 +4155,31 @@ public partial class ApiService : ModService
     [ApiResponse(typeof(StatsResponse), 200)]
     private StatsResponse HandleGetStats()
     {
+        var startedAt = ServerCommand.StartTimeUtc;
         return new StatsResponse
         {
             Fps = Math.Round(Volatile.Read(ref _currentFps), 1),
             Tps = Math.Round(Volatile.Read(ref _currentTps), 1),
-            AvgTickMs = Math.Round(Volatile.Read(ref _avgTickMs), 2),
+            AvgTickMs = Math.Round(_avgTickMs.Average, 2),
             MemoryMb = Math.Round(GC.GetTotalMemory(false) / 1024.0 / 1024.0, 1),
             GcGen0 = GC.CollectionCount(0),
             GcGen1 = GC.CollectionCount(1),
             GcGen2 = GC.CollectionCount(2),
-            PendingActions = _pendingGameActions.Count,
-            GameThreadWaitMs = Math.Round(Volatile.Read(ref _avgGameThreadWaitMs), 2),
+            PendingActions = _dispatcher.PendingCount,
+            GameThreadWaitMs = Math.Round(_avgGameThreadWaitMs.Average, 2),
+            StartedAtUtc = startedAt?.ToString("o"),
+            UptimeSeconds = startedAt is { } t ? (long)(DateTime.UtcNow - t).TotalSeconds : null,
         };
     }
 
     /// <summary>Reads from periodic snapshot. See <see cref="TakeGameStateSnapshot"/>.</summary>
     [ApiEndpoint("GET", "/farmhands", Summary = "Get all farmhand slots", Tag = "Farmhands")]
     [ApiResponse(typeof(FarmhandsResponse), 200, Description = "List of farmhand slots")]
-    private FarmhandsResponse HandleGetFarmhands()
+    private FarmhandsResponse HandleGetFarmhands() => HandleGetFarmhands(_snapshot);
+
+    private static FarmhandsResponse HandleGetFarmhands(GameStateSnapshot snap)
     {
-        var snap = _snapshot;
-        return new FarmhandsResponse { Farmhands = snap.Farmhands, Version = snap.Version };
+        return new FarmhandsResponse { Farmhands = snap.Farmhands, Sequence = snap.Sequence };
     }
 
     [ApiEndpoint("GET", "/settings", Summary = "Get server settings", Tag = "Settings")]
@@ -4026,9 +4200,10 @@ public partial class ApiService : ModService
             Server = new ServerRuntimeSettingsInfo
             {
                 MaxPlayers = raw.Server.MaxPlayers,
-                CabinStrategy = raw.Server.CabinStrategy,
+                CabinStrategy = raw.Server.CabinStrategy.ToString(),
                 SeparateWallets = raw.Server.SeparateWallets,
-                ExistingCabinBehavior = raw.Server.ExistingCabinBehavior,
+                ExistingCabinBehavior = raw.Server.ExistingCabinBehavior.ToString(),
+                AllowCabinRelocation = raw.Server.AllowCabinRelocation,
             },
         };
     }
@@ -4047,6 +4222,9 @@ public partial class ApiService : ModService
             AvailableCount = snap.CabinAvailableCount,
             Cabins = snap.Cabins,
             SavedPositionPlayerIds = _cabinManager.Data.PlayerCabinPositions.Keys.ToList(),
+            Migration = snap.CabinMigration,
+            StackSpot = snap.CabinStackSpot,
+            MainFarmHouseEntry = snap.CabinMainFarmHouseEntry,
         };
     }
 
@@ -4631,6 +4809,10 @@ public partial class ApiService : ModService
                     LogLevel.Warn
                 );
                 Game1.netWorldState.Value.farmhandData.Remove(farmhandId);
+                // DestroyCabin drops the owner record on the cabin path; this direct-removal
+                // fallback must too, or the deleted slot's record lingers until the next load's
+                // self-heal.
+                _farmhandOwnership.RemoveOwner(farmhandId);
             }
             else
             {
@@ -4669,8 +4851,10 @@ public partial class ApiService : ModService
         HttpListenerResponse response
     )
     {
-        // Parse the JSON request body
+        // Parse the request body. The reject sink lets a settings converter (e.g. FarmType) default a
+        // malformed field instead of aborting the parse, so the rest of the request still applies.
         NewGameRequest? body = null;
+        var rejects = new List<SettingReject>();
         try
         {
             using var reader = new System.IO.StreamReader(
@@ -4680,7 +4864,13 @@ public partial class ApiService : ModService
             var json = await reader.ReadToEndAsync();
             if (!string.IsNullOrWhiteSpace(json))
             {
-                body = JsonConvert.DeserializeObject<NewGameRequest>(json);
+                body = JsonConvert.DeserializeObject<NewGameRequest>(
+                    json,
+                    new JsonSerializerSettings
+                    {
+                        Context = new StreamingContext(StreamingContextStates.Other, rejects),
+                    }
+                );
             }
         }
         catch (Exception ex)
@@ -4688,47 +4878,107 @@ public partial class ApiService : ModService
             Monitor.Log($"Failed to parse /newgame request body: {ex.Message}", LogLevel.Debug);
         }
 
+        foreach (var reject in rejects)
+        {
+            Monitor.Log(
+                $"/newgame request: {reject.Path} '{reject.RejectedValue}' is not recognized; using '{reject.FallbackUsed}'.",
+                LogLevel.Debug
+            );
+        }
+
         body ??= new NewGameRequest();
 
-        // Validate no clients are connected
-        int connectedClients = 0;
-        try
+        // Build the config from the settings file (defaults), overriding with any explicitly
+        // provided request values. Starting from FromSettings guarantees EVERY file setting
+        // flows into the created game unless the request overrides it — a hand-picked
+        // parameter list drops whatever it forgets (CabinLayoutNearby, for one, decides
+        // which designated-position layout every later load resolves).
+        var config = NewGameConfig.FromSettings(_settings);
+        if (body.FarmType.HasValue)
         {
-            await RunOnGameThreadAsync(() =>
+            config.WhichFarm = body.FarmType.Value;
+        }
+        if (body.FarmName != null)
+        {
+            config.FarmName = body.FarmName;
+        }
+        if (body.StartingCabins.HasValue)
+        {
+            config.StartingCabins = body.StartingCabins.Value;
+        }
+        if (body.CabinStrategy != null)
+        {
+            if (!CabinStrategyParser.TryParse(body.CabinStrategy, out var strategy))
             {
-                connectedClients = Game1.otherFarmers.Count;
-            });
+                response.StatusCode = 400;
+                await WriteJsonAsync(
+                    response,
+                    new NewGameResponse
+                    {
+                        Success = false,
+                        Error =
+                            $"Unknown cabinStrategy '{body.CabinStrategy}' (use CabinStack, "
+                            + "FarmhouseStack, or None).",
+                    }
+                );
+                return;
+            }
+            config.CabinStrategy = strategy;
         }
-        catch
+        if (body.MaxPlayers.HasValue)
         {
-            // Game thread unavailable; allow the attempt anyway
+            config.MaxPlayers = body.MaxPlayers.Value;
         }
-
-        if (connectedClients > 0)
+        // Validate the EFFECTIVE MaxPlayers — the request override if present, else the
+        // server-settings.json default FromSettings seeded — before it reaches the durable game:
+        // ApplyNewGameConfig persists it and SyncFromSettings reapplies it on every later load, so
+        // a 0/negative value sticks, and under None it freezes the cap at min(designated,
+        // MaxPlayers), leaving a game no player can ever join. settings validate uses the same
+        // [1..100] range but only as a diagnostic, so the API must gate it here — and gating the
+        // effective value (not just the request override) closes the omitted-field path where a
+        // bad settings default would otherwise flow through unchecked.
+        if (config.MaxPlayers < 1 || config.MaxPlayers > 100)
         {
-            response.StatusCode = 409;
+            response.StatusCode = 400;
             await WriteJsonAsync(
                 response,
                 new NewGameResponse
                 {
                     Success = false,
-                    Error =
-                        $"Cannot create new game while {connectedClients} client(s) are connected. Disconnect all players first.",
+                    Error = $"maxPlayers {config.MaxPlayers} is out of range [1..100].",
                 }
             );
             return;
         }
-
-        // Build the config from settings (defaults), overriding with any explicitly provided request values.
-        var config = NewGameConfig.FromRequest(
-            farmType: body.FarmType ?? _settings.FarmType,
-            farmName: body.FarmName ?? _settings.FarmName,
-            startingCabins: body.StartingCabins ?? _settings.StartingCabins,
-            cabinStrategy: body.CabinStrategy ?? _settings.CabinStrategy.ToString(),
-            maxPlayers: body.MaxPlayers ?? _settings.MaxPlayers,
-            profitMargin: body.ProfitMargin ?? _settings.ProfitMargin,
-            separateWallets: body.SeparateWallets ?? _settings.SeparateWallets
-        );
+        if (body.ProfitMargin.HasValue)
+        {
+            config.ProfitMargin = body.ProfitMargin.Value;
+        }
+        if (config.ProfitMargin < 0.25f || config.ProfitMargin > 1.0f)
+        {
+            response.StatusCode = 400;
+            await WriteJsonAsync(
+                response,
+                new NewGameResponse
+                {
+                    Success = false,
+                    Error = $"profitMargin {config.ProfitMargin} is out of range [0.25..1.0].",
+                }
+            );
+            return;
+        }
+        if (body.SeparateWallets.HasValue)
+        {
+            config.UseSeparateWallets = body.SeparateWallets.Value;
+        }
+        if (body.AllowCabinRelocation.HasValue)
+        {
+            config.AllowCabinRelocation = body.AllowCabinRelocation.Value;
+        }
+        if (body.AllowIpConnections.HasValue)
+        {
+            config.AllowIpConnections = body.AllowIpConnections.Value;
+        }
 
         Monitor.Log($"[API] New game requested: {config}", LogLevel.Info);
 
@@ -4743,26 +4993,65 @@ public partial class ApiService : ModService
             return;
         }
 
-        // Call RequestNewGame on the game thread. This sets flags and calls ExitToTitle().
-        // Capture the returned Task which completes when the new game is fully created.
+        // Lease check → client-count check → take lease → request, in ONE game-thread action so
+        // no join or competing transition can land between check and act, and no early return
+        // ever holds a lease it must give back. Lease before count: the body is stable while a
+        // reset's own client is still connected. The lease is released when the operation's
+        // task settles — never on the 120 s HTTP timeout below, so an operation that outlives
+        // its request still holds it until the world is loaded.
         Task? newGameTask = null;
+        string? rejection = null;
         try
         {
             await RunOnGameThreadAsync(() =>
             {
-                newGameTask = gameManager.RequestNewGame(config);
+                if (gameManager.Disruption.Holder is { } holder)
+                {
+                    rejection = $"{holder} in progress";
+                    return;
+                }
+
+                var connectedClients = Game1.otherFarmers.Count;
+                if (connectedClients > 0)
+                {
+                    rejection =
+                        $"Cannot create new game while {connectedClients} client(s) are connected. Disconnect all players first.";
+                    return;
+                }
+
+                newGameTask = StartWorldTransition(
+                    gameManager,
+                    WorldTransitionNewGame,
+                    () => gameManager.RequestNewGame(config)
+                );
             });
         }
         catch (Exception ex)
         {
-            response.StatusCode = 500;
+            // Fail closed: the count could not be read, so don't assume nobody is connected.
+            Monitor.Log(
+                $"[API] New game precheck could not run on the game thread: {ex.Message}",
+                LogLevel.Warn
+            );
+            response.StatusCode = 503;
             await WriteJsonAsync(
                 response,
                 new NewGameResponse
                 {
                     Success = false,
-                    Error = $"Failed to initiate new game: {ex.Message}",
+                    Error =
+                        "Cannot verify server state right now (game thread busy, likely a day transition or save sync). Retry after a few seconds.",
                 }
+            );
+            return;
+        }
+
+        if (rejection != null)
+        {
+            response.StatusCode = 409;
+            await WriteJsonAsync(
+                response,
+                new NewGameResponse { Success = false, Error = rejection }
             );
             return;
         }
@@ -4823,53 +5112,6 @@ public partial class ApiService : ModService
     [ApiResponse(typeof(ReloadResponse), 200, Description = "World reloaded successfully")]
     private async Task HandlePostReloadAsync(HttpListenerResponse response)
     {
-        // Validate no clients are connected — reload returns to title and would
-        // disconnect everyone. Fail closed: if the count can't be read because the
-        // game thread is busy, treat it as transient (503) rather than assuming 0
-        // connected, which could silently disconnect active players if the thread
-        // recovers before the reload fires.
-        int connectedClients = 0;
-        try
-        {
-            await RunOnGameThreadAsync(() =>
-            {
-                connectedClients = Game1.otherFarmers.Count;
-            });
-        }
-        catch (Exception ex)
-        {
-            Monitor.Log(
-                $"[API] Reload precheck could not read connected-client count: {ex.Message}",
-                LogLevel.Warn
-            );
-            response.StatusCode = 503;
-            await WriteJsonAsync(
-                response,
-                new ReloadResponse
-                {
-                    Success = false,
-                    Error =
-                        "Cannot verify connected clients right now (game thread busy, likely a day transition or save sync). Retry after a few seconds.",
-                }
-            );
-            return;
-        }
-
-        if (connectedClients > 0)
-        {
-            response.StatusCode = 409;
-            await WriteJsonAsync(
-                response,
-                new ReloadResponse
-                {
-                    Success = false,
-                    Error =
-                        $"Cannot reload while {connectedClients} client(s) are connected. Disconnect all players first.",
-                }
-            );
-            return;
-        }
-
         var gameManager = GameManagerService.Instance;
         if (gameManager == null)
         {
@@ -4883,26 +5125,61 @@ public partial class ApiService : ModService
 
         Monitor.Log("[API] World reload requested", LogLevel.Info);
 
-        // Call RequestReloadSave on the game thread (sets flags + ExitToTitle).
-        // The returned Task completes when the world has finished reloading.
+        // Same single-action shape as /newgame: lease → client count → take lease → request.
+        // Reload returns to title and would disconnect everyone, so fail closed when the count
+        // can't be read (503), never assume 0.
         Task? reloadTask = null;
+        string? rejection = null;
         try
         {
             await RunOnGameThreadAsync(() =>
             {
-                reloadTask = gameManager.RequestReloadSave();
+                if (gameManager.Disruption.Holder is { } holder)
+                {
+                    rejection = $"{holder} in progress";
+                    return;
+                }
+
+                var connectedClients = Game1.otherFarmers.Count;
+                if (connectedClients > 0)
+                {
+                    rejection =
+                        $"Cannot reload while {connectedClients} client(s) are connected. Disconnect all players first.";
+                    return;
+                }
+
+                reloadTask = StartWorldTransition(
+                    gameManager,
+                    WorldTransitionReload,
+                    gameManager.RequestReloadSave
+                );
             });
         }
         catch (Exception ex)
         {
-            response.StatusCode = 500;
+            Monitor.Log(
+                $"[API] Reload precheck could not run on the game thread: {ex.Message}",
+                LogLevel.Warn
+            );
+            response.StatusCode = 503;
             await WriteJsonAsync(
                 response,
                 new ReloadResponse
                 {
                     Success = false,
-                    Error = $"Failed to initiate reload: {ex.Message}",
+                    Error =
+                        "Cannot verify server state right now (game thread busy, likely a day transition or save sync). Retry after a few seconds.",
                 }
+            );
+            return;
+        }
+
+        if (rejection != null)
+        {
+            response.StatusCode = 409;
+            await WriteJsonAsync(
+                response,
+                new ReloadResponse { Success = false, Error = rejection }
             );
             return;
         }
@@ -4941,6 +5218,48 @@ public partial class ApiService : ModService
         }
     }
 
+    /// <summary>Lease holder names for the two HTTP world transitions; they surface in 409 bodies as "&lt;name&gt; in progress".</summary>
+    private const string WorldTransitionNewGame = "new game";
+    private const string WorldTransitionReload = "reload";
+
+    /// <summary>
+    /// Takes the world-disruption lease for <paramref name="holder"/> and starts the transition.
+    /// The returned task carries the operation's outcome and settles only after the lease has
+    /// been released, so a caller that observes completion can start the next transition at
+    /// once. Game thread only, and only after the caller has checked the lease is free in the
+    /// same action — the acquire cannot fail here, so the request always runs under the lease.
+    /// </summary>
+    private static Task StartWorldTransition(
+        GameManagerService gameManager,
+        string holder,
+        Func<Task> request
+    )
+    {
+        gameManager.Disruption.TryAcquire(holder);
+        Task task;
+        try
+        {
+            task = request();
+        }
+        catch
+        {
+            // A synchronous throw (ExitToTitle itself) would otherwise leave the lease held
+            // until restart, with every later transition answering 409.
+            gameManager.Disruption.Release(holder);
+            throw;
+        }
+
+        return task.ContinueWith(
+                t =>
+                {
+                    gameManager.Disruption.Release(holder);
+                    return t;
+                },
+                TaskContinuationOptions.ExecuteSynchronously
+            )
+            .Unwrap();
+    }
+
     #endregion
 
     #region Response Helpers
@@ -4968,9 +5287,19 @@ public partial class ApiService : ModService
         await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
     }
 
-    private string GetScalarHtml()
+    [ApiEndpoint(
+        "GET",
+        "/swagger/v1/swagger.json",
+        Summary = "OpenAPI specification",
+        Tag = "Docs",
+        Public = true
+    )]
+    private string HandleGetOpenApiSpec() => _openApiSpec ?? "{}";
+
+    [ApiEndpoint("GET", "/docs", Summary = "API documentation UI", Tag = "Docs", Public = true)]
+    private string HandleGetDocs()
     {
-        return $@"<!DOCTYPE html>
+        return @"<!DOCTYPE html>
 <html>
 <head>
     <title>Stardew Dedicated Server API</title>
@@ -4978,7 +5307,7 @@ public partial class ApiService : ModService
     <meta name=""viewport"" content=""width=device-width, initial-scale=1"" />
 </head>
 <body>
-    <script id=""api-reference"" data-url=""http://localhost:{Env.ApiPort}/swagger/v1/swagger.json""></script>
+    <script id=""api-reference"" data-url=""swagger/v1/swagger.json""></script>
     <script src=""https://cdn.jsdelivr.net/npm/@scalar/api-reference""></script>
 </body>
 </html>";

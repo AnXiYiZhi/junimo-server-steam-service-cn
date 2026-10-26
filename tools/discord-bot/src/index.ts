@@ -1,29 +1,52 @@
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import {
     ActivityType,
+    type Channel,
     Client,
-    Colors,
-    EmbedBuilder,
+    DiscordAPIError,
+    DiscordjsError,
+    DiscordjsErrorCodes,
+    type EmbedBuilder,
     Events,
+    GatewayCloseCodes,
     GatewayIntentBits,
+    type Guild,
     type Message,
+    type NewsChannel,
     PermissionFlagsBits,
+    type PermissionResolvable,
+    RESTJSONErrorCodes,
     type TextChannel,
 } from "discord.js";
+import { type ChannelRef, describeChannelRef, matchesChannelRef, parseChannelRef } from "./channels";
+import {
+    buildDashboardEmbed,
+    buildStatusFields,
+    classifyDashboardEmbed,
+    type DashboardMessageKind,
+    formatFooter,
+    formatPresence,
+    formatStateLine,
+    parseDashboardState,
+    parseOwnerId,
+} from "./dashboard";
+import { resolveServerState, type ServerStatus } from "./discordState";
+import { createLogger, log } from "./log";
 
 // Configuration from environment
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const API_URL = process.env.API_URL || "http://server:8080";
 const API_KEY = process.env.API_KEY || "";
 const WS_URL = process.env.WS_URL || `${API_URL.replace("http://", "ws://").replace("https://", "wss://")}/ws`;
-const DISCORD_CHAT_CHANNEL_ID = process.env.DISCORD_CHAT_CHANNEL_ID;
-const STATUS_DASHBOARD_CHANNEL_ID = process.env.STATUS_DASHBOARD_CHANNEL_ID;
-const STATUS_DASHBOARD_REFRESH_RATE = Number(process.env.STATUS_DASHBOARD_REFRESH_RATE) || 30;
-const STATUS_DASHBOARD_REFRESH_RATE_FORMATTED =
-    STATUS_DASHBOARD_REFRESH_RATE < 60
-        ? `${STATUS_DASHBOARD_REFRESH_RATE} seconds`
-        : `${Math.round(STATUS_DASHBOARD_REFRESH_RATE / 60)} minutes`;
-const DISCORD_BOT_NICKNAME = process.env.DISCORD_BOT_NICKNAME;
-let targetMessageId: string | null = null;
+const CHAT_CHANNEL = parseChannelRef(process.env.DISCORD_CHAT_CHANNEL);
+const DASHBOARD_CHANNEL = parseChannelRef(process.env.STATUS_DASHBOARD_CHANNEL);
+// Every update edits one message per channel; the same floor as the presence keeps Discord's rate limits at bay.
+const MIN_STATUS_DASHBOARD_REFRESH_RATE = 20;
+const STATUS_DASHBOARD_REFRESH_RATE = Math.max(
+    Number(process.env.STATUS_DASHBOARD_REFRESH_RATE) || 30,
+    MIN_STATUS_DASHBOARD_REFRESH_RATE,
+);
 const COOLDOWN_DURATION_MS = 30000;
 const MAX_COMMANDS_PER_WINDOW = 10;
 const commandHistory = new Map<string, number[]>();
@@ -37,7 +60,7 @@ const UPDATE_INTERVAL_MS = Math.max(
 );
 
 if (!DISCORD_BOT_TOKEN) {
-    console.log("[Discord Bot] DISCORD_BOT_TOKEN not set - bot disabled");
+    log.info("DISCORD_BOT_TOKEN not set - bot disabled");
     process.exit(0);
 }
 
@@ -50,24 +73,6 @@ function getApiHeaders(): HeadersInit {
         headers.Authorization = `Bearer ${API_KEY}`;
     }
     return headers;
-}
-
-interface ServerStatus {
-    playerCount: number;
-    maxPlayers: number;
-    steamInviteCode: string | null;
-    gogInviteCode: string | null;
-    serverVersion: string;
-    isOnline: boolean;
-    isReady: boolean;
-    lastUpdated: string;
-    farmName: string;
-    day: number;
-    season: string;
-    year: number;
-    timeOfDay: number;
-    farmTypeKey: string;
-    isPaused: boolean;
 }
 
 interface PlayerInfo {
@@ -120,13 +125,45 @@ interface WebSocketMessage {
     };
 }
 
-// Only request message intents if chat relay is enabled
-const intents = [GatewayIntentBits.Guilds];
-if (DISCORD_CHAT_CHANNEL_ID) {
-    intents.push(GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent);
+// Commands are addressed by mentioning the bot, and Discord delivers the content of such
+// messages without the privileged Message Content intent. That intent is needed only to
+// read every message in the chat relay channel.
+const intents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages];
+if (CHAT_CHANNEL) {
+    intents.push(GatewayIntentBits.MessageContent);
 }
 
-const client = new Client({ intents });
+// Relayed chat, player names and the farm name come from the game unchanged, so nothing the
+// bot posts may ping users, roles or everyone; replies still notify the person replied to.
+const client = new Client({ intents, allowedMentions: { parse: [], repliedUser: true } });
+
+/** A guild channel the bot posts to; the two types matched by `matchesChannelRef`. */
+type PostableChannel = TextChannel | NewsChannel;
+
+/** Channels in one guild matching a configured reference. */
+function resolveChannelsIn(guild: Guild, ref: ChannelRef): PostableChannel[] {
+    const matches: PostableChannel[] = [];
+    for (const channel of guild.channels.cache.values()) {
+        if (matchesChannelRef(channel, ref)) {
+            matches.push(channel as PostableChannel);
+        }
+    }
+    return matches;
+}
+
+/**
+ * Channels matching a configured reference across every guild: one for an id, one per
+ * guild for a name. Resolved from the gateway cache on each use, so channel renames and
+ * newly joined guilds take effect without a restart.
+ */
+function resolveChannels(ref: ChannelRef): PostableChannel[] {
+    return [...client.guilds.cache.values()].flatMap((guild) => resolveChannelsIn(guild, ref));
+}
+
+/** True when an incoming message's channel is the configured one. */
+function isConfiguredChannel(channel: Channel, ref: ChannelRef): boolean {
+    return !channel.isDMBased() && matchesChannelRef(channel, ref);
+}
 
 // WebSocket connection state
 let ws: WebSocket | null = null;
@@ -147,6 +184,12 @@ function startHeartbeat(): void {
     }, 30000);
 }
 
+// Polled by several callers, so only reachability changes are logged.
+let statusFetchFailure: string | null | undefined;
+
+// The last status seen with live game data; shown on the dashboard while the server is unreachable.
+let lastKnownStatus: ServerStatus | null = null;
+
 /**
  * Fetches the server status from the HTTP API.
  */
@@ -158,36 +201,43 @@ async function fetchServerStatus(): Promise<ServerStatus | null> {
         });
 
         if (!response.ok) {
-            console.error(`[Discord Bot] API request failed: ${response.status} ${response.statusText}`);
+            reportStatusFetch(`${response.status} ${response.statusText}`);
             return null;
         }
 
-        return await response.json();
-    } catch (error) {
-        if (error instanceof Error) {
-            console.error(`[Discord Bot] Failed to fetch status: ${error.message}`);
-        } else {
-            console.error(`[Discord Bot] Failed to fetch status: ${error}`);
+        const status = await response.json();
+        reportStatusFetch(null);
+        if (status?.isOnline) {
+            lastKnownStatus = status;
         }
+        return status;
+    } catch (error) {
+        reportStatusFetch(error instanceof Error ? error.message : String(error));
         return null;
     }
 }
 
-/**
- * Updates the bot's presence/status based on server state.
- */
+function reportStatusFetch(failure: string | null): void {
+    if (failure === statusFetchFailure) {
+        return;
+    }
+    if (failure) {
+        log.warn(
+            `Cannot fetch ${API_URL}/status (${failure}); presence and dashboard will show the server as offline until it responds`,
+        );
+    } else if (statusFetchFailure) {
+        log.info("Server API reachable again");
+    }
+    statusFetchFailure = failure;
+}
+
+let lastPresence: string | null = null;
+
+/** Updates the bot's presence/status based on server state: players and code while online, else the state's reason. */
 async function updatePresence(): Promise<void> {
     const status = await fetchServerStatus();
-
-    let activityName: string;
-
-    if (!status?.isOnline) {
-        activityName = "Server Offline";
-    } else {
-        const playerInfo = `${status.playerCount}/${status.maxPlayers} players`;
-        const inviteCode = status.steamInviteCode || status.gogInviteCode || "No code";
-        activityName = `${playerInfo} | ${inviteCode}`;
-    }
+    const state = resolveServerState(status);
+    const activityName = state.kind === "online" && status ? formatPresence(status) : state.detail;
 
     client.user?.setPresence({
         activities: [
@@ -197,25 +247,22 @@ async function updatePresence(): Promise<void> {
                 state: activityName,
             },
         ],
-        status: status?.isOnline ? "online" : "idle",
+        status: state.presence,
     });
 
-    console.log(`[Discord Bot] Status updated: ${activityName}`);
+    if (activityName !== lastPresence) {
+        log.info(`Status updated: ${activityName}`);
+        lastPresence = activityName;
+    }
 }
 
 /**
- * Updates the bot's nickname in all guilds.
- * Uses DISCORD_BOT_NICKNAME env var if set, otherwise uses farm name from server.
+ * Updates the bot's nickname in all guilds: the server's display name (SERVER_NAME), else the farm name.
  */
 async function updateBotNickname(): Promise<void> {
-    let nickname = DISCORD_BOT_NICKNAME;
-
-    if (!nickname) {
-        const status = await fetchServerStatus();
-        if (status?.farmName) {
-            nickname = status.farmName;
-        }
-    }
+    const status = await fetchServerStatus();
+    // Discord rejects nicknames over 32 characters; the full name stays on /status.
+    const nickname = (status?.serverName || status?.farmName)?.slice(0, 32);
 
     if (!nickname) {
         return;
@@ -226,12 +273,12 @@ async function updateBotNickname(): Promise<void> {
             const currentNickname = guild.members.me?.nickname;
             if (currentNickname !== nickname) {
                 await guild.members.me?.setNickname(nickname);
-                console.log(`[Discord Bot] Nickname set to "${nickname}" in ${guild.name}`);
+                log.info(`Nickname set to "${nickname}" in ${guild.name}`);
             }
         } catch (error) {
             // May lack permissions in some guilds
             if (error instanceof Error) {
-                console.error(`[Discord Bot] Failed to set nickname in ${guild.name}: ${error.message}`);
+                log.error(`Failed to set nickname in ${guild.name}: ${error.message}`);
             }
         }
     }
@@ -239,13 +286,16 @@ async function updateBotNickname(): Promise<void> {
 
 // Track WebSocket authentication state
 let wsAuthenticated = false;
+let wsFailedAttempts = 0;
+const WS_RECONNECT_DELAY_MS = 5000;
+const WS_FAILURE_LOG_EVERY = 12; // one progress line per minute at the 5s retry cadence
 
 /**
  * Connects to the game server's WebSocket for real-time chat relay.
  */
 function connectWebSocket(): void {
-    if (!DISCORD_CHAT_CHANNEL_ID) {
-        console.log("[Discord Bot] DISCORD_CHAT_CHANNEL_ID not set - chat relay disabled");
+    if (!CHAT_CHANNEL) {
+        log.info("DISCORD_CHAT_CHANNEL not set - chat relay disabled");
         return;
     }
 
@@ -259,20 +309,27 @@ function connectWebSocket(): void {
     }
 
     wsAuthenticated = false;
-    console.log(`[Discord Bot] Connecting to WebSocket: ${WS_URL}`);
+    if (wsFailedAttempts === 0) {
+        log.info(`Connecting to WebSocket: ${WS_URL}`);
+    }
 
     try {
         ws = new WebSocket(WS_URL);
+        let opened = false;
 
         ws.onopen = () => {
+            opened = true;
             // Send auth message if API_KEY is set
             if (API_KEY) {
-                console.log("[Discord Bot] WebSocket connected, authenticating...");
+                if (wsFailedAttempts === 0) {
+                    log.info("WebSocket connected, authenticating...");
+                }
                 ws?.send(JSON.stringify({ type: "auth", payload: { token: API_KEY } }));
             } else {
                 // No auth required, start heartbeat immediately
-                console.log("[Discord Bot] WebSocket connected");
+                log.info("WebSocket connected");
                 wsAuthenticated = true;
+                wsFailedAttempts = 0;
                 startHeartbeat();
             }
         };
@@ -283,16 +340,17 @@ function connectWebSocket(): void {
 
                 // Handle auth response
                 if (msg.type === "auth_success") {
-                    console.log("[Discord Bot] WebSocket authenticated");
+                    log.info("WebSocket authenticated");
                     wsAuthenticated = true;
+                    wsFailedAttempts = 0;
                     startHeartbeat();
                     return;
                 }
 
                 if (msg.type === "auth_failed") {
-                    console.error(
-                        `[Discord Bot] WebSocket authentication failed: ${(msg.payload as any)?.error || "unknown error"}`,
-                    );
+                    if (wsFailedAttempts === 0) {
+                        log.error(`WebSocket authentication failed: ${(msg.payload as any)?.error || "unknown error"}`);
+                    }
                     return;
                 }
 
@@ -301,43 +359,62 @@ function connectWebSocket(): void {
                     return;
                 }
 
-                if (msg.type === "chat" && msg.payload) {
-                    // Game -> Discord
-                    const channel = client.channels.cache.get(DISCORD_CHAT_CHANNEL_ID);
-                    if (channel?.isTextBased()) {
-                        const { playerName, message } = msg.payload;
-                        if (playerName && message) {
-                            await (channel as TextChannel).send(`**${playerName}**: ${message}`);
+                if (msg.type === "chat" && msg.payload && CHAT_CHANNEL) {
+                    // Game -> Discord, to the chat channel of every guild that has one
+                    const { playerName, message } = msg.payload;
+                    if (playerName && message) {
+                        for (const channel of resolveChannels(CHAT_CHANNEL)) {
+                            try {
+                                await channel.send(`**${playerName}**: ${message}`);
+                            } catch (error) {
+                                log.error(
+                                    `Failed to relay chat to #${channel.name} in ${channel.guild.name}: ${error}`,
+                                );
+                            }
                         }
                     }
                 }
             } catch (error) {
                 if (error instanceof Error) {
-                    console.error(`[Discord Bot] Failed to process WebSocket message: ${error.message}`);
+                    log.error(`Failed to process WebSocket message: ${error.message}`);
                 }
             }
         };
 
         ws.onclose = () => {
-            console.log("[Discord Bot] WebSocket disconnected, reconnecting in 5s...");
+            if (wsAuthenticated) {
+                log.info("WebSocket disconnected, reconnecting...");
+            } else {
+                wsFailedAttempts++;
+                if (wsFailedAttempts === 1 && opened) {
+                    log.warn(
+                        `Server closed the WebSocket before authentication completed; check that API_KEY matches the server. Retrying every ${WS_RECONNECT_DELAY_MS / 1000}s`,
+                    );
+                } else if (wsFailedAttempts === 1) {
+                    log.info(
+                        `Cannot reach the server WebSocket at ${WS_URL} yet; retrying every ${WS_RECONNECT_DELAY_MS / 1000}s. ` +
+                            "This is normal while the game server is still starting. If it persists after the server is up, " +
+                            "check that API_ENABLED is true on the server and API_KEY matches.",
+                    );
+                } else if (wsFailedAttempts % WS_FAILURE_LOG_EVERY === 0) {
+                    log.info(`WebSocket still not connected (${wsFailedAttempts} attempts)`);
+                }
+            }
             ws = null;
             if (wsHeartbeatTimer) {
                 clearInterval(wsHeartbeatTimer);
                 wsHeartbeatTimer = null;
             }
-            wsReconnectTimer = setTimeout(connectWebSocket, 5000);
+            wsReconnectTimer = setTimeout(connectWebSocket, WS_RECONNECT_DELAY_MS);
         };
 
-        ws.onerror = (_event) => {
-            // WebSocket error events don't contain useful error details in the browser API
-            // The actual error will trigger onclose, so we just log that an error occurred
-            console.error(`[Discord Bot] WebSocket connection error - will attempt reconnection`);
-        };
+        // Error events carry no details; the close event that always follows does the logging.
+        ws.onerror = () => {};
     } catch (error) {
         if (error instanceof Error) {
-            console.error(`[Discord Bot] Failed to create WebSocket: ${error.message}`);
+            log.error(`Failed to create WebSocket: ${error.message}`);
         }
-        wsReconnectTimer = setTimeout(connectWebSocket, 5000);
+        wsReconnectTimer = setTimeout(connectWebSocket, WS_RECONNECT_DELAY_MS);
     }
 }
 
@@ -347,7 +424,7 @@ function connectWebSocket(): void {
  */
 function sendChatToGame(author: string, message: string): boolean {
     if (!ws || ws.readyState !== WebSocket.OPEN || !wsAuthenticated) {
-        console.log("[Discord Bot] WebSocket not ready, cannot send chat");
+        log.info("WebSocket not ready, cannot send chat");
         return false;
     }
 
@@ -361,7 +438,7 @@ function sendChatToGame(author: string, message: string): boolean {
         return true;
     } catch (error) {
         if (error instanceof Error) {
-            console.error(`[Discord Bot] Failed to send chat to game: ${error.message}`);
+            log.error(`Failed to send chat to game: ${error.message}`);
         }
         return false;
     }
@@ -390,155 +467,289 @@ function isRateLimited(userId: string): boolean {
     return false;
 }
 
-// Auto-updating status dashboard
-async function updateLiveDashboard() {
-    if (!STATUS_DASHBOARD_CHANNEL_ID) {
-        return;
+// ============================================================================
+// STATUS DASHBOARD
+// ============================================================================
+// The dashboard message is owned by one deployment: a UUID generated on first
+// boot, persisted to the bot's volume, and stamped into the embed footer. The
+// stamp lets the bot re-adopt its own message across restarts and refuse to
+// touch a dashboard owned by another deployment sharing the channel.
+
+const dashboardLog = createLogger("Dashboard");
+const DASHBOARD_STATE_FILE = "/data/dashboard-state.json";
+
+interface DashboardState {
+    // null only in degraded mode (persistence unavailable): no id is stamped
+    // and adoption falls back to title-based matching.
+    ownerId: string | null;
+    // Tracked dashboard message per channel id.
+    messageIds: Record<string, string>;
+}
+
+const dashboardState: DashboardState = { ownerId: null, messageIds: {} };
+let dashboardStateWritable = false;
+let dashboardUpdateInFlight = false;
+const warnedForeignOwnerIds = new Set<string>();
+
+/**
+ * Loads (or initializes) the persisted dashboard state. A missing file is a
+ * normal first boot — the id is never recovered from channel contents, since
+ * that could steal a foreign deployment's dashboard.
+ */
+function loadDashboardState(): void {
+    let raw: string | null = null;
+    try {
+        raw = readFileSync(DASHBOARD_STATE_FILE, "utf8");
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+            dashboardLog.warn(`Could not read ${DASHBOARD_STATE_FILE} (${error}) - treating as first boot`);
+        }
     }
 
-    try {
-        const channel = (await client.channels.fetch(STATUS_DASHBOARD_CHANNEL_ID)) as TextChannel;
-        if (!channel?.isTextBased()) {
-            console.error("[Dashboard] Target channel not found or is not text-based.");
+    if (raw !== null) {
+        const persisted = parseDashboardState(raw);
+        if (persisted) {
+            dashboardState.ownerId = persisted.ownerId;
+            dashboardState.messageIds = persisted.messageIds;
+            dashboardStateWritable = true;
+            dashboardLog.info(`Ownership id: ${dashboardState.ownerId}`);
             return;
         }
+        dashboardLog.warn(`${DASHBOARD_STATE_FILE} has no usable ownerId - treating as first boot`);
+    }
 
-        const status: ServerStatus | null = await fetchServerStatus();
+    dashboardState.ownerId = crypto.randomUUID();
+    dashboardState.messageIds = {};
+    dashboardStateWritable = true;
+    persistDashboardState();
+    if (dashboardStateWritable) {
+        dashboardLog.info(`Ownership id created: ${dashboardState.ownerId}`);
+    }
+}
 
-        const embed = new EmbedBuilder()
-            .setTitle("🧑‍🌾 Stardew Valley Server Status Dashboard")
-            .setTimestamp()
-            .setFooter({ text: `Automatically updates every ${STATUS_DASHBOARD_REFRESH_RATE_FORMATTED}` });
+/**
+ * Atomically persists the dashboard state (tmp file + rename). A failed write
+ * at any point drops the bot into degraded mode: the ownership guard is
+ * disabled and the footer is written without an id, so a later healthy boot
+ * can re-adopt the message via the legacy branch and re-stamp it.
+ */
+function persistDashboardState(): void {
+    if (!dashboardStateWritable) {
+        return;
+    }
+    try {
+        mkdirSync(dirname(DASHBOARD_STATE_FILE), { recursive: true });
+        const tmpFile = `${DASHBOARD_STATE_FILE}.tmp`;
+        writeFileSync(tmpFile, JSON.stringify(dashboardState));
+        renameSync(tmpFile, DASHBOARD_STATE_FILE);
+    } catch (error) {
+        dashboardStateWritable = false;
+        dashboardState.ownerId = null;
+        dashboardLog.warn(
+            `Cannot persist ${DASHBOARD_STATE_FILE} (${error}) - ownership guard disabled. ` +
+                "The dashboard still updates, but a second deployment sharing this channel is no longer detected. " +
+                "Check that the bot's /data volume is mounted and writable.",
+        );
+    }
+}
 
-        if (!status?.isOnline) {
-            embed
-                .setColor(Colors.Red)
-                .setDescription(
-                    "🔴 **The server is currently offline.**\n\n_No game data can be pulled right now. Check back later!_",
-                );
-        } else {
-            const seasonEmojis: Record<string, string> = {
-                spring: "🌸 Spring",
-                summer: "☀️ Summer",
-                fall: "🍂 Fall",
-                winter: "❄️ Winter",
-            };
-            const formattedSeason = seasonEmojis[status.season?.toLowerCase()] || status.season;
+/** Remembers the dashboard message of a channel. */
+function trackMessage(channelId: string, messageId: string): void {
+    dashboardState.messageIds[channelId] = messageId;
+    persistDashboardState();
+}
 
-            embed.setColor(Colors.Blue).addFields(
-                { name: "🏡 Farm Name", value: status.farmName || "Our Farm", inline: true },
-                { name: "🗺️ Farm Layout", value: getFarmTypeName(status.farmTypeKey), inline: true },
-                {
-                    name: "📶 Server Status",
-                    value: status.isReady ? "✅ Ready & Running" : "⏳ Saving / Loading",
-                    inline: true,
-                },
-                {
-                    name: "👥 Active Players",
-                    value: `**${status.playerCount} / ${status.maxPlayers}** ${status.isPaused ? "_(Paused)_" : ""}`,
-                    inline: true,
-                },
-                {
-                    name: "📅 In-Game Date",
-                    value: `Year ${status.year}, ${formattedSeason}, Day ${status.day}`,
-                    inline: true,
-                },
-                { name: "⏰ Clock Time", value: formatStardewTime(status.timeOfDay), inline: true },
-                {
-                    name: "🔑 Connection Code",
-                    value: `\`${status.steamInviteCode || status.gogInviteCode || "None Available"}\``,
-                    inline: false,
-                },
-            );
-        }
+/** Forgets a channel's tracked dashboard message so the next update rescans that channel. */
+function clearTrackedMessage(channelId: string): void {
+    delete dashboardState.messageIds[channelId];
+    persistDashboardState();
+}
 
-        // Dispatch/edit
-        if (targetMessageId) {
+/** Builds the dashboard embed from the current server status. */
+async function fetchDashboardEmbed(): Promise<EmbedBuilder> {
+    const status = await fetchServerStatus();
+    const lastChecked = new Date().toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+    const footer = formatFooter(STATUS_DASHBOARD_REFRESH_RATE, dashboardState.ownerId, lastChecked);
+    return buildDashboardEmbed(status, resolveServerState(status), footer, lastKnownStatus);
+}
+
+/** Interval entry point: updates the dashboard in every matching channel, skipping ticks that overlap. */
+async function updateLiveDashboard(): Promise<void> {
+    if (!DASHBOARD_CHANNEL || dashboardUpdateInFlight) {
+        return;
+    }
+    dashboardUpdateInFlight = true;
+    try {
+        const embed = await fetchDashboardEmbed();
+        for (const channel of resolveChannels(DASHBOARD_CHANNEL)) {
             try {
-                const existingMsg = await channel.messages.fetch(targetMessageId);
-                await existingMsg.edit({ content: "", embeds: [embed] });
-                console.log("[Dashboard] Live status display updated successfully.");
+                await runDashboardUpdate(channel, embed);
+            } catch (error) {
+                dashboardLog.error(`Update failed in #${channel.name} (${channel.guild.name}): ${error}`);
+            }
+        }
+    } catch (error) {
+        dashboardLog.error(`Loop execution failed: ${error}`);
+    } finally {
+        dashboardUpdateInFlight = false;
+    }
+}
+
+/**
+ * Updates one channel's dashboard: edits the tracked message when it is still ours,
+ * otherwise scans the channel to adopt our dashboard or posts a fresh one.
+ */
+async function runDashboardUpdate(channel: PostableChannel, embed: EmbedBuilder): Promise<void> {
+    const where = `#${channel.name} (${channel.guild.name})`;
+
+    // Primary path: edit the tracked message.
+    const trackedId = dashboardState.messageIds[channel.id];
+    if (trackedId) {
+        let existing: Message | null = null;
+        try {
+            // force: bypass the message cache (populated by our own edits), or a
+            // deletion / foreign takeover of the tracked message is never seen.
+            existing = await channel.messages.fetch({ message: trackedId, force: true });
+        } catch (error) {
+            if (error instanceof DiscordAPIError && error.code === RESTJSONErrorCodes.UnknownMessage) {
+                dashboardLog.info(`Tracked message in ${where} was deleted - scanning for a replacement`);
+                clearTrackedMessage(channel.id);
+            } else {
+                // Transient failure (network, 5xx, rate limit, permissions): keep the id
+                // and retry next tick — falling through to the scan here is what would
+                // duplicate the dashboard.
+                dashboardLog.error(`Could not fetch tracked message (${error}) - retrying next tick`);
                 return;
-            } catch (_err) {
-                console.log("[Dashboard] Saved message ID missing or deleted. Generating a replacement entry...");
             }
         }
 
-        // Fallback
-        const recentMessages = await channel.messages.fetch({ limit: 10 });
-        const botOldMessage = recentMessages.find((m) => m.author.id === client.user?.id);
-
-        if (botOldMessage) {
-            targetMessageId = botOldMessage.id;
-            await botOldMessage.edit({ content: "", embeds: [embed] });
-            console.log("[Dashboard] Recovered old message reference and applied edits.");
-        } else {
-            const newMsg = await channel.send({ embeds: [embed] });
-            targetMessageId = newMsg.id;
-            console.log("[Dashboard] Fresh status message initialized.");
+        if (existing) {
+            const kind = classifyDashboardEmbed(existing.embeds[0], dashboardState.ownerId);
+            if (kind === "mine" || kind === "legacy") {
+                await existing.edit({ content: "", embeds: [embed] });
+                return;
+            }
+            dashboardLog.warn(`Tracked message in ${where} is not our dashboard anymore - scanning for a replacement`);
+            clearTrackedMessage(channel.id);
         }
+    }
+
+    // Scan path: classify recent bot-authored messages and adopt our dashboard.
+    let recentMessages: Awaited<ReturnType<typeof channel.messages.fetch>>;
+    try {
+        recentMessages = await channel.messages.fetch({ limit: 50 });
     } catch (error) {
-        console.error(`[Dashboard] Loop execution failed: ${error}`);
+        dashboardLog.error(`Message scan failed (${error}) - retrying next tick`);
+        return;
     }
-}
 
-// Helper to transform Stardew's 24h int format (e.g., 600, 1620) into standard time
-function formatStardewTime(timeInt: number): string {
-    if (timeInt === undefined || timeInt === null) {
-        return "??:??";
+    const ownDashboards: { message: Message; kind: DashboardMessageKind }[] = [];
+    for (const message of recentMessages.values()) {
+        if (message.author.id !== client.user?.id) {
+            continue;
+        }
+        const kind = classifyDashboardEmbed(message.embeds[0], dashboardState.ownerId);
+        if (kind === "mine" || kind === "legacy") {
+            ownDashboards.push({ message, kind });
+        } else if (kind === "foreign") {
+            const foreignId = parseOwnerId(message.embeds[0]?.footer?.text) ?? "unknown";
+            const warningKey = `${channel.id}:${foreignId}`;
+            if (!warnedForeignOwnerIds.has(warningKey)) {
+                warnedForeignOwnerIds.add(warningKey);
+                dashboardLog.warn(
+                    `${where} has a dashboard owned by another deployment (id:${foreignId}) - ` +
+                        "leaving it untouched. Each server needs its own bot application and channel setup.",
+                );
+            }
+        }
     }
-    const hours24 = Math.floor(timeInt / 100);
-    const minutes = timeInt % 100;
-    const ampm = hours24 >= 12 ? "PM" : "AM";
-    let hours12 = hours24 % 12;
-    if (hours12 === 0) {
-        hours12 = 12;
-    }
-    const minutesStr = minutes < 10 ? `0${minutes}` : minutes;
-    return `${hours12}:${minutesStr} ${ampm}`;
-}
 
-// Helper to match Stardew Farm types cleanly
-function getFarmTypeName(key: string): string {
-    const types: Record<string, string> = {
-        Standard: "Standard 🌾",
-        Riverland: "Riverland 🐟",
-        Forest: "Forest 🌲",
-        Hilltop: "Hilltop ⛏️",
-        Wilderness: "Wilderness 🦁",
-        FourCorners: "Four Corners 🗺️",
-        Beach: "Beach 🏖️",
-        MeadowlandsFarm: "Meadowlands 🐓",
-    };
-    return types[key] || key || "Unknown Type";
+    // fetch() returns newest-first; prefer a stamped dashboard over a legacy one.
+    const adopted = ownDashboards.find((d) => d.kind === "mine") ?? ownDashboards.find((d) => d.kind === "legacy");
+
+    if (adopted) {
+        trackMessage(channel.id, adopted.message.id);
+        // The edit re-stamps: legacy dashboards get the id on adoption.
+        await adopted.message.edit({ content: "", embeds: [embed] });
+        dashboardLog.info(`Adopted existing ${adopted.kind} dashboard message in ${where}`);
+    } else {
+        const newMsg = await channel.send({ embeds: [embed] });
+        trackMessage(channel.id, newMsg.id);
+        dashboardLog.info(`Fresh status message posted in ${where}`);
+    }
+
+    // Best-effort cleanup of our own surplus dashboards. Skipped in degraded mode,
+    // where "mine" is title-based and could match a foreign deployment's dashboard.
+    if (dashboardState.ownerId !== null) {
+        for (const { message } of ownDashboards) {
+            if (message.id === dashboardState.messageIds[channel.id]) {
+                continue;
+            }
+            try {
+                await message.delete();
+                dashboardLog.info(`Deleted a surplus dashboard message of ours in ${where}`);
+            } catch (error) {
+                dashboardLog.warn(`Could not delete a surplus dashboard message in ${where}: ${error}`);
+            }
+        }
+    }
 }
 
 // ============================================================================
 // MAIN MESSAGE EVENT ROUTER (Commands + Chat Relay)
 // ============================================================================
+
+const COMMANDS = ["!status", "!players", "!server", "!help"];
+
+/**
+ * The command in a message addressed to this bot (`@Bot !status`), or null. The mention
+ * is what tells several bots in one Discord server apart and keeps these commands from
+ * colliding with the game's own `!` commands typed into the chat relay.
+ */
+function parseCommand(message: Message): string | null {
+    const botId = client.user?.id;
+    if (!botId || !message.mentions.has(botId)) {
+        return null;
+    }
+    const input = message.content
+        .replace(new RegExp(`<@!?${botId}>`, "g"), "")
+        .trim()
+        .toLowerCase();
+    return COMMANDS.includes(input) ? input : null;
+}
+
+/** Replies to a message, logging instead of throwing when the bot may not post in that channel. */
+async function reply(message: Message, content: string): Promise<Message | null> {
+    try {
+        return await message.reply(content);
+    } catch (error) {
+        const channelName = message.channel.isDMBased() ? "a DM" : `#${message.channel.name}`;
+        log.error(`Could not reply in ${channelName} (${message.guild?.name ?? "no guild"}): ${error}`);
+        return null;
+    }
+}
+
 client.on(Events.MessageCreate, async (message: Message) => {
     // Ignore bot messages
     if (message.author.bot) {
         return;
     }
 
-    const input = message.content.trim().toLowerCase();
-
     // --------------------------------------------------------------------------
     // BOT COMMAND HANDLING
     // --------------------------------------------------------------------------
 
-    const validCommands = ["!status", "!players", "!server", "!help"];
-    const isCommand = validCommands.includes(input);
-    if (isCommand) {
+    // The relay and dashboard channels keep their own purpose; commands there are
+    // treated like any other message (relayed into the game, or ignored).
+    const inOwnChannel =
+        (CHAT_CHANNEL !== null && isConfiguredChannel(message.channel, CHAT_CHANNEL)) ||
+        (DASHBOARD_CHANNEL !== null && isConfiguredChannel(message.channel, DASHBOARD_CHANNEL));
+    const input = inOwnChannel ? null : parseCommand(message);
+    if (input) {
         if (isRateLimited(message.author.id)) {
-            try {
-                const reply = await message.reply(
-                    "⏳ **Whoa, slow down!** You're sending commands too quickly. Please wait a bit before trying again.",
-                );
-                setTimeout(() => reply.delete().catch(() => {}), 5000);
-            } catch (err) {
-                console.error(`[Rate Limit] Failed to send cooldown warning: ${err}`);
+            const warning = await reply(message, "Too many commands; please wait a moment before trying again.");
+            if (warning) {
+                setTimeout(() => warning.delete().catch(() => {}), 5000);
             }
             return;
         }
@@ -547,33 +758,20 @@ client.on(Events.MessageCreate, async (message: Message) => {
         if (input === "!status") {
             try {
                 const status: ServerStatus | null = await fetchServerStatus();
+                const state = resolveServerState(status);
 
                 if (!status?.isOnline) {
-                    await message.reply("❌ **Server Status:** The server is currently offline.");
+                    await reply(message, `**Status:** ${formatStateLine(state)}`);
                     return;
                 }
 
-                const seasonEmojis: Record<string, string> = {
-                    spring: "🌸 Spring",
-                    summer: "☀️ Summer",
-                    fall: "🍂 Fall",
-                    winter: "❄️ Winter",
-                };
-                const formattedSeason = seasonEmojis[status.season?.toLowerCase()] || status.season;
-
                 const lines = [
-                    `🏡 **Farm Name:** ${status.farmName}`,
-                    `🗺️ **Farm Type:** ${getFarmTypeName(status.farmTypeKey)}`,
-                    `👥 **Players:** ${status.playerCount}/${status.maxPlayers} ${status.isPaused ? "(⏸️ Paused)" : "(▶️ Live)"}`,
-                    `📅 **Date:** Day ${status.day} of ${formattedSeason}, Year ${status.year}`,
-                    `⏰ **Time:** ${formatStardewTime(status.timeOfDay)}`,
-                    `📡 **Server State:** ${status.isReady ? "Ready ✓" : "Busy (Saving/Transitioning) ⏳"}`,
-                    `🔑 **Invite Code:** \`${status.steamInviteCode || status.gogInviteCode || "None"}\``,
+                    `**Status:** ${formatStateLine(state)}`,
+                    ...buildStatusFields(status).map((field) => `**${field.name}:** ${field.value}`),
                 ];
-
-                await message.reply(lines.join("\n"));
+                await reply(message, lines.join("\n"));
             } catch (_e) {
-                await message.reply("⚠️ Failed to load server status.");
+                await reply(message, "Could not load the server status.");
             }
             return;
         }
@@ -591,22 +789,16 @@ client.on(Events.MessageCreate, async (message: Message) => {
                     ),
                 ]);
 
-                const onlineList = playersRes.players.filter((p) => p.isOnline).map((p) => `• 🟢 **${p.name}**`);
+                const online = playersRes.players.filter((p) => p.isOnline).map((p) => p.name);
 
                 const lines = [
-                    `📊 **Roster Information**`,
-                    `━━━━━━━━━━━━━━━━━━━━━━━━`,
-                    `🟢 **Online Now (${onlineList.length}):**`,
-                    onlineList.length ? onlineList.join("\n") : "• Nobody online",
-                    `\n🛖 **Cabin Strategy & Real Estate:**`,
-                    `• Total Cabins Built: **${cabinsRes.totalCount}**`,
-                    `• Assigned to Players: **${cabinsRes.assignedCount}**`,
-                    `• Available Vacancies: **${cabinsRes.availableCount}**`,
+                    `**Online (${online.length}):** ${online.length ? online.join(", ") : "nobody"}`,
+                    `**Cabins:** ${cabinsRes.totalCount} built, ${cabinsRes.assignedCount} assigned, ${cabinsRes.availableCount} available`,
                 ];
 
-                await message.reply(lines.join("\n"));
+                await reply(message, lines.join("\n"));
             } catch (_e) {
-                await message.reply("⚠️ Failed to parse player lists and cabin layouts.");
+                await reply(message, "Could not load the player list.");
             }
             return;
         }
@@ -623,23 +815,18 @@ client.on(Events.MessageCreate, async (message: Message) => {
                 ]);
 
                 const lines = [
-                    `⚙️ **Server Configuration & Telemetry**`,
-                    `━━━━━━━━━━━━━━━━━━━━━━━━`,
-                    `🖥️ **Performance Metrics:**`,
-                    `• Tick Speed: **${stats.tps.toFixed(1)} / ${stats.targetTps} TPS** (Ticks Per Sec)`,
-                    `• (Web)VNC Frame Rate: **${stats.fps.toFixed(1)} FPS**`,
-                    `• Average Tick Time: **${stats.avgTickMs.toFixed(2)} ms**`,
-                    `• Ram Overhead: **${stats.memoryMb.toFixed(1)} MB**`,
-                    `\n🛠️ **Gameplay Rules:**`,
-                    `• Wallet-Type: **${settings.server.separateWallets ? "💰 Separate Wallets" : "🤝 Shared Wallet"}**`,
-                    `• Profit Margin Multiplier: **${settings.game.profitMargin}x**`,
-                    `• Night Monsters Spawn: **${settings.game.spawnMonstersAtNight}**`,
-                    `• Cabin Strategy: \`${settings.server.cabinStrategy}\` ([Learn More](https://stardew-valley-dedicated-server.github.io/server/features/cabin-strategies.html#cabinstack-default))`,
+                    `**Tick rate:** ${stats.tps.toFixed(1)} / ${stats.targetTps} TPS, ${stats.avgTickMs.toFixed(2)} ms per tick`,
+                    `**Frame rate:** ${stats.fps.toFixed(1)} FPS`,
+                    `**Memory:** ${stats.memoryMb.toFixed(1)} MB`,
+                    `**Wallets:** ${settings.server.separateWallets ? "separate" : "shared"}`,
+                    `**Profit margin:** ${settings.game.profitMargin}x`,
+                    `**Monsters at night:** ${settings.game.spawnMonstersAtNight}`,
+                    `**Cabin strategy:** \`${settings.server.cabinStrategy}\` (<https://docs.junimoserver.com/features/cabin-strategies>)`,
                 ];
 
-                await message.reply(lines.join("\n"));
+                await reply(message, lines.join("\n"));
             } catch (_e) {
-                await message.reply("⚠️ Failed to retrieve system performance diagnostics.");
+                await reply(message, "Could not load the server settings.");
             }
             return;
         }
@@ -647,13 +834,13 @@ client.on(Events.MessageCreate, async (message: Message) => {
         // COMMAND: !help
         if (input === "!help") {
             const helpLines = [
-                `🤖 **Stardew Server Bot Commands:**`,
-                `• \`!status\` - View current farm date, time, player counts, and invite codes.`,
-                `• \`!players\` - List who is online, and cabin availability.`,
-                `• \`!server\` - Check hardware telemetry (TPS/FPS/RAM) and farm settings.`,
-                `• \`!help\` - Display this command map.`,
+                `**Commands** (mention me, e.g. <@${client.user?.id}> !status):`,
+                `\`!status\` - server state, players, in-game date, versions, tick rate, and the invite code`,
+                `\`!players\` - who is online, and cabin availability`,
+                `\`!server\` - tick rate, memory, and gameplay settings`,
+                `\`!help\` - this list`,
             ];
-            await message.reply(helpLines.join("\n"));
+            await reply(message, helpLines.join("\n"));
             return;
         }
     }
@@ -662,7 +849,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
     // PART 2: PASSIVE CHAT RELAY
     // --------------------------------------------------------------------------
     // If the message made it past the commands above, check if it's meant for the game chat
-    if (message.channel.id !== DISCORD_CHAT_CHANNEL_ID) {
+    if (!CHAT_CHANNEL || !isConfiguredChannel(message.channel, CHAT_CHANNEL)) {
         return;
     }
 
@@ -677,10 +864,126 @@ client.on(Events.MessageCreate, async (message: Message) => {
             await message.react("❌");
         } catch (error) {
             if (error instanceof Error) {
-                console.error(`[Discord Bot] Failed to add reaction: ${error.message}`);
+                log.error(`Failed to add reaction: ${error.message}`);
             }
         }
     }
+});
+
+// ============================================================================
+// GUILD CHECKS
+// ============================================================================
+
+interface ChannelRequirements {
+    setting: string;
+    required: [PermissionResolvable, string][];
+    optional: [PermissionResolvable, string, string][];
+}
+
+const CHAT_CHANNEL_REQUIREMENTS: ChannelRequirements = {
+    setting: "DISCORD_CHAT_CHANNEL",
+    required: [
+        [PermissionFlagsBits.ViewChannel, "VIEW_CHANNEL"],
+        [PermissionFlagsBits.SendMessages, "SEND_MESSAGES"],
+    ],
+    optional: [
+        [PermissionFlagsBits.ReadMessageHistory, "READ_MESSAGE_HISTORY", "may miss some messages"],
+        [PermissionFlagsBits.AddReactions, "ADD_REACTIONS", "cannot show failure indicators"],
+    ],
+};
+
+const DASHBOARD_CHANNEL_REQUIREMENTS: ChannelRequirements = {
+    setting: "STATUS_DASHBOARD_CHANNEL",
+    required: [
+        [PermissionFlagsBits.ViewChannel, "VIEW_CHANNEL"],
+        [PermissionFlagsBits.SendMessages, "SEND_MESSAGES"],
+        [PermissionFlagsBits.EmbedLinks, "EMBED_LINKS"],
+    ],
+    optional: [
+        [
+            PermissionFlagsBits.ReadMessageHistory,
+            "READ_MESSAGE_HISTORY",
+            "cannot recover the dashboard message after a restart",
+        ],
+    ],
+};
+
+/** The configured channels with what the bot needs in them; empty when neither feature is set. */
+const CONFIGURED_CHANNELS: [ChannelRef, string, ChannelRequirements][] = [];
+if (CHAT_CHANNEL) {
+    CONFIGURED_CHANNELS.push([CHAT_CHANNEL, CHAT_CHANNEL_REQUIREMENTS.setting, CHAT_CHANNEL_REQUIREMENTS]);
+}
+if (DASHBOARD_CHANNEL) {
+    CONFIGURED_CHANNELS.push([
+        DASHBOARD_CHANNEL,
+        DASHBOARD_CHANNEL_REQUIREMENTS.setting,
+        DASHBOARD_CHANNEL_REQUIREMENTS,
+    ]);
+}
+
+interface GuildFindings {
+    errors: string[];
+    warnings: string[];
+}
+
+/**
+ * Resolves each configured channel in one guild and checks the bot's permissions there.
+ * A name is expected in every guild, so a guild without it gets a warning; a missing id
+ * is reported once, across guilds, by the startup checks.
+ */
+function checkGuild(guild: Guild): GuildFindings {
+    const findings: GuildFindings = { errors: [], warnings: [] };
+
+    if (!guild.members.me?.permissions.has(PermissionFlagsBits.ChangeNickname)) {
+        findings.warnings.push(`Missing CHANGE_NICKNAME permission in "${guild.name}" - cannot update bot nickname`);
+    }
+
+    for (const [ref, setting, requirements] of CONFIGURED_CHANNELS) {
+        const channels = resolveChannelsIn(guild, ref);
+        if (channels.length === 0) {
+            if (ref.kind === "name") {
+                findings.warnings.push(`${describeChannelRef(ref)} not found in "${guild.name}" - check ${setting}`);
+            }
+            continue;
+        }
+        if (channels.length > 1) {
+            findings.warnings.push(
+                `${describeChannelRef(ref)} matches ${channels.length} channels in "${guild.name}" - all of them are used`,
+            );
+        }
+        for (const channel of channels) {
+            const permissions = guild.members.me ? channel.permissionsFor(guild.members.me) : null;
+            const at = `#${channel.name} in "${guild.name}"`;
+            for (const [permission, name] of requirements.required) {
+                if (!permissions?.has(permission)) {
+                    findings.errors.push(`Missing ${name} permission in ${at}`);
+                }
+            }
+            for (const [permission, name, consequence] of requirements.optional) {
+                if (!permissions?.has(permission)) {
+                    findings.warnings.push(`Missing ${name} permission in ${at} - ${consequence}`);
+                }
+            }
+            log.info(`${setting}: ${at}`);
+        }
+    }
+    return findings;
+}
+
+// A guild joined while running is served on the next tick; check it now so a missing
+// channel or permission shows up in the log right away instead of as a failed update.
+client.on(Events.GuildCreate, (guild) => {
+    log.info(`Joined "${guild.name}"`);
+    const findings = checkGuild(guild);
+    for (const warning of findings.warnings) {
+        log.warn(`Guild check: ${warning}`);
+    }
+    for (const error of findings.errors) {
+        log.error(`Guild check: ${error}`);
+    }
+    updateBotNickname().catch((error) => {
+        log.error(`Nickname update failed: ${error instanceof Error ? error.message : error}`);
+    });
 });
 
 /**
@@ -688,115 +991,63 @@ client.on(Events.MessageCreate, async (message: Message) => {
  * Logs warnings for any missing permissions or configuration issues.
  */
 async function performStartupChecks(): Promise<void> {
-    console.log("[Discord Bot] Performing startup checks...");
+    log.info("Performing startup checks...");
 
     const warnings: string[] = [];
     const errors: string[] = [];
 
     // Check guilds
     const guildCount = client.guilds.cache.size;
-    console.log(`[Discord Bot] Connected to ${guildCount} guild(s)`);
+    log.info(`Connected to ${guildCount} guild(s)`);
 
     if (guildCount === 0) {
         warnings.push("Bot is not in any guilds - invite it to a server first");
     }
 
-    // Check chat channel if configured
-    if (DISCORD_CHAT_CHANNEL_ID) {
-        const chatChannel = client.channels.cache.get(DISCORD_CHAT_CHANNEL_ID);
-
-        if (!chatChannel) {
-            errors.push(`Chat channel ${DISCORD_CHAT_CHANNEL_ID} not found - check DISCORD_CHAT_CHANNEL_ID`);
-        } else if (!chatChannel.isTextBased()) {
-            errors.push(`Channel ${DISCORD_CHAT_CHANNEL_ID} is not a text channel`);
-        } else {
-            // Check permissions in the chat channel
-            const channel = chatChannel as TextChannel;
-            const botMember = channel.guild.members.me;
-
-            if (botMember) {
-                const permissions = channel.permissionsFor(botMember);
-
-                if (!permissions?.has(PermissionFlagsBits.ViewChannel)) {
-                    errors.push(`Missing VIEW_CHANNEL permission in chat channel "${channel.name}"`);
-                }
-                if (!permissions?.has(PermissionFlagsBits.SendMessages)) {
-                    errors.push(`Missing SEND_MESSAGES permission in chat channel "${channel.name}"`);
-                }
-                if (!permissions?.has(PermissionFlagsBits.ReadMessageHistory)) {
-                    warnings.push(
-                        `Missing READ_MESSAGE_HISTORY permission in chat channel "${channel.name}" - may miss some messages`,
-                    );
-                }
-                if (!permissions?.has(PermissionFlagsBits.AddReactions)) {
-                    warnings.push(
-                        `Missing ADD_REACTIONS permission in chat channel "${channel.name}" - cannot show failure indicators`,
-                    );
-                }
-
-                console.log(`[Discord Bot] Chat channel: #${channel.name} in ${channel.guild.name}`);
-            }
+    // An id targets one channel, so it is an error only when no guild has it. A name is
+    // checked per guild below.
+    for (const [ref, setting] of CONFIGURED_CHANNELS) {
+        if (ref.kind === "id" && resolveChannels(ref).length === 0) {
+            errors.push(`${describeChannelRef(ref)} not found in any server the bot is in - check ${setting}`);
         }
     }
 
-    // Check permissions in each guild
     for (const guild of client.guilds.cache.values()) {
-        const botMember = guild.members.me;
-        if (!botMember) {
-            continue;
-        }
-
-        // Check nickname permission
-        if (!botMember.permissions.has(PermissionFlagsBits.ChangeNickname)) {
-            warnings.push(`Missing CHANGE_NICKNAME permission in "${guild.name}" - cannot update bot nickname`);
-        }
+        const findings = checkGuild(guild);
+        errors.push(...findings.errors);
+        warnings.push(...findings.warnings);
     }
 
-    // Check API connectivity
-    try {
-        const status = await fetchServerStatus();
-        if (status) {
-            console.log(`[Discord Bot] API connectivity: OK (server ${status.isOnline ? "online" : "offline"})`);
-        } else {
-            warnings.push("Could not fetch server status - API may be unavailable");
-        }
-    } catch {
-        warnings.push("API connectivity check failed");
+    // fetchServerStatus logs its own failure, so only success is reported here
+    const status = await fetchServerStatus();
+    if (status) {
+        log.info(`API connectivity: OK (server ${resolveServerState(status).kind})`);
     }
 
-    // Print warnings
-    if (warnings.length > 0) {
-        console.log("");
-        console.log("[Discord Bot] ⚠️  Warnings:");
-        for (const warning of warnings) {
-            console.log(`  - ${warning}`);
-        }
+    for (const warning of warnings) {
+        log.warn(`Startup check: ${warning}`);
     }
-
-    // Print errors
-    if (errors.length > 0) {
-        console.log("");
-        console.log("[Discord Bot] ❌ Errors:");
-        for (const error of errors) {
-            console.log(`  - ${error}`);
-        }
+    for (const error of errors) {
+        log.error(`Startup check: ${error}`);
     }
-
     if (warnings.length === 0 && errors.length === 0) {
-        console.log("[Discord Bot] All checks passed ✓");
+        log.info("All startup checks passed");
     }
-
-    console.log("");
 }
 
 client.once(Events.ClientReady, async () => {
-    console.log(`[Discord Bot] Logged in as ${client.user?.tag}`);
-    console.log(`[Discord Bot] API URL: ${API_URL}`);
-    console.log(`[Discord Bot] API authentication: ${API_KEY ? "enabled" : "disabled"}`);
-    console.log(`[Discord Bot] Update interval: ${UPDATE_INTERVAL_MS}ms`);
+    log.info(`Logged in as ${client.user?.tag}`);
+    log.info(`API URL: ${API_URL}`);
+    log.info(`API authentication: ${API_KEY ? "enabled" : "disabled"}`);
+    log.info(`Update interval: ${UPDATE_INTERVAL_MS}ms`);
 
-    if (DISCORD_CHAT_CHANNEL_ID) {
-        console.log(`[Discord Bot] Chat relay channel: ${DISCORD_CHAT_CHANNEL_ID}`);
+    if (CHAT_CHANNEL) {
+        log.info(`Chat relay channel: ${describeChannelRef(CHAT_CHANNEL)}`);
+    }
+    if (DASHBOARD_CHANNEL) {
+        log.info(
+            `Status dashboard channel: ${describeChannelRef(DASHBOARD_CHANNEL)}, updating every ${STATUS_DASHBOARD_REFRESH_RATE}s`,
+        );
     }
 
     // Perform startup checks
@@ -809,7 +1060,8 @@ client.once(Events.ClientReady, async () => {
     // Connect WebSocket for chat relay
     connectWebSocket();
 
-    if (STATUS_DASHBOARD_CHANNEL_ID) {
+    if (DASHBOARD_CHANNEL) {
+        loadDashboardState();
         await updateLiveDashboard();
         setInterval(updateLiveDashboard, STATUS_DASHBOARD_REFRESH_RATE * 1000);
     }
@@ -817,24 +1069,65 @@ client.once(Events.ClientReady, async () => {
     // Periodic updates with error handling
     setInterval(() => {
         updatePresence().catch((error) => {
-            console.error(`[Discord Bot] Presence update failed: ${error instanceof Error ? error.message : error}`);
+            log.error(`Presence update failed: ${error instanceof Error ? error.message : error}`);
         });
     }, UPDATE_INTERVAL_MS);
 
     setInterval(() => {
         updateBotNickname().catch((error) => {
-            console.error(`[Discord Bot] Nickname update failed: ${error instanceof Error ? error.message : error}`);
+            log.error(`Nickname update failed: ${error instanceof Error ? error.message : error}`);
         });
     }, UPDATE_INTERVAL_MS);
 });
 
 client.on(Events.Error, (error) => {
-    console.error(`[Discord Bot] Client error: ${error.message}`);
+    log.error(`Client error: ${error.message}`);
+});
+
+client.on(Events.ShardError, (error) => {
+    log.error(`Gateway error: ${error.message}`);
+});
+
+const TOKEN_REJECTED_HINT =
+    "Discord rejected DISCORD_BOT_TOKEN. Copy a fresh token from the Developer Portal (Bot -> Reset Token).";
+const RESTART_HINT = "Bot stopped. After fixing the configuration, run: docker compose up -d discord-bot";
+
+/**
+ * Explains a configuration error and exits 0, so `restart: on-failure` does not
+ * loop against Discord's daily identify limit.
+ */
+function stopForConfigError(lines: string[]): never {
+    for (const line of lines) {
+        log.error(line);
+    }
+    log.error(RESTART_HINT);
+    process.exit(0);
+}
+
+// discord.js gives up on these close codes and then rejects an internal promise,
+// which Bun reports as a crash with a library stack trace. Exit here first.
+client.on(Events.ShardDisconnect, ({ code }) => {
+    switch (code) {
+        case GatewayCloseCodes.AuthenticationFailed:
+            stopForConfigError([TOKEN_REJECTED_HINT]);
+            break;
+        case GatewayCloseCodes.DisallowedIntents:
+            stopForConfigError([
+                "Discord refused the bot's gateway intents: DISCORD_CHAT_CHANNEL is set, so the bot requests the",
+                "Message Content intent, but it is not enabled for this application.",
+                "Fix: Developer Portal -> your app -> Bot -> Privileged Gateway Intents -> enable Message Content Intent,",
+                "or unset DISCORD_CHAT_CHANNEL to run without chat relay.",
+            ]);
+            break;
+        default:
+            log.error(`Gateway closed with unrecoverable code ${code} (${GatewayCloseCodes[code] ?? "unknown"})`);
+            process.exit(1);
+    }
 });
 
 // Graceful shutdown
 function shutdown() {
-    console.log("[Discord Bot] Shutting down...");
+    log.info("Shutting down...");
 
     if (wsReconnectTimer) {
         clearTimeout(wsReconnectTimer);
@@ -858,5 +1151,11 @@ process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
 // Start the bot
-console.log("[Discord Bot] Starting...");
-client.login(DISCORD_BOT_TOKEN);
+log.info("Starting...");
+client.login(DISCORD_BOT_TOKEN).catch((error: unknown) => {
+    if (error instanceof DiscordjsError && error.code === DiscordjsErrorCodes.TokenInvalid) {
+        stopForConfigError([TOKEN_REJECTED_HINT]);
+    }
+    log.error(`Login failed: ${error instanceof Error ? error.message : error}`);
+    process.exit(1);
+});

@@ -42,14 +42,19 @@ jobs:
       packages: write
 
     steps:
+      # github.sha IS the tagged release commit here (release-please tags before this job
+      # starts); full history + tags let the changelog resolve the previous release locally.
       - name: Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Login to DockerHub
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -64,7 +69,7 @@ jobs:
             type=raw,value=${{ needs.release-please.outputs.version }}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ./docker/Dockerfile
@@ -73,6 +78,9 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           provenance: true
           sbom: true
+          build-args: |
+            SDVD_GIT_SHA=${{ github.sha }}
+            BUILD_CONFIGURATION=Release
           secrets: |
             steam_username=${{ secrets.STEAM_USERNAME }}
             steam_password=${{ secrets.STEAM_PASSWORD }}
@@ -105,29 +113,79 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Release:** https://github.com/${{ github.repository }}/releases/tag/${{ needs.release-please.outputs.tag_name }}" >> $GITHUB_STEP_SUMMARY
 
-      - name: Discord notification
-        if: success()
+      # No continue-on-error: the Discord post below links these assets.
+      - name: Attach operator files to the release
         env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
-          RELEASE_URL: https://github.com/${{ github.repository }}/releases/tag/${{ needs.release-please.outputs.tag_name }}
-        run: |
-          if [ -n "$DISCORD_WEBHOOK" ]; then
-            jq -n \
-              --arg tag "$TAG_NAME" \
-              --arg url "$RELEASE_URL" \
-              '{
-                embeds: [{
-                  title: "New Release Published",
-                  color: 5763719,
-                  fields: [
-                    {name: "Version", value: "`\($tag)`"},
-                    {name: "How to update", value: "```docker compose pull```"},
-                    {name: "Release Notes", value: "[View Release](\($url))"}
-                  ]
-                }]
-              }' | curl -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK"
-          fi
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: gh release upload "$TAG" docker-compose.yml .env.example --clobber
+
+      # continue-on-error on both notification steps: a range or Discord failure must never
+      # red a release build that already published its images.
+      - name: Build changelog
+        id: changelog
+        continue-on-error: true
+        uses: ./.github/actions/build-changelog
+        with:
+          head: ${{ needs.release-please.outputs.tag_name }}
+          # Everything since the previous release — the stable stream carries a complete
+          # changelog even when previews already announced parts of it.
+          tag-match: v[0-9]* sdvd-server-v*
+          tag-exclude: v*-*
+
+      - name: Discord notification
+        if: steps.changelog.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/discord-notify
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_RELEASES }}
+          # Bot name: try the channel-specific variable, then the shared one, then this default.
+          # If no avatar variable is set, the action falls back to the project logo.
+          username: ${{ vars.DISCORD_BOT_USERNAME_RELEASES || vars.DISCORD_BOT_USERNAME || 'Release Bot' }}
+          avatar-url: ${{ vars.DISCORD_BOT_AVATAR_URL_RELEASES || vars.DISCORD_BOT_AVATAR_URL }}
+          # Logo green (#77FF6E) for stable releases; the preview channel uses amber. No title is set:
+          # the version headline goes in the description so it can link to the image tag.
+          color: "7864174"
+          description: |
+            # Release [${{ needs.release-please.outputs.version }}](https://hub.docker.com/r/sdvd/server/tags?name=${{ needs.release-please.outputs.version }}) is available!
+            ${{ steps.changelog.outputs.markdown }}
+          embed2-description: |
+            ## Install or update
+            Run from your server folder to update, or from an empty folder for a new server.
+            ### Linux/macOS
+            `curl -fsSL https://docs.junimoserver.com/install.sh | bash`
+            ### Windows (PowerShell)
+            `powershell -c "irm https://docs.junimoserver.com/install.ps1 | iex"`
+          buttons: >-
+            [{"label":"Upgrade guide","url":"https://docs.junimoserver.com/admins/operations/upgrading"},
+             {"label":"See all changes","url":"${{ steps.changelog.outputs.compare-url }}"}]
+
+  stamp-issue-versions:
+    name: Stamp Issue Versions
+    needs: [release-please, build-and-publish]
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Stamp issues with release version
+        uses: ./.github/actions/stamp-issue-versions
+        with:
+          # Org issue-field id for "Release version". Deleting and recreating a field
+          # changes its id — this input must then be updated.
+          field-id: "45984818"
+          field-name: Release version
+          value: ${{ needs.release-please.outputs.version }}
+          channel: release
+          head-ref: ${{ needs.release-please.outputs.tag_name }}
+          tag-match: v[0-9]* sdvd-server-v*
+          tag-exclude: v*-*
 
   build-and-publish-steam-service:
     name: Build Steam Service
@@ -178,11 +236,13 @@ jobs:
 
   deploy-docs:
     name: Deploy Documentation
-    needs: build-docs
+    needs: [build-docs, release-please]
     permissions:
       contents: read
       pages: write
       id-token: write
       actions: read
     uses: ./.github/workflows/deploy-docs.yml
+    with:
+      latest_version: ${{ needs.release-please.outputs.version }}
     secrets: inherit

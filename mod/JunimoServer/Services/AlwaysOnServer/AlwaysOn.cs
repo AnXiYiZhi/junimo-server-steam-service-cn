@@ -3,7 +3,10 @@ using System.Diagnostics;
 using System.Linq;
 using HarmonyLib;
 using JunimoServer.Services.ChatCommands;
+using JunimoServer.Services.Commands;
 using JunimoServer.Services.GameManager;
+using JunimoServer.Services.Lobby;
+using JunimoServer.Services.SaveImport;
 using JunimoServer.Services.ServerOptim;
 using JunimoServer.Shared;
 using JunimoServer.Util;
@@ -26,8 +29,6 @@ public class AlwaysOnServer : ModService
     /// </summary>
     public bool IsAutomating;
 
-    public bool clientPaused;
-
     /// <summary>
     /// Set to true when ShippingMenu should be active, then used
     /// </summary>
@@ -35,8 +36,26 @@ public class AlwaysOnServer : ModService
 
     private bool _warpingSleep;
 
-    // Shipping menu timeout reset, causes menu to be closed when bigger than `Config.EndOfDayTimeOut`
-    private int shippingMenuTimeoutTicks;
+    // Wall-clock moment the server became empty past 1:00 AM; the host sleeps once
+    // Env.AutoSleepGraceSeconds elapse without an authenticated player returning.
+    private DateTime? _emptyPastCutoffSince;
+
+    // Wall-clock moment SleepHostNow was called. While set, the pause stays off so the sleep
+    // warp and ready-check can run; cleared once the day transition starts.
+    private DateTime? _hostSleepRequestedAt;
+
+    // A requested sleep that never reached the day transition by then is abandoned so the
+    // pause re-engages and the grace timer retries it.
+    private static readonly TimeSpan HostSleepRequestTimeout = TimeSpan.FromSeconds(60);
+
+    // The last activity that held the pause off, so each one is logged once, not per tick.
+    private HostActivity _lastHoldOff;
+
+    private readonly LobbyService _lobbyService;
+    private readonly SaveImportService _saveImportService;
+
+    // Wall-clock start of the stuck-ShippingMenu window (seconds-based, so TPS-independent).
+    private DateTime? _shippingMenuTimeoutStartTime;
 
     private AlwaysOnServerFestivals alwaysOnServerFestivals;
 
@@ -49,19 +68,23 @@ public class AlwaysOnServer : ModService
         AlwaysOnConfig config,
         IModHelper helper,
         IMonitor monitor,
-        Harmony harmony
+        Harmony harmony,
+        LobbyService lobbyService,
+        SaveImportService saveImportService
     )
         : base(helper, monitor)
     {
         Config = config;
+        _lobbyService = lobbyService;
+        _saveImportService = saveImportService;
 
-        // Register chat commands
-        helper.ConsoleCommands.Add(
+        // Register console commands
+        helper.ConsoleCommands.Register(
             "host-auto",
             "Toggles host auto mode on/off",
             ToggleAutoModeCommand
         );
-        helper.ConsoleCommands.Add(
+        helper.ConsoleCommands.Register(
             "host-visibility",
             "Toggles host visibility on/off",
             ToggleVisibilityCommand
@@ -191,10 +214,12 @@ public class AlwaysOnServer : ModService
 
         // Reset all automation state regardless (OnSaveLoaded re-enables automation)
         IsAutomating = false;
-        clientPaused = false;
         _isShippingMenuActive = false;
         _warpingSleep = false;
-        shippingMenuTimeoutTicks = 0;
+        _emptyPastCutoffSince = null;
+        _hostSleepRequestedAt = null;
+        _lastHoldOff = HostActivity.None;
+        _shippingMenuTimeoutStartTime = null;
         _weddingStartTime = null;
         _handledWeddingGate = null;
         ServerOptimizerOverrides.SetAutomationInputSuppression(false);
@@ -225,7 +250,7 @@ public class AlwaysOnServer : ModService
 
                 PreSeedEarlyGameEvents();
                 PreSeedChoices();
-                HealUpgradedHostFarmhouse();
+                HealHostFarmhouse();
             }
 
             // Seed locks for cabins whose farmhands are already offline at load time.
@@ -342,9 +367,10 @@ public class AlwaysOnServer : ModService
         alwaysOnServerFestivals.HandleFestivalStart();
         alwaysOnServerFestivals.HandleFestivalLeave();
         // Per-tick: the main-event countdown announce ("Type !event…") and timeout backstop must reach
-        // players promptly. OneSecondUpdateTicked fires every 60 ticks — 12s at SERVER_TPS=5 — which
-        // delayed the announce past clients' wait windows. Countdown/timeout gating is wall-clock based
-        // (DateTime.UtcNow) and one-shot-flagged, so per-tick invocation is safe and more responsive.
+        // players promptly, and OneSecondUpdateTicked is per second at best (per 60 ticks on stock
+        // SMAPI, see one-second-update-ticked-fires-per-game-tick.md). Countdown/timeout gating is
+        // wall-clock based (DateTime.UtcNow) and one-shot-flagged, so per-tick invocation is safe and
+        // more responsive.
         alwaysOnServerFestivals.HandleFestivalEvents();
     }
 
@@ -383,7 +409,7 @@ public class AlwaysOnServer : ModService
             return;
         }
 
-        // Starts a timeout counter in OnUnvalidatedUpdateTick.
+        // Marks the ShippingMenu window active; OnUnvalidatedUpdateTick then times it out.
         // Note: The actual ShippingMenu clicking is handled by HandleShippingMenu()
         // in OnOneSecondUpdateTicked, which properly waits for the intro animation.
         _isShippingMenuActive = true;
@@ -392,25 +418,37 @@ public class AlwaysOnServer : ModService
     private void OnUnvalidatedUpdateTick(object sender, UnvalidatedUpdateTickedEventArgs e)
     {
         // Waiting for ShippingMenu/Save/EndOfDay to timeout
-        if (_isShippingMenuActive && Config.EndOfDayTimeOut != 0)
+        if (_isShippingMenuActive && Config.EndOfDayTimeOutSeconds != 0)
         {
-            shippingMenuTimeoutTicks += 1;
+            _shippingMenuTimeoutStartTime ??= DateTime.UtcNow;
 
-            if (shippingMenuTimeoutTicks >= Config.EndOfDayTimeOut * Env.ServerTps)
+            var elapsedSeconds = (
+                DateTime.UtcNow - _shippingMenuTimeoutStartTime.Value
+            ).TotalSeconds;
+            if (elapsedSeconds >= Config.EndOfDayTimeOutSeconds)
             {
                 // Prevent others from joining after timeout
                 Game1.options.setServerMode("offline");
             }
         }
 
-        if (Game1.timeOfDay == 610)
+        // Day start: the game progressed past the end-of-day save, so reset the timeout.
+        // Keyed on 600 not 610 so it still fires when the empty-server auto-pause freezes
+        // the clock at day start. The empty server then sits frozen at 600 all day, so the
+        // guards keep the body a no-op once settled instead of re-running setServerMode.
+        if (Game1.timeOfDay == 600)
         {
-            // Reset the ShippingMenu timeout since the game obviously progressed
-            _isShippingMenuActive = false;
-            shippingMenuTimeoutTicks = 0;
+            if (_isShippingMenuActive)
+            {
+                _isShippingMenuActive = false;
+                _shippingMenuTimeoutStartTime = null;
+            }
 
-            // Set online again in case the game kept going after timing out prematurely
-            Game1.options.setServerMode("online");
+            // Set online again in case the game kept going after timing out prematurely.
+            if (!Game1.options.enableServer)
+            {
+                Game1.options.setServerMode("online");
+            }
         }
     }
 
@@ -783,17 +821,15 @@ public class AlwaysOnServer : ModService
 
         // eventFinished() warped the host onto the open Farm map: the wedding's endBehaviors "wedding"
         // case sets the exit warp from getHomeOfFarmer(Game1.player).getPorchStandingSpot() (Event.cs
-        // "wedding"), and on the host Game1.player's home is the main FarmHouse, so the host lands at the
-        // farmhouse-porch tile on the Farm rather than in its FarmHouse — out of its normal hidden idle
-        // spot. Return it home, but ONLY once no wedding is still queued: on a multi-wedding day the next
-        // ceremony is started by StartNextQueuedWeddingIfIdle, which needs the host on a non-temporary
-        // location (FarmHouse won't trigger the queued Farm/Town wedding), so warping home between
-        // ceremonies would strand the next wedding unstarted. getAvailableWeddingEvent pops the running
+        // "wedding"), so the host lands at the farmhouse-porch tile rather than the canonical Farm park
+        // spot. Normalize that, but ONLY once no wedding is still queued: on a multi-wedding day the next
+        // ceremony is started by StartNextQueuedWeddingIfIdle, and re-warping the host between ceremonies
+        // could interleave with the next event start. getAvailableWeddingEvent pops the running
         // ceremony's farmer from weddingsToday before the event runs (Game1.cs:6096), so a remaining
         // Count > 0 reliably means "another wedding still queued".
         if (Game1.weddingsToday is not { Count: > 0 })
         {
-            WarpHostHomeAfterWeddings();
+            WarpHostToFarmAfterWeddings();
         }
 
         // Mark this ceremony handled and clear the timer so the next wedding's gate starts a fresh
@@ -809,58 +845,50 @@ public class AlwaysOnServer : ModService
     }
 
     /// <summary>
-    /// Return the host to its FarmHouse idle spot after the day's last wedding. <c>eventFinished()</c>
-    /// leaves the host on the open Farm map (the wedding exit warp targets the host's farmhouse porch via
-    /// <c>getHomeOfFarmer(Game1.player)</c>), but the host is meant to stay hidden in its FarmHouse — the
-    /// same place <see cref="HandleAutoSleep"/> keeps it. Reuses that handler's home-warp idiom:
-    /// <c>getLocationRequest(home)</c> + <c>warpFarmer</c> into the FarmHouse, then snap to the bed spot
-    /// and <c>Halt()</c>. Master-only and FarmHouse-targeted (no-ops if home doesn't resolve to one).
+    /// Warp the host to its standard Farm park spot after the day's last wedding — the same target
+    /// <c>HideHostActivity</c> warps it to on every day start (<see cref="AlwaysOnUtil.WarpToFarmDefaultSpawn"/>),
+    /// so the host's idle position stays the single invariant the rest of the system assumes (pacing
+    /// probes, cabin placement). The wedding exit warp already lands on the Farm (at the farmhouse
+    /// porch); this merely normalizes that to the canonical park tile. Master-only.
     /// </summary>
-    private void WarpHostHomeAfterWeddings()
+    private void WarpHostToFarmAfterWeddings()
     {
         if (!Game1.IsMasterGame)
         {
             return;
         }
 
-        var home = Game1.player.homeLocation.Value;
-        if (string.IsNullOrEmpty(home))
-        {
-            return;
-        }
+        int x = 0,
+            y = 0;
+        Utility.getDefaultWarpLocation("Farm", ref x, ref y);
 
-        // Already home (a single-tile-warp engine edge case): just snap to the bed and stop.
-        if (
-            Game1.currentLocation is FarmHouse here
-            && string.Equals(here.NameOrUniqueName, home, StringComparison.OrdinalIgnoreCase)
-        )
+        // Already on the Farm (eventFinished()'s exit warp can resolve in place before this runs):
+        // just snap to the park tile and stop.
+        if (Game1.currentLocation is Farm)
         {
-            Game1.player.position.Set(Utility.PointToVector2(here.GetPlayerBedSpot()) * 64f);
+            Game1.player.position.Set(new Microsoft.Xna.Framework.Vector2(x, y) * 64f);
             Game1.player.Halt();
             return;
         }
 
-        var req = Game1.getLocationRequest(home);
+        var req = Game1.getLocationRequest("Farm");
         req.OnWarp += () =>
         {
-            if (Game1.currentLocation is FarmHouse fh)
-            {
-                Game1.player.position.Set(Utility.PointToVector2(fh.GetPlayerBedSpot()) * 64f);
-            }
             Game1.player.Halt();
             // warpFarmer arms a fade-to-black; on the render-suppressed host the fade-in handler is
             // draw-coupled and stalls (same reason the teardown above clears the fade by hand), so clear
-            // it on arrival or the host sits on a black screen in its FarmHouse.
+            // it on arrival or the host sits on a black screen.
             Game1.fadeClear();
             Game1.fadeToBlackAlpha = 0f;
         };
-        // Coords are any valid tile inside the target FarmHouse; the OnWarp callback snaps to the bed
-        // spot. Mirrors HandleAutoSleep's home-warp (and DedicatedServer.cs:415). Issued right after
-        // eventFinished()'s own Farm-exit warpFarmer — performWarpFarmer just overwrites the single
-        // Game1.locationRequest, so this supersedes the Farm exit and the host warps straight home
-        // without first landing on the open Farm.
-        Game1.warpFarmer(req, 5, 9, Game1.player.FacingDirection);
-        Monitor.Log($"Warped host home to {home} after the day's last wedding.", LogLevel.Info);
+        // Issued right after eventFinished()'s own exit warpFarmer — performWarpFarmer just overwrites
+        // the single Game1.locationRequest, so this supersedes the porch exit and the host warps
+        // straight to the park tile.
+        Game1.warpFarmer(req, x, y, Game1.player.FacingDirection);
+        Monitor.Log(
+            "Parked host at the Farm park spot after the day's last wedding.",
+            LogLevel.Info
+        );
     }
 
     /// <summary>
@@ -993,24 +1021,197 @@ public class AlwaysOnServer : ModService
     }
 
     /// <summary>
-    /// Pause the game when there are no clients connected.
-    /// After 2500 (1:00 AM), always unpause to allow the end-of-day pass-out sequence.
+    /// Pause the world whenever no authenticated player is present and the host is at rest, at
+    /// any time of day. From 1:00 AM on (timeOfDay >= 2500, inclusive) an empty server also runs
+    /// a wall-clock grace timer and, if nobody returns before it elapses, sleeps the host so the
+    /// next player arrives at a fresh 6:00 AM. The clock never runs with nobody present: the
+    /// server is either paused, finishing something the pause would freeze, or in the day
+    /// transition.
     /// </summary>
     private void HandleAutoPause()
     {
-        var numPlayers = Game1.otherFarmers.Count;
-        var isFestivalDay = SDateHelper.IsFestivalToday();
+        // Never hold the pause while a day transition is in flight: HostPaused gates
+        // Game1.UpdateOther (Game1.cs:4308 → 6436), which pumps the newDay screen fade — a
+        // pause during that phase parks the transition indefinitely. An empty server's
+        // /newgame day-0 transition starts at 6:00 (see
+        // .claude/plans/bugs/newgame-stalls-after-forced-reload.md). Same predicate the /newgame
+        // completion gate uses; the pause re-engages the tick after the transition settles.
+        if (!GameManagerService.IsDayTransitionComplete())
+        {
+            SetPaused(false, "day transition in flight");
+            _hostSleepRequestedAt = null;
+            _emptyPastCutoffSince = null;
+            return;
+        }
 
-        if (numPlayers >= 1)
+        if (CountPresentPlayers() > 0)
         {
-            Game1.netWorldState.Value.IsPaused = clientPaused;
+            SetPaused(false, "players present");
+            _emptyPastCutoffSince = null;
+            return;
         }
-        else if (numPlayers == 0 && !isFestivalDay)
+
+        // A requested host sleep runs its warp + ready-check under the running loop; the
+        // transition guard above takes over once NewDay creates the sync.
+        if (_hostSleepRequestedAt is DateTime requestedAt)
         {
-            // Pause during normal hours (610-2500), but unpause after 2500 to allow
-            // the forced pass-out sequence at 2600 (2:00 AM) to proceed.
-            Game1.netWorldState.Value.IsPaused = Game1.timeOfDay is >= 610 and <= 2500;
+            SetPaused(false, "host sleep requested");
+            if (DateTime.UtcNow - requestedAt > HostSleepRequestTimeout)
+            {
+                Monitor.Log(
+                    $"Host sleep did not reach the day transition within {HostSleepRequestTimeout.TotalSeconds:0}s; "
+                        + "re-engaging the pause and retrying after the grace period",
+                    LogLevel.Warn
+                );
+                _hostSleepRequestedAt = null;
+                _warpingSleep = false;
+                _emptyPastCutoffSince = null;
+            }
+            return;
         }
+
+        if (Game1.timeOfDay >= 2500)
+        {
+            _emptyPastCutoffSince ??= DateTime.UtcNow;
+        }
+        else
+        {
+            _emptyPastCutoffSince = null;
+        }
+
+        // Anything still in flight needs the unpaused loop to finish (the pause gates
+        // UpdateCharacters/UpdateLocations/UpdateOther, Game1.cs:4308, and the farm-event
+        // tick, Game1.cs:4187): the pause waits, and the automation handlers wrap it up.
+        var activity = CurrentHostActivity();
+        if (activity != HostActivity.None)
+        {
+            // Log once per activity change: the pause is usually already off here (sleep
+            // request, transition), but the run artifact must still show what held it off.
+            if (activity != _lastHoldOff)
+            {
+                _lastHoldOff = activity;
+                Monitor.Log(
+                    $"Auto-pause held off: {DescribeHostActivity(activity)} (timeOfDay={Game1.timeOfDay})",
+                    LogLevel.Info
+                );
+            }
+            if (Game1.netWorldState.Value.IsPaused)
+            {
+                SetPaused(false, DescribeHostActivity(activity));
+            }
+            return;
+        }
+
+        _lastHoldOff = HostActivity.None;
+        SetPaused(true, "server empty, host at rest");
+
+        if (
+            _emptyPastCutoffSince is DateTime emptySince
+            && (DateTime.UtcNow - emptySince).TotalSeconds >= Env.AutoSleepGraceSeconds
+        )
+        {
+            SleepHostNow(
+                $"Server empty at or past 1:00 AM for {Env.AutoSleepGraceSeconds}s, host going to sleep"
+            );
+        }
+    }
+
+    /// <summary>
+    /// Authenticated players the world must keep running for. Disconnect-marked farmers
+    /// linger in <c>otherFarmers</c> until the engine removes them (see OnlineFarmers) and
+    /// unauthenticated lobby players only ever see the frozen lobby delta, so neither counts.
+    /// Allocation-free: the NetRootDictionary enumerator is a struct.
+    /// </summary>
+    private int CountPresentPlayers()
+    {
+        var count = 0;
+        foreach (var kvp in Game1.otherFarmers)
+        {
+            if (
+                Game1.Multiplayer.isDisconnecting(kvp.Value)
+                || _lobbyService.IsPlayerUnauthenticated(kvp.Key)
+            )
+            {
+                continue;
+            }
+            count++;
+        }
+        return count;
+    }
+
+    /// <summary>
+    /// What on the host would be frozen mid-flight by the pause. <see cref="HostActivity.None"/>
+    /// means the host is at rest: no event (festival, wedding, cutscene), no pending warp
+    /// (<c>locationRequest</c> is cleared on both the completed and the failed path, unlike
+    /// <c>isWarping</c>), no 2:00 AM pass-out in flight, and no farm event. The farm-event check
+    /// is defensive: overnight events play inside the day transition, which is already unpaused.
+    /// </summary>
+    private static HostActivity CurrentHostActivity()
+    {
+        if (Game1.CurrentEvent != null)
+        {
+            return HostActivity.Event;
+        }
+        if (Game1.farmEvent != null)
+        {
+            return HostActivity.FarmEvent;
+        }
+        if (Game1.locationRequest != null)
+        {
+            return HostActivity.Warp;
+        }
+        // At 2:00 AM the pass-out is the only way the day can end, and it needs the running
+        // loop from the moment the clock crosses 2600 (UpdateOther fires startToPassOut) until
+        // the animation hands over to NewDay. Cover the whole span, not just the animation.
+        if (Game1.timeOfDay >= 2600 || Game1.player.FarmerSprite.isPassingOut())
+        {
+            return HostActivity.PassOut;
+        }
+        return HostActivity.None;
+    }
+
+    private enum HostActivity
+    {
+        None,
+        Event,
+        FarmEvent,
+        Warp,
+        PassOut,
+    }
+
+    /// <summary>Log text for a non-None activity. Called on transitions only.</summary>
+    private static string DescribeHostActivity(HostActivity activity)
+    {
+        switch (activity)
+        {
+            case HostActivity.Event:
+                var ev = Game1.CurrentEvent;
+                return ev == null ? "event in progress"
+                    : ev.isFestival ? "festival in progress"
+                    : ev.isWedding ? "wedding in progress"
+                    : $"event {ev.id} in progress";
+            case HostActivity.FarmEvent:
+                return $"farm event {Game1.farmEvent?.GetType().Name} in progress";
+            case HostActivity.Warp:
+                return $"warp to {Game1.locationRequest?.Name} pending";
+            default:
+                return "2:00 AM pass-out in flight";
+        }
+    }
+
+    /// <summary>Write the pause flag and log the transition once, never per tick.</summary>
+    private void SetPaused(bool paused, string reason)
+    {
+        if (Game1.netWorldState.Value.IsPaused == paused)
+        {
+            return;
+        }
+
+        Game1.netWorldState.Value.IsPaused = paused;
+        Monitor.Log(
+            $"Auto-pause {(paused ? "engaged" : "released")}: {reason} (timeOfDay={Game1.timeOfDay})",
+            LogLevel.Info
+        );
     }
 
     /// <summary>
@@ -1088,6 +1289,25 @@ public class AlwaysOnServer : ModService
         {
             return;
         }
+
+        SleepHostNow("Other players ready for sleep");
+    }
+
+    /// <summary>
+    /// Warp the host home (if not already there) and trigger Sleep_Yes. Shared by the
+    /// players-ready path and the empty-server grace path. The sleep-requested latch keeps
+    /// <see cref="HandleAutoPause"/> from pausing the warp or the sleep ready-check.
+    /// </summary>
+    private void SleepHostNow(string reason)
+    {
+        if (_warpingSleep)
+        {
+            return;
+        }
+
+        Monitor.Log(reason, LogLevel.Info);
+        _hostSleepRequestedAt = DateTime.UtcNow;
+        SetPaused(false, "host sleep requested");
 
         var home = Game1.player.homeLocation.Value;
 
@@ -1329,10 +1549,10 @@ public class AlwaysOnServer : ModService
 
     /// <summary>
     /// Apply the host's one-time new-game choices (pet, farm cave) deterministically at load. These
-    /// run here — not on the OneSecondUpdateTicked loop, which fires every 12s at SERVER_TPS=5 (see
+    /// run here — not on the OneSecondUpdateTicked loop (see
     /// one-second-update-ticked-fires-per-game-tick.md) — so the choice is settled before the
     /// reload/newgame completion contract resolves and before anything (a /test seed, an operator
-    /// command) can write the same state, which the 12s cadence would otherwise race and overwrite.
+    /// command) can write the same state, which a loop-timed write would otherwise race and overwrite.
     /// Each handler is single-shot on a save-persisted signal (pet existence, eventsSeen "65"), so a
     /// re-run on /reload is a no-op.
     /// </summary>
@@ -1388,23 +1608,26 @@ public class AlwaysOnServer : ModService
     }
 
     /// <summary>
-    /// Reset a host farmhouse that a prior build left upgraded back to level 0 (the host farmhouse
-    /// is internal-only, see <see cref="HostFarmhouseUpgradeGuard"/>). No-op for new/healthy saves.
-    ///
-    /// TRANSITIONAL: remove after 2026-09-01 once affected saves have self-healed (#346).
+    /// Load-time heal of the host farmhouse (internal-only, see
+    /// <see cref="HostFarmhouseUpgradeGuard"/>): resets an upgraded farmhouse to level 0 and
+    /// ensures a usable bed. The bed is left to the save-import finalizer while an import is
+    /// pending: the farmhouse still holds the former owner's bed until the finalizer moves it.
     /// </summary>
-    private void HealUpgradedHostFarmhouse()
+    private void HealHostFarmhouse()
     {
-        if (Game1.player.HouseUpgradeLevel == 0)
+        if (Game1.player.HouseUpgradeLevel != 0)
+        {
+            HostFarmhouseUpgradeGuard.ResetHostFarmhouseToLevelZero();
+            Monitor.Log("Reset host farmhouse to level 0 (internal-only).", LogLevel.Info);
+            return;
+        }
+
+        if (_saveImportService.TryReadIntent() != null)
         {
             return;
         }
 
-        HostFarmhouseUpgradeGuard.ResetHostFarmhouseToLevelZero();
-        Monitor.Log(
-            "Reset host farmhouse to level 0 (internal-only); cleared a stale upgrade from #346.",
-            LogLevel.Info
-        );
+        HostFarmhouseUpgradeGuard.EnsureHostPlayerBed();
     }
 
     /// <summary>

@@ -1,0 +1,81 @@
+name: Stamp Issue Versions
+description: >
+  Stamps the issues closed by the PRs in this build's commit range with the image version that
+  first contains their fix (org Issue Field, first value wins), and posts a "your fix shipped"
+  comment once per channel.
+
+inputs:
+  field-id:
+    description: Numeric id of the org issue field to write
+    required: true
+  field-name:
+    description: Expected name of that field — the first write is asserted against it to catch a stale id
+    required: true
+  value:
+    description: Version to stamp (e.g. 1.5.0 or 1.5.0-preview.3)
+    required: true
+  channel:
+    description: Comment channel, "preview" or "release"
+    required: true
+  head-ref:
+    description: Ref or SHA of the build's head commit
+    required: true
+  tag-match:
+    description: Space-separated `git describe --match` globs that select base-tag candidates
+    required: true
+  tag-exclude:
+    description: Space-separated `git describe --exclude` globs that remove base-tag candidates
+    required: false
+    default: ""
+  max-issues:
+    description: Abort if the range resolves more issues than this (guards a bad base tag)
+    required: false
+    default: "100"
+  dry-run:
+    description: Resolve and log everything but write nothing
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout full history
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+        fetch-tags: true
+
+    - name: Set up Bun
+      uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      with:
+        bun-version: 1.4.2
+
+    - name: Resolve commit range
+      id: range
+      shell: bash
+      env:
+        HEAD_REF: ${{ inputs.head-ref }}
+        TAG_MATCH: ${{ inputs.tag-match }}
+        TAG_EXCLUDE: ${{ inputs.tag-exclude }}
+      run: '"$GITHUB_ACTION_PATH/../../scripts/resolve-build-range.sh"'
+
+    - name: Install dependencies
+      shell: bash
+      working-directory: .github/scripts
+      run: bun install --frozen-lockfile
+
+    - name: Stamp issues
+      shell: bash
+      working-directory: .github/scripts
+      env:
+        GH_TOKEN: ${{ github.token }}
+        HEAD_OID: ${{ steps.range.outputs.head-oid }}
+        BASE_OID: ${{ steps.range.outputs.base-oid }}
+        FIELD_ID: ${{ inputs.field-id }}
+        EXPECTED_FIELD_NAME: ${{ inputs.field-name }}
+        VALUE: ${{ inputs.value }}
+        CHANNEL: ${{ inputs.channel }}
+        MAX_ISSUES: ${{ inputs.max-issues }}
+        DRY_RUN: ${{ inputs.dry-run }}
+      run: |
+        OWNER="${GITHUB_REPOSITORY%%/*}" REPO="${GITHUB_REPOSITORY#*/}" bun run stamp-issue-versions.ts

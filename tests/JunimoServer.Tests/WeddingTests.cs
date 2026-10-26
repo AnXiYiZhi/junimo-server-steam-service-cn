@@ -56,7 +56,7 @@ namespace JunimoServer.Tests;
 /// video shows them). The test client drives each ceremony through the honest player path — the
 /// <c>WeddingCutscenePlayer</c> tweak clicks each <c>speak</c> dialogue box per tick, so the cutscene
 /// advances and renders frame-by-frame to its <c>waitForOtherPlayers</c> gate (which auto-readies on
-/// arrival), with deliberate ~2.5s pauses at the "couple assembled" and "marriage pronounced" beats so
+/// arrival), with deliberate ~1.5s pauses at the "couple assembled" and "marriage pronounced" beats so
 /// it's obvious in the video. Each distinct ceremony a client renders is recorded in
 /// <c>/status.weddingsRendered</c> (one entry per <c>weddingEnd&lt;farmerId&gt;</c> gate) — a client
 /// that force-skipped the ceremony would render nothing, so this is the proof the cutscene actually ran.
@@ -90,10 +90,10 @@ public class WeddingTests : TestBase
     private const string SpouseNpcB = "Penny";
 
     // How long for both clients to fully RENDER both ceremonies before we consider the server hung.
-    // Each client plays each cutscene through at CLIENT_TPS=5 — every speak box costs ~750ms safetyTimer
-    // (~4 ticks) plus typing, and WeddingCutscenePlayer adds two ~2.5s "make it visible" beats per
-    // ceremony — so two ceremonies × two clients runs minutes, not seconds. Sized well above that; a
-    // genuine hang (a ceremony that never starts/renders, or a host stall) still blows past it.
+    // Each client plays each cutscene through at CLIENT_TPS=5 (scripted pauses, dialogue clicks, and two
+    // 1.5s "make it visible" beats per ceremony), so two ceremonies × two clients takes tens of seconds
+    // even with the pace speedups. Deliberately oversized headroom: a genuine hang (a ceremony that never
+    // starts/renders, or a host stall) still blows past it.
     private static readonly TimeSpan CeremoniesResolveTimeout = TimeSpan.FromSeconds(240);
 
     /// <summary>
@@ -106,7 +106,7 @@ public class WeddingTests : TestBase
     [Fact]
     public async Task TwoFarmhandNpcWeddings_SameDay_BothCompleteWithoutHangingHost()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
 
         // Land on the day before the weddings.
         var setDate = await ServerApi.SetDate(WeddingSeason, EngageDay, year: 1, ct);
@@ -116,13 +116,9 @@ public class WeddingTests : TestBase
             $"SetDate({WeddingSeason} {EngageDay}) failed: {setDate.Error}"
         );
 
-        // Connect BOTH farmhands CONCURRENTLY — both players present together from the start, not A
-        // then B. The two client containers are leased up front (overlapping their cold start) and both
-        // join sequences run together; the per-server join gate serializes only the game-thread join
-        // (the loop processes one farmhand at a time), so B lands right behind A instead of waiting on
-        // A's whole lease+join. The primary is held as the shared GameClient, the second wrapped as a
-        // SecondFarmer; neither is privileged. await using → farmhandB disconnects before the class's
-        // /newgame reset.
+        // Connect BOTH farmhands CONCURRENTLY — both present from the start, not A then B (the scenario
+        // under test). Neither is privileged: the primary is the shared GameClient, the second a
+        // SecondFarmer. await using → farmhandB disconnects before the class's /newgame reset.
         var (farmhandA, farmhandBConn) = await Farmers.ConnectBothConcurrentlyAsync(
             primaryPrefix: "WeddingA",
             secondaryPrefix: "WeddingB",
@@ -339,35 +335,34 @@ public class WeddingTests : TestBase
             );
         }
 
-        // The host must be returned to its FarmHouse idle spot, not left standing on the open Farm map.
-        // The wedding's endBehaviors ("wedding" case) sets the exit warp from
-        // getHomeOfFarmer(Game1.player).getPorchStandingSpot(), which on the host resolves to the main
-        // farmhouse porch — so eventFinished() drops the host onto the Farm. The mod warps it home after
-        // the day's last ceremony; assert that here (separate from hostRecovered: "not stuck" is distinct
-        // from "back home", and the home-warp lands a tick or two after the temp map clears).
-        var hostHome = await PollingHelper.WaitUntilAsync(
-            WaitName.Polling_Wedding_HostReturnedHomeAfterCeremonies,
+        // The host must end parked on the Farm — its steady-state idle spot (HideHostActivity parks it
+        // there on every day start, and the pacing probes assume that geometry). The wedding's
+        // endBehaviors ("wedding" case) sets the exit warp from
+        // getHomeOfFarmer(Game1.player).getPorchStandingSpot(), so eventFinished() drops the host at the
+        // farmhouse-porch tile; the mod normalizes that to the canonical Farm park spot after the day's
+        // last ceremony. Assert that here (separate from hostRecovered: "not stuck / off the temp map" is
+        // distinct from "parked", and the park warp lands a tick or two after the temp map clears).
+        var hostAtParkSpot = await PollingHelper.WaitUntilAsync(
+            WaitName.Polling_Wedding_HostAtFarmParkSpotAfterCeremonies,
             async () =>
             {
                 var hs = await ServerApi.GetWeddingState(ct: ct);
-                return hs?.Success == true
-                    && hs.HostCurrentLocation?.StartsWith(
-                        "FarmHouse",
-                        System.StringComparison.Ordinal
-                    ) == true;
+                return hs?.Success == true && hs.HostAtFarmParkSpot;
             },
             timeout: TestTimings.NetworkSyncTimeout,
             cancellationToken: ct
         );
-        if (!hostHome)
+        if (!hostAtParkSpot)
         {
             var hs = await ServerApi.GetWeddingState(ct: ct);
             Assert.Fail(
-                "Host was not returned to its FarmHouse after the same-day weddings — it is left on the "
-                    + "open Farm map where the wedding exit warp drops it (the exit targets the host's "
-                    + "farmhouse porch via getHomeOfFarmer(Game1.player)). After the last ceremony the host "
-                    + "must warp back to its FarmHouse idle spot.\n"
-                    + $"  hostCurrentLocation={hs?.HostCurrentLocation ?? "null"} (expected to start with \"FarmHouse\")"
+                "Host did not end parked at the Farm park spot after the same-day weddings. After the "
+                    + "last ceremony the host must be returned to the Farm default warp tile (the same "
+                    + "idle spot HideHostActivity parks it at on every day start) — merely being on the "
+                    + "Farm is not enough, since the vanilla wedding exit warp already lands there (at "
+                    + "the farmhouse porch).\n"
+                    + $"  hostCurrentLocation={hs?.HostCurrentLocation ?? "null"} "
+                    + $"hostTile=({hs?.HostTileX},{hs?.HostTileY}) (expected the Farm default warp tile)"
             );
         }
 

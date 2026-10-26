@@ -10,8 +10,8 @@ namespace JunimoServer.Tests;
 ///
 /// <para>
 /// The headline test is the regression gate for the leave-only auto-end bug: the two
-/// no-main-event festivals (Spirit's Eve, Feast of Winter Star) used to host-end ~0.17 s
-/// after loading (<c>RunLeaveOnly</c> firing <c>TicksToSeconds(10)</c>). The fix removed
+/// no-main-event festivals (Spirit's Eve, Feast of Winter Star) used to host-end almost
+/// immediately after loading (<c>RunLeaveOnly</c> firing its end dialogue). The fix removed
 /// that auto-end so the festival only ends when players leave or the wall-clock timeout
 /// elapses. Nothing automated caught the bug before; these tests are that gate.
 /// </para>
@@ -73,28 +73,47 @@ public class FestivalTests : TestBase
     private const int EggDay = 13;
     private const int EggBeforeDay = 12;
 
-    // Per-map warp-in tiles (the engine's own area-warp tiles, Game1.cs:13204/13212).
+    // Stardew Valley Fair: Fall 16, main-event, in Town.
+    private const string FairSeason = "fall";
+    private const int FairDay = 16;
+    private const int FairBeforeDay = 15;
+    private static readonly (int Open, int Close) FairWindow = (900, 1500);
+
+    // Luau: Summer 11, main-event (adds an iridium starfruit to the soup), at the Beach.
+    private const string LuauSeason = "summer";
+    private const int LuauDay = 11;
+    private const int LuauBeforeDay = 10;
+    private static readonly (int Open, int Close) LuauWindow = (900, 1400);
+    private const string LuauLocation = "Beach";
+
+    // Per-map warp-in tiles (the engine's own area-warp tiles, Game1.cs:13204/13212/13216).
     // warpFarmer's festival-entry guard keys on the location NAME matching whereIsTodaysFest,
     // not the tile, so any in-bounds tile on the festival map triggers entry.
     private static readonly (int X, int Y) TownEntryTile = (35, 35);
     private static readonly (int X, int Y) ForestEntryTile = (34, 13);
+    private static readonly (int X, int Y) BeachEntryTile = (34, 10);
 
-    // How long a festival must stay active to prove the 0.17s auto-end is gone. Comfortably
-    // larger than the old window, far below the ~33-min (SpiritsEveTimeOut) wall-clock backstop.
+    // How long a festival must stay active to prove the immediate auto-end is gone. Comfortably
+    // larger than the old window, far below the SpiritsEveTimeOutSeconds wall-clock backstop.
     private static readonly TimeSpan FestivalSettleWindow = TimeSpan.FromSeconds(6);
+
+    // The Fair's leave can be briefly deferred while the grange results box is open (HandleDialogueBox
+    // clears it on its next one-second pass), so allow more than NetworkSyncTimeout (10s). A ceiling
+    // only — the common (box-already-clear) case ends within ~1s.
+    private static readonly TimeSpan FairLeaveEndTimeout = TimeSpan.FromSeconds(20);
 
     /// <summary>
     /// Test 1 (the regression gate): Spirit's Eve does NOT auto-end immediately.
     ///
-    /// Pre-fix, <c>RunLeaveOnly</c> fired <c>TryStartEndFestivalDialogue</c> ~0.17 s after
-    /// the festival loaded, ending it before the player could do anything. With the fix the
+    /// Pre-fix, <c>RunLeaveOnly</c> fired <c>TryStartEndFestivalDialogue</c> almost immediately
+    /// after the festival loaded, ending it before the player could do anything. With the fix the
     /// festival stays active until a player leaves or the wall-clock timeout elapses, so it
     /// must still be active several seconds after entry.
     /// </summary>
     [Fact]
     public async Task SpiritsEve_DoesNotAutoEndImmediately()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
 
         await EnterFestivalAsync(
             SpiritsEveSeason,
@@ -108,7 +127,7 @@ public class FestivalTests : TestBase
         );
 
         // The fix is the only thing keeping the festival alive here: pre-fix it would have
-        // ended within ~0.17s. Poll for the whole settle window and fail the moment the
+        // ended almost immediately. Poll for the whole settle window and fail the moment the
         // festival is observed inactive.
         var endedEarly = await PollingHelper.WaitUntilAsync(
             WaitName.Polling_Festival_StillActiveAfterSettle,
@@ -124,7 +143,7 @@ public class FestivalTests : TestBase
         Assert.False(
             endedEarly,
             $"Spirit's Eve ended within {FestivalSettleWindow.TotalSeconds:0}s of entry. "
-                + "Pre-fix, RunLeaveOnly's TicksToSeconds(10) ≈ 0.17s auto-end did exactly this; "
+                + "Pre-fix, RunLeaveOnly's immediate auto-end did exactly this; "
                 + "the leave-only fix removed it so the festival must stay active until players leave."
         );
 
@@ -150,7 +169,7 @@ public class FestivalTests : TestBase
     [Fact]
     public async Task SpiritsEve_EndsWhenPlayerLeaves()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
 
         await EnterFestivalAsync(
             SpiritsEveSeason,
@@ -193,7 +212,7 @@ public class FestivalTests : TestBase
     /// is still leavable — guarding both the no-online-players end and the per-festival state reset.
     ///
     /// Disconnecting the only client leaves nobody online at the festival; the host's
-    /// <c>HandleFestivalLeave</c> no-online-players branch (<c>CountOnlineOtherPlayers() == 0</c>)
+    /// <c>HandleFestivalLeave</c> no-online-players branch (<c>OnlineFarmers.CountOthers() == 0</c>)
     /// ends it gracefully via the host's own festivalEnd ready. Then a fresh client enters a later
     /// festival (Festival of Ice) and votes to leave: that leave must be honoured, which it isn't
     /// if a stale <c>_startedFestivalEnd</c> survives the empty festival (the engine sets
@@ -202,7 +221,7 @@ public class FestivalTests : TestBase
     [Fact]
     public async Task EmptyFestivalEnds_AndNextFestivalIsLeavable()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
 
         var farmhand = await EnterFestivalAsync(
             SpiritsEveSeason,
@@ -236,7 +255,7 @@ public class FestivalTests : TestBase
         Assert.True(
             emptyEnded,
             "An empty festival (no online players left) should end via HandleFestivalLeave's "
-                + "CountOnlineOtherPlayers() == 0 branch — otherFarmers.Count can't reach 0 during a "
+                + "OnlineFarmers.CountOthers() == 0 branch — otherFarmers.Count can't reach 0 during a "
                 + "festival, so the end must key off the online (non-disconnecting) count."
         );
         LogSuccess("Empty Spirit's Eve ended with no online players present");
@@ -296,7 +315,7 @@ public class FestivalTests : TestBase
     [Fact]
     public async Task EggFestival_MainEventStartsWithCountdownSkip()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
 
         await EnterFestivalAsync(
             EggSeason,
@@ -347,6 +366,284 @@ public class FestivalTests : TestBase
     }
 
     /// <summary>
+    /// The Stardew Valley Fair does not strand the festival after grange judging, and a connected
+    /// player can still leave it. Pre-fix the Fair auto-ended after the countdown — latching
+    /// <c>_startedFestivalEnd</c> against a host-only <c>festivalEnd</c> ready-check no one could
+    /// satisfy — and hung forever. The auto-end is gone; the leave also survives a briefly-open
+    /// grange results menu on the host.
+    /// </summary>
+    [Fact]
+    public async Task Fair_DoesNotStrandFestival_AndLeavesCleanly()
+    {
+        var ct = TestCt;
+
+        await EnterFestivalAsync(
+            FairSeason,
+            FairBeforeDay,
+            FairDay,
+            FairWindow,
+            "Town",
+            TownEntryTile,
+            namePrefix: "FestFair",
+            ct
+        );
+
+        // Wait for the grange countdown announce to confirm we entered the main-event festival before
+        // skipping the countdown.
+        var announce = await GameClient.Chat.WaitForMessageContainingAsync(
+            new[] { "Grange Judging", "!event" },
+            timeout: TestTimings.ChatCommandTimeout
+        );
+        Assert.NotNull(announce);
+
+        // Skip the 5-minute countdown so grange judging fires immediately (mirrors the Egg test).
+        var sent = await GameClient.Chat.Send("!event");
+        Assert.True(sent?.Success == true, $"Sending !event failed: {sent?.Error}");
+
+        // Primary regression assertion: after judging fires, the festival must stay active with the
+        // host's festivalEnd ready never set. Fail the moment it ends early or a host ready appears.
+        var stranded = await PollingHelper.WaitUntilAsync(
+            WaitName.Polling_Festival_FairNoAutoEnd,
+            async () =>
+            {
+                var state = await ServerApi.GetFestivalState(ct);
+                return state?.IsFestivalActive != true || state.FestivalEndReady >= 1;
+            },
+            timeout: FestivalSettleWindow,
+            cancellationToken: ct
+        );
+        Assert.False(
+            stranded,
+            "The Fair auto-ended after the grange countdown (festival inactive or FestivalEndReady "
+                + ">= 1 within the settle window) — it must stay active with no host festivalEnd ready."
+        );
+
+        var midState = await ServerApi.GetFestivalState(ct);
+        Assert.NotNull(midState);
+        Assert.True(
+            midState.IsFestivalActive,
+            "The Fair should still be active after grange judging (it ends only on player-leave/timeout)."
+        );
+        Assert.True(
+            midState.FestivalEndReady == 0,
+            $"No festivalEnd ready should be set after judging; got {midState.FestivalEndReady}."
+        );
+
+        // End-to-end gate: a connected player can leave normally, proving _startedFestivalEnd was
+        // never prematurely latched (the menu gate keeps this working even if the grange box is open).
+        var leave = await GameClient.Actions.LeaveFestival();
+        Assert.NotNull(leave);
+        Assert.True(leave.Success, $"leave_festival action failed: {leave.Error}");
+
+        var ended = await PollingHelper.WaitUntilAsync(
+            WaitName.Polling_Festival_FairEndedOnLeave,
+            async () =>
+            {
+                var state = await ServerApi.GetFestivalState(ct);
+                return state?.IsFestivalActive == false;
+            },
+            timeout: FairLeaveEndTimeout,
+            cancellationToken: ct
+        );
+        Assert.True(
+            ended,
+            "The Fair should end after the connected player votes to leave — a latched "
+                + "_startedFestivalEnd would make HandleFestivalLeave early-return and ignore the vote."
+        );
+        LogSuccess("Fair stayed active after judging (no auto-end) and ended cleanly on leave");
+    }
+
+    /// <summary>
+    /// A leave vote that lands while a host menu is open must be deferred — not latch
+    /// <c>_startedFestivalEnd</c> — and must fire once the menu clears. <c>TryStartEndFestivalDialogue</c>
+    /// no-ops while a menu is open but <c>EndFestival</c> latches unconditionally, so an unguarded end
+    /// during that window would strand the festival. Holds an inert host menu open across the vote — a
+    /// deterministic stand-in for the transient grange results box, since the gate keys on
+    /// <c>Game1.activeClickableMenu is null</c>, not the menu type. The final assertion is the
+    /// discriminator: without the gate the vote latches on the open menu and the festival never ends.
+    /// </summary>
+    [Fact]
+    public async Task Fair_DefersLeaveWhileHostMenuOpen_ThenEndsWhenCleared()
+    {
+        var ct = TestCt;
+
+        await EnterFestivalAsync(
+            FairSeason,
+            FairBeforeDay,
+            FairDay,
+            FairWindow,
+            "Town",
+            TownEntryTile,
+            namePrefix: "FestFairMenu",
+            ct
+        );
+
+        // Open an inert host menu on the active (idle-countdown) Fair. Nothing clears it, so it holds
+        // the leave-end gate closed until we close it below. (No !event needed: the leave path runs
+        // every tick regardless of the countdown.)
+        var opened = await ServerApi.SetHostMenu(open: true, ct);
+        Assert.True(
+            opened?.Success == true && opened.MenuOpen,
+            $"Failed to open the host menu for the deferral scenario: {opened?.Error}"
+        );
+
+        // Wrap the rest in try/finally: the open menu is shared host state on this shared-class
+        // server, so it must be cleared even if an assertion fails or the test is cancelled — a
+        // leaked menu would hold the next festival test's leave-end gate closed.
+        try
+        {
+            // The connected player votes to leave WHILE the host menu is open.
+            var leave = await GameClient.Actions.LeaveFestival();
+            Assert.NotNull(leave);
+            Assert.True(leave.Success, $"leave_festival action failed: {leave.Error}");
+
+            // Confirm the vote replicated to the host, so the deferral asserted next is genuinely "vote
+            // present but held", not "vote not yet arrived".
+            var voteSynced = await PollingHelper.WaitUntilAsync(
+                WaitName.Polling_Festival_FairLeaveVoteSynced,
+                async () =>
+                {
+                    var state = await ServerApi.GetFestivalState(ct);
+                    return state?.FestivalEndReady >= 1;
+                },
+                timeout: TestTimings.NetworkSyncTimeout,
+                cancellationToken: ct
+            );
+            Assert.True(voteSynced, "The client's festivalEnd vote should replicate to the host.");
+
+            // Deferral: with the vote present but a host menu open, the Fair must NOT end across the
+            // settle window — HandleFestivalLeave holds off, never latching _startedFestivalEnd.
+            var endedWhileMenuOpen = await PollingHelper.WaitUntilAsync(
+                WaitName.Polling_Festival_FairDeferredHold,
+                async () =>
+                {
+                    var state = await ServerApi.GetFestivalState(ct);
+                    return state?.IsFestivalActive != true;
+                },
+                timeout: FestivalSettleWindow,
+                cancellationToken: ct
+            );
+            Assert.False(
+                endedWhileMenuOpen,
+                "While a host menu was open, the Fair must not end — the leave vote must be deferred, "
+                    + "not force-ended or latched."
+            );
+
+            // Release: close the host menu. The deferred leave must now fire and end the Fair.
+            var closed = await ServerApi.SetHostMenu(open: false, ct);
+            Assert.True(
+                closed?.Success == true && !closed.MenuOpen,
+                $"Failed to close the host menu: {closed?.Error}"
+            );
+
+            var ended = await PollingHelper.WaitUntilAsync(
+                WaitName.Polling_Festival_FairEndedAfterMenuCleared,
+                async () =>
+                {
+                    var state = await ServerApi.GetFestivalState(ct);
+                    return state?.IsFestivalActive == false;
+                },
+                timeout: TestTimings.NetworkSyncTimeout,
+                cancellationToken: ct
+            );
+            Assert.True(
+                ended,
+                "After the host menu cleared, the deferred leave should end the Fair. A latched "
+                    + "_startedFestivalEnd would make HandleFestivalLeave early-return and strand it."
+            );
+            LogSuccess(
+                "Fair deferred the leave while a host menu was open, then ended cleanly once it cleared"
+            );
+        }
+        finally
+        {
+            // Non-cancellable so cleanup still runs if ct was cancelled. Idempotent on the happy path
+            // (the menu is already closed above).
+            await ServerApi.SetHostMenu(open: false, CancellationToken.None);
+        }
+    }
+
+    /// <summary>
+    /// The Luau adds the iridium starfruit to the soup exactly once, even when <c>!event</c>
+    /// fast-forwards the countdown after the on-entry announce. This test locks that in — enter the
+    /// Luau (the on-entry announce adds the starfruit once), then <c>!event</c>, and assert the soup
+    /// still holds exactly one.
+    /// </summary>
+    [Fact]
+    public async Task Luau_AddsIridiumStarfruitExactlyOnce()
+    {
+        var ct = TestCt;
+
+        await EnterFestivalAsync(
+            LuauSeason,
+            LuauBeforeDay,
+            LuauDay,
+            LuauWindow,
+            LuauLocation,
+            BeachEntryTile,
+            namePrefix: "FestLuau",
+            ct
+        );
+
+        // The on-entry announce (OnAnnounce = AddIridiumStarfruitToSoup) adds the starfruit once and is
+        // broadcast as the "Soup Tasting" message. Waiting for it guarantees the add ran before !event.
+        var announce = await GameClient.Chat.WaitForMessageContainingAsync(
+            new[] { "Soup Tasting", "!event" },
+            timeout: TestTimings.ChatCommandTimeout
+        );
+        Assert.NotNull(announce);
+
+        // Confirm the on-entry add is observable as exactly one before fast-forwarding.
+        var addedOnce = await PollingHelper.WaitUntilAsync(
+            WaitName.Polling_Festival_LuauStarfruitAdded,
+            async () =>
+            {
+                var s = await ServerApi.GetFestivalState(ct);
+                return s?.LuauIridiumStarfruitCount == 1;
+            },
+            timeout: TestTimings.NetworkSyncTimeout,
+            cancellationToken: ct
+        );
+        Assert.True(
+            addedOnce,
+            "The Luau on-entry announce should add exactly one iridium starfruit to the soup."
+        );
+
+        // Fast-forward the countdown — this must not re-add the starfruit. The main event fires in the
+        // same pass.
+        var sent = await GameClient.Chat.Send("!event");
+        Assert.True(sent?.Success == true, $"Sending !event failed: {sent?.Error}");
+
+        // Assert the count never exceeds one across the settle window. A regressed guard adds the
+        // second starfruit in the same tick !event is consumed, so it is caught on the first poll.
+        var doubleAdded = await PollingHelper.WaitUntilAsync(
+            WaitName.Polling_Festival_LuauStarfruitStaysOne,
+            async () =>
+            {
+                var s = await ServerApi.GetFestivalState(ct);
+                return s?.LuauIridiumStarfruitCount is > 1;
+            },
+            timeout: FestivalSettleWindow,
+            cancellationToken: ct
+        );
+        Assert.False(
+            doubleAdded,
+            "The Luau soup held more than one iridium starfruit after !event — it must be added exactly "
+                + "once per festival, even when !event fast-forwards the countdown."
+        );
+
+        var finalState = await ServerApi.GetFestivalState(ct);
+        Assert.NotNull(finalState);
+        Assert.True(finalState.Success, $"festival_state read failed: {finalState.Error}");
+        Assert.True(
+            finalState.LuauIridiumStarfruitCount == 1,
+            "Expected exactly one iridium starfruit in the Luau soup after !event; got "
+                + $"{finalState.LuauIridiumStarfruitCount}."
+        );
+        LogSuccess("Luau added the iridium starfruit exactly once across the !event fast-forward");
+    }
+
+    /// <summary>
     /// Connects a client, sleeps through to the given festival day, moves the clock into the
     /// festival window, waits for the client to sync into that window, warps it into the festival
     /// map, and waits until the host has warped in and the festival is active. Returns the client.
@@ -374,7 +671,7 @@ public class FestivalTests : TestBase
         Assert.NotNull(setDate);
         Assert.True(setDate.Success, $"SetDate({season} {dayBefore}) failed: {setDate.Error}");
 
-        var farmhand = await Farmers.ConnectNewAsync(namePrefix: namePrefix, ct: ct);
+        var farmhand = await Farmers.ConnectFastAsync(namePrefix: namePrefix, ct: ct);
 
         // Sleep-through to the festival day. The client sleeps, the host auto-sleeps, and the
         // day transitions — the only path that populates Game1.whereIsTodaysFest (a /test/set_date

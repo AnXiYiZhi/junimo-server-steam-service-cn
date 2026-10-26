@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using System.Text;
 using System.Text.RegularExpressions;
-using Docker.DotNet.Models;
 using DotNet.Testcontainers.Builders;
 using DotNet.Testcontainers.Containers;
 using DotNet.Testcontainers.Images;
@@ -156,11 +155,8 @@ public class ServerContainer : IAsyncDisposable
         }
     }
 
-    // Server error patterns to ignore (known non-fatal)
-    private static readonly string[] IgnoredErrorPatterns = new[]
-    {
-        "XACT", // Audio initialization fails in headless mode
-    };
+    // Server error patterns to ignore (known non-fatal). Empty: every [ERROR] line counts.
+    private static readonly string[] IgnoredErrorPatterns = Array.Empty<string>();
 
     private ServerContainer(
         IContainer serverContainer,
@@ -265,8 +261,28 @@ public class ServerContainer : IAsyncDisposable
             .WithEnvironment("SETTINGS_PATH", SettingsPath)
             .WithEnvironment("API_ENABLED", "true")
             .WithEnvironment("API_PORT", ContainerApiPort.ToString())
-            // Performance/test settings
-            .WithEnvironment("SERVER_TPS", TestEnvLoader.Get("SERVER_TPS") ?? "60")
+            // Performance/test settings. A per-class ServerTps override (TestServerAttribute) wins over
+            // the suite-wide .env.test value — it is part of the server pooling key, so a distinct TPS
+            // gets its own server instance.
+            .WithEnvironment(
+                "SERVER_TPS",
+                options.ServerTps > 0
+                    ? options.ServerTps.ToString()
+                    : TestEnvLoader.Get("SERVER_TPS") ?? "60"
+            )
+            // Kill-switch for the TPS-agnostic pacing patches (fades + movement sub-step). Default-on
+            // in the mod; pass .env.test's value through so a run can set it =false to A/B the patches
+            // (movement reverts to ~60/TPS× slow). Passing the default "true" is a no-op.
+            .WithEnvironment(
+                "SDVD_TPS_AGNOSTIC_PACING",
+                TestEnvLoader.Get("SDVD_TPS_AGNOSTIC_PACING") ?? "true"
+            )
+            // Tests that advance a day with no client connected wait on this grace, so it
+            // defaults to seconds here instead of the production 300.
+            .WithEnvironment(
+                "AUTO_SLEEP_GRACE_SECONDS",
+                TestEnvLoader.Get("AUTO_SLEEP_GRACE_SECONDS") ?? "5"
+            )
             // SERVER_FPS drives both the in-container draw cap and the recorder's
             // sample rate (they're literally the same value; sampling X11 faster
             // than the framebuffer updates is wasted). 0 = rendering disabled.
@@ -286,12 +302,9 @@ public class ServerContainer : IAsyncDisposable
             )
             // GPU passthrough — per-host, no-op on hosts without GPU
             .WithGpuIfEnabled(host)
-            // SYS_TIME capability for GOG Galaxy auth + Docker labels for ownership
+            // Docker labels for ownership
             .WithCreateParameterModifier(p =>
             {
-                p.HostConfig ??= new HostConfig();
-                p.HostConfig.CapAdd ??= new List<string>();
-                p.HostConfig.CapAdd.Add("SYS_TIME");
                 p.Labels ??= new Dictionary<string, string>();
                 p.Labels["sdvd.test"] = "true";
                 p.Labels["sdvd.run-id"] = runId;
@@ -389,24 +402,30 @@ public class ServerContainer : IAsyncDisposable
         Action<string>? logCallback
     )
     {
+        // PascalCase keys, matching the shape the mod itself writes (ServerSettingsLoader's
+        // Newtonsoft serialization of ServerSettings) — the mod rewrites this file at game
+        // creation and migration commit, so seeding it in the same shape keeps one key
+        // casing across both writers (the mod reads either casing, but file-level tooling
+        // like ServerSettingsFileHelper's sed should not have to).
         var settings = new
         {
-            game = new
+            Game = new
             {
-                farmName = options.FarmName,
-                farmType = options.FarmType.ToJsonValue(),
-                profitMargin = options.ProfitMargin,
-                startingCabins = options.StartingCabins,
-                spawnMonstersAtNight = options.SpawnMonstersAtNight,
+                FarmName = options.FarmName,
+                FarmType = options.FarmType.ToJsonValue(),
+                ProfitMargin = options.ProfitMargin,
+                StartingCabins = options.StartingCabins,
+                SpawnMonstersAtNight = options.SpawnMonstersAtNight,
             },
-            server = new
+            Server = new
             {
-                maxPlayers = options.MaxPlayers,
-                cabinStrategy = options.CabinStrategy,
-                separateWallets = options.SeparateWallets,
-                existingCabinBehavior = options.ExistingCabinBehavior,
-                verboseLogging = false,
-                allowIpConnections = options.AllowIpConnections,
+                MaxPlayers = options.MaxPlayers,
+                CabinStrategy = options.CabinStrategy,
+                SeparateWallets = options.SeparateWallets,
+                ExistingCabinBehavior = options.ExistingCabinBehavior,
+                VerboseLogging = false,
+                AllowIpConnections = options.AllowIpConnections,
+                AllowCabinRelocation = options.AllowCabinRelocation,
             },
         };
 
@@ -613,7 +632,8 @@ public class ServerContainer : IAsyncDisposable
         // Resolve coordinator-visible ports through TunnelManager so callers
         // never see a remote daemon's 127.0.0.1 directly. For local hosts the
         // forward is a no-op and the coordinator-side port equals the mapped
-        // port; for remote hosts it is opened over a per-forward `ssh -N -L`.
+        // port; for remote hosts it is opened via `ssh -O forward` against the
+        // host's ControlMaster.
         var apiMapped = _serverContainer.GetMappedPublicPort(ContainerApiPort);
         var vncMapped = _serverContainer.GetMappedPublicPort(ContainerVncPort);
         _apiForward = await _tunnels.OpenAsync(HostId, SshDestination, SshKeyPath, apiMapped, ct);
@@ -713,8 +733,7 @@ public class ServerContainer : IAsyncDisposable
         Action<string>? onProgress = null
     )
     {
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(_options.ReadyTimeout);
+        using var timeoutCts = Cts.LinkedTimeout(ct, _options.ReadyTimeout);
 
         // Only wait for invite code on Steam servers (Galaxy SDK must initialize first)
         var requireInviteCode = _options.WithSteam;
@@ -722,13 +741,13 @@ public class ServerContainer : IAsyncDisposable
         var client = new ServerApiClient(
             BaseUrl,
             liveBaseUrl: () => BaseUrl,
-            healAsync: HealApiForwardAsync
+            healAsync: HealApiForwardAsync,
+            hostId: HostId
         );
         try
         {
             var status = await client.WaitForServerOnline(
                 _options.ReadyTimeout,
-                TimeSpan.FromSeconds(2),
                 timeoutCts.Token,
                 msg =>
                 {
@@ -756,12 +775,40 @@ public class ServerContainer : IAsyncDisposable
         }
     }
 
+    private Action<string>? _onErrorDetected;
+
     /// <summary>
-    /// Gets a cancellation token that triggers when a server error is detected.
+    /// Raised once per detected server error (a flushed SMAPI ERROR/FATAL block) with the
+    /// full error text. Errors detected before a handler attaches are replayed to it at
+    /// subscription — a subscriber that wires up after boot cannot miss a boot-window
+    /// error — so delivery is at-least-once and handlers must be idempotent. Handlers
+    /// stay attached for the container's lifetime — <see cref="ClearErrors"/> resets the
+    /// accumulated error list, not this event.
     /// </summary>
-    public CancellationToken GetErrorCancellationToken()
+    public event Action<string> OnErrorDetected
     {
-        return _errorCancellation?.Token ?? CancellationToken.None;
+        add
+        {
+            string[] pending;
+            lock (_serverErrorsLock)
+            {
+                _onErrorDetected += value;
+                pending = _serverErrors.ToArray();
+            }
+            // Replay outside the lock: handlers do nontrivial work (poison → drain →
+            // dispose), and a throw here surfaces in the subscriber's own context.
+            foreach (var error in pending)
+            {
+                value(error);
+            }
+        }
+        remove
+        {
+            lock (_serverErrorsLock)
+            {
+                _onErrorDetected -= value;
+            }
+        }
     }
 
     /// <summary>
@@ -797,7 +844,8 @@ public class ServerContainer : IAsyncDisposable
         return new ServerApiClient(
             BaseUrl,
             liveBaseUrl: () => BaseUrl,
-            healAsync: HealApiForwardAsync
+            healAsync: HealApiForwardAsync,
+            hostId: HostId
         );
     }
 
@@ -927,6 +975,7 @@ public class ServerContainer : IAsyncDisposable
             _host.ApiClient,
             _serverContainer,
             $"server-{_serverIndex}",
+            HostId,
             HandleLine,
             msg => _logCallback?.Invoke(msg)
         );
@@ -988,13 +1037,24 @@ public class ServerContainer : IAsyncDisposable
             // Continuation line belonging to the current error
             _currentErrorDetails.Add(line.TrimEnd());
         }
-        else if (line.StartsWith("Process terminated.", StringComparison.Ordinal))
+        else if (IsUnprefixedCrashHeader(line))
         {
-            // .NET runtime FailFast (e.g. missing libicu) prints unprefixed to
-            // stderr — start a fatal error block so startup fails as an app
-            // crash instead of masquerading as a daemon/transport timeout.
+            // The .NET runtime writes these unprefixed to stderr — start a fatal
+            // error block so startup fails as an app crash instead of
+            // masquerading as a daemon/transport timeout.
             _currentErrorHeader = line;
         }
+    }
+
+    // Fatal crash headers the runtime writes without a SMAPI prefix: FailFast
+    // (e.g. missing libicu), an unhandled exception that escaped SMAPI's
+    // handlers, or a stack overflow.
+    private static bool IsUnprefixedCrashHeader(string line)
+    {
+        return line.StartsWith("Process terminated.", StringComparison.Ordinal)
+            || line.StartsWith("Unhandled exception.", StringComparison.Ordinal)
+            || line.StartsWith("Unhandled Exception:", StringComparison.Ordinal)
+            || line.StartsWith("Stack overflow.", StringComparison.Ordinal);
     }
 
     private void FlushError()
@@ -1017,6 +1077,13 @@ public class ServerContainer : IAsyncDisposable
         try
         {
             _errorCancellation?.Cancel();
+        }
+        catch { }
+        // Guarded like the Cancel above: a throwing handler must not kill the log pump
+        // (it also feeds recording and error accumulation).
+        try
+        {
+            _onErrorDetected?.Invoke(fullError);
         }
         catch { }
 
@@ -1143,10 +1210,14 @@ public class ServerContainer : IAsyncDisposable
                     }
                 }
             }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            catch (OperationCanceledException)
             {
+                // Cancelled by ShutdownCoordinator.Token (Ctrl+C / Docker-down) or by the host
+                // ExtractLimiter's poison token (host disconnect, or the broker's stopOnFail
+                // limiter-cancel). No inner call in this block applies its own timeout, so an OCE
+                // here is always a teardown cancellation — not a retrieval failure to warn about.
                 _logCallback?.Invoke(
-                    $"[Recording] server-{_serverIndex} recording extraction cancelled (shutdown)"
+                    $"[Recording] server-{_serverIndex} recording extraction cancelled (teardown)"
                 );
             }
             catch (Exception ex)

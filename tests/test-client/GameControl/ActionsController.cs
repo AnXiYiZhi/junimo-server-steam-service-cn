@@ -314,6 +314,51 @@ public class ActionsController
     }
 
     /// <summary>
+    /// Till a tile into a terrain HoeDirt via the vanilla hoe path
+    /// (<c>GameLocation.makeHoeDirt</c>), which checks the Diggable tile
+    /// property and collisions the way a real hoe swing does.
+    /// </summary>
+    public TillTileResult TillTile(string locationName, int tileX, int tileY)
+    {
+        if (!Context.IsWorldReady)
+        {
+            return new TillTileResult { Success = false, Error = "Not in a game world" };
+        }
+
+        if (Game1.player.currentLocation?.Name != locationName)
+        {
+            return new TillTileResult
+            {
+                Success = false,
+                Error =
+                    $"Player is on '{Game1.player.currentLocation?.Name}', not '{locationName}'",
+            };
+        }
+
+        var location = Game1.player.currentLocation;
+        var tile = new Vector2(tileX, tileY);
+
+        if (!location.makeHoeDirt(tile))
+        {
+            return new TillTileResult
+            {
+                Success = false,
+                Error =
+                    $"makeHoeDirt refused ({tileX},{tileY}) — tile not Diggable, blocked, "
+                    + "or already tilled",
+            };
+        }
+
+        return new TillTileResult
+        {
+            Success = true,
+            LocationName = locationName,
+            TileX = tileX,
+            TileY = tileY,
+        };
+    }
+
+    /// <summary>
     /// Plant a seed via <c>HoeDirt.plant</c>. The dirt may be a terrain HoeDirt or
     /// the inner HoeDirt of a Garden Pot at the same tile. <c>plant</c> requires
     /// <c>player.currentLocation == dirt.Location</c>.
@@ -338,14 +383,18 @@ public class ActionsController
         var location = Game1.player.currentLocation;
         var tile = new Vector2(tileX, tileY);
 
+        // Pot first: a Garden Pot on a tilled tile coexists with an empty
+        // terrain HoeDirt at the same key, and real interaction always reaches
+        // the pot (it occupies the tile) — mirrors CropSaver's
+        // pot-wins-the-tile rule so tests plant where a player would.
         HoeDirt? dirt = null;
-        if (location.terrainFeatures.TryGetValue(tile, out var tf) && tf is HoeDirt td)
-        {
-            dirt = td;
-        }
-        else if (location.Objects.TryGetValue(tile, out var obj) && obj is IndoorPot pot)
+        if (location.Objects.TryGetValue(tile, out var obj) && obj is IndoorPot pot)
         {
             dirt = pot.hoeDirt.Value;
+        }
+        else if (location.terrainFeatures.TryGetValue(tile, out var tf) && tf is HoeDirt td)
+        {
+            dirt = td;
         }
 
         if (dirt == null)
@@ -379,7 +428,7 @@ public class ActionsController
     /// <summary>
     /// Lists this client's view of the farm's cabin buildings (name + tile). The server
     /// rewrites each peer's locationIntroduction copy (CabinManagerService), so the client's
-    /// farm can differ from master state — e.g. a dummy cabin relocated to the shared stack
+    /// farm can differ from master state — e.g. a door-less dummy cabin at the shared stack
     /// for a player whose own cabin was moved. /cabins (master state) cannot observe that, so
     /// this is the positive-observation gate for the per-peer cabin mutations.
     /// </summary>
@@ -404,12 +453,15 @@ public class ActionsController
                 continue;
             }
 
+            var door = building.getPointForHumanDoor();
             cabins.Add(
                 new FarmBuildingInfo
                 {
                     Name = building.GetIndoors()?.NameOrUniqueName ?? "",
                     TileX = building.tileX.Value,
                     TileY = building.tileY.Value,
+                    DoorX = door.X,
+                    DoorY = door.Y,
                     // HasInterior == false means the door is dead: Building.doAction only warps
                     // the player inside when GetIndoors() != null, so a null interior is an
                     // unenterable (door-dead) cabin — what the dummy-cabin prop must be.
@@ -418,7 +470,168 @@ public class ActionsController
             );
         }
 
-        return new FarmBuildingsResult { Success = true, Cabins = cabins };
+        return new FarmBuildingsResult
+        {
+            Success = true,
+            Cabins = cabins,
+            // Game1.getFarm() answers from the current location's root when the player is
+            // inside a building, so a Farm replaced by a re-sent introduction while the player
+            // stood in one of its interiors is reachable here but absent from Game1.locations.
+            IsLiveFarm = Game1.locations.Contains(farm),
+        };
+    }
+
+    /// <summary>
+    /// Lists the current location's warps as this client resolves them. Warp targets ride
+    /// replication deltas whose values stay invisible until the netcode interpolation
+    /// window elapses (15 client ticks), so tests poll this before walking onto a warp —
+    /// the values here are exactly what a walk would use.
+    /// </summary>
+    public LocationWarpsResult GetLocationWarps()
+    {
+        if (!Context.IsWorldReady)
+        {
+            return new LocationWarpsResult { Success = false, Error = "Not in a game world" };
+        }
+
+        var location = Game1.currentLocation;
+        if (location == null)
+        {
+            return new LocationWarpsResult { Success = false, Error = "No current location" };
+        }
+
+        return new LocationWarpsResult
+        {
+            Success = true,
+            LocationName = location.NameOrUniqueName,
+            Warps = location
+                .warps.Select(w => new LocationWarpInfo
+                {
+                    X = w.X,
+                    Y = w.Y,
+                    TargetName = w.TargetName,
+                    TargetX = w.TargetX,
+                    TargetY = w.TargetY,
+                })
+                .ToList(),
+        };
+    }
+
+    /// <summary>
+    /// Walks the player onto a warp/door tile and triggers the resulting transition the way
+    /// real play does. With no tile given, targets the current location's first warp (a
+    /// cabin interior's only warps are its exit mat). The player is stood on the adjacent
+    /// tile opposite <paramref name="direction"/> and then stepped forward with the exact
+    /// per-step pair vanilla movement runs (Farmer.MovePositionImpl: nextPosition →
+    /// GameLocation.isCollidingWithWarp → Farmer.warpFarmer); when no warp triggers along
+    /// the walk, the action-press door path is tried at the target tile
+    /// (GameLocation.checkAction — building humanDoors warp via Building.doAction).
+    /// Source of truth: decompiled Farmer.MovePositionImpl / GameLocation.checkAction —
+    /// keep this in sync if their resolution changes. The transition itself is
+    /// asynchronous; callers confirm arrival via /status (WaitForLocationAsync).
+    /// </summary>
+    public WalkOntoTileResult WalkOntoTile(int? tileX, int? tileY, int direction = 2)
+    {
+        if (!Context.IsWorldReady)
+        {
+            return new WalkOntoTileResult { Success = false, Error = "Not in a game world" };
+        }
+
+        if (Game1.eventUp)
+        {
+            return new WalkOntoTileResult
+            {
+                Success = false,
+                Error = "An event is up; warps are suppressed (Farmer.warpFarmer no-ops)",
+            };
+        }
+
+        var location = Game1.currentLocation;
+        if (location == null)
+        {
+            return new WalkOntoTileResult { Success = false, Error = "No current location" };
+        }
+
+        if (tileX == null || tileY == null)
+        {
+            var firstWarp = location.warps.FirstOrDefault();
+            if (firstWarp == null)
+            {
+                return new WalkOntoTileResult
+                {
+                    Success = false,
+                    Error = $"No warps in {location.NameOrUniqueName} to auto-target",
+                };
+            }
+
+            tileX = firstWarp.X;
+            tileY = firstWarp.Y;
+        }
+
+        var player = Game1.player;
+        var (standX, standY) = direction switch
+        {
+            0 => (tileX.Value, tileY.Value + 1), // stepping up
+            1 => (tileX.Value - 1, tileY.Value), // stepping right
+            3 => (tileX.Value + 1, tileY.Value), // stepping left
+            _ => (tileX.Value, tileY.Value - 1), // stepping down (default)
+        };
+        player.Position = new Vector2(standX * 64f, standY * 64f);
+        player.faceDirection(direction);
+
+        // Walk up to two tiles, mirroring MovePositionImpl's per-step warp check + advance.
+        var speed = Math.Max(1f, player.getMovementSpeed());
+        var (dx, dy) = direction switch
+        {
+            0 => (0f, -1f),
+            1 => (1f, 0f),
+            3 => (-1f, 0f),
+            _ => (0f, 1f),
+        };
+        var maxSteps = (int)Math.Ceiling(128f / speed);
+        for (var i = 0; i < maxSteps; i++)
+        {
+            var next = player.nextPosition(direction);
+            var warp = location.isCollidingWithWarp(next, player);
+            if (warp != null)
+            {
+                player.warpFarmer(warp, direction);
+                return new WalkOntoTileResult
+                {
+                    Success = true,
+                    Via = "warp",
+                    TargetLocation = warp.TargetName,
+                    TargetX = warp.TargetX,
+                    TargetY = warp.TargetY,
+                };
+            }
+
+            player.Position += new Vector2(dx * speed, dy * speed);
+        }
+
+        // No warp along the walk — try the action-press door path at the target tile.
+        if (
+            location.checkAction(
+                new xTile.Dimensions.Location(tileX.Value, tileY.Value),
+                Game1.viewport,
+                player
+            )
+        )
+        {
+            return new WalkOntoTileResult
+            {
+                Success = true,
+                Via = "door",
+                TargetLocation = Game1.locationRequest?.Name,
+            };
+        }
+
+        return new WalkOntoTileResult
+        {
+            Success = false,
+            Error =
+                $"No warp or door triggered at ({tileX},{tileY}) in {location.NameOrUniqueName}",
+        };
     }
 }
 
@@ -427,6 +640,10 @@ public class FarmBuildingInfo
     public string Name { get; set; } = "";
     public int TileX { get; set; }
     public int TileY { get; set; }
+
+    /// <summary>Tile of the human door (Building.getPointForHumanDoor): the walk-onto target.</summary>
+    public int DoorX { get; set; }
+    public int DoorY { get; set; }
 
     /// <summary>True if this building has an interior the player can enter (door is live).</summary>
     public bool HasInterior { get; set; }
@@ -437,6 +654,63 @@ public class FarmBuildingsResult
     public bool Success { get; set; }
     public string? Error { get; set; }
     public List<FarmBuildingInfo> Cabins { get; set; } = new();
+
+    /// <summary>
+    /// True when the farm this view was read from is the one in Game1.locations. False means
+    /// the player stands inside an interior of a Farm that a re-sent introduction replaced.
+    /// </summary>
+    public bool IsLiveFarm { get; set; }
+}
+
+public class LocationWarpInfo
+{
+    /// <summary>Trigger tile in the current location.</summary>
+    public int X { get; set; }
+
+    public int Y { get; set; }
+
+    public string TargetName { get; set; } = "";
+
+    /// <summary>Landing tile in the target location, as currently visible to this client.</summary>
+    public int TargetX { get; set; }
+
+    public int TargetY { get; set; }
+}
+
+public class LocationWarpsResult
+{
+    public bool Success { get; set; }
+    public string? Error { get; set; }
+    public string? LocationName { get; set; }
+    public List<LocationWarpInfo> Warps { get; set; } = new();
+}
+
+public class WalkOntoTileParams
+{
+    /// <summary>Target tile. Omit both to auto-target the current location's first warp.</summary>
+    public int? TileX { get; set; }
+
+    public int? TileY { get; set; }
+
+    /// <summary>Step direction (0 up, 1 right, 2 down, 3 left). Default: 2 (down).</summary>
+    public int Direction { get; set; } = 2;
+}
+
+public class WalkOntoTileResult
+{
+    public bool Success { get; set; }
+    public string? Error { get; set; }
+
+    /// <summary>How the transition triggered: "warp" (touch warp) or "door" (action press).</summary>
+    public string? Via { get; set; }
+
+    /// <summary>The transition's target location name (for "door", the queued request's name).</summary>
+    public string? TargetLocation { get; set; }
+
+    /// <summary>Warp landing tile ("warp" only).</summary>
+    public int? TargetX { get; set; }
+
+    public int? TargetY { get; set; }
 }
 
 public class SleepResult
@@ -521,6 +795,22 @@ public class ClearAreaParams
     public int TileY { get; set; }
     public int Width { get; set; }
     public int Height { get; set; }
+}
+
+public class TillTileResult
+{
+    public bool Success { get; set; }
+    public string? Error { get; set; }
+    public string? LocationName { get; set; }
+    public int? TileX { get; set; }
+    public int? TileY { get; set; }
+}
+
+public class TillTileParams
+{
+    public string LocationName { get; set; } = "";
+    public int TileX { get; set; }
+    public int TileY { get; set; }
 }
 
 public class PlantCropResult

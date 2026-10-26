@@ -26,7 +26,7 @@ public class SteamAuthApiClient : IDisposable
     {
         _baseUrl = baseUrl.TrimEnd('/');
         // Handler pipeline: correlation handler adds X-Request-Id from the
-        // ambient ModRequestContext, then the default handler sends.
+        // ambient RequestContext, then the default handler sends.
         var correlationHandler = new SteamAuthCorrelationHandler
         {
             InnerHandler = new HttpClientHandler(),
@@ -328,6 +328,11 @@ public class HealthAccount
     public int index { get; set; }
     public bool logged_in { get; set; }
     public string steam_id { get; set; }
+
+    // Token health, re-exposed by the mod's /status and /health as authReadiness. The sidecar
+    // computes token_days_remaining from the refresh token's JWT exp claim.
+    public string token_expires_at { get; set; }
+    public int? token_days_remaining { get; set; }
 }
 
 public class LoginStatusResponse

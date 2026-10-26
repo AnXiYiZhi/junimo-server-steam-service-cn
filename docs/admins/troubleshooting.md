@@ -53,7 +53,13 @@ Common fixes:
 
 ### Token expired
 
-Steam tokens last about 200 days. When expired:
+Steam tokens last about 200 days. The steam-auth container asks Steam to renew its token once a day and saves the new one when Steam agrees — which it only does close to expiry. For the last 14 days before expiry, a daily warning in `docker compose logs steam-auth` reports the latest renewal result:
+
+- **"Steam declined to renew it today"** — expected until Steam's renewal window opens; the warning stops once a renewal succeeds.
+- **"Renewal failed with AccessDenied"** (or another Steam result) — Steam rejected this renewal attempt; if it keeps failing, re-run setup before the expiry date in the warning.
+- Tokens supplied via `STEAM_REFRESH_TOKEN` or `STEAM_ACCOUNTS` are never renewed; mint a new one with `setup` and `export-token`, then update the variable.
+
+Once a token has expired, the log says so and names the fix:
 
 ```sh
 docker compose run --rm -it steam-auth setup
@@ -87,7 +93,7 @@ If you are using the **same Steam account** for both the server and your game cl
 
 **Solution:** Use a **separate Steam account** for the server. The server account must own a copy of Stardew Valley.
 
-If a dedicated account isn't available, connect as the host via direct IP instead of invite code, and have other players use the invite code.
+If a dedicated account isn't available, connect as the host via direct IP instead of invite code, and have other players use the invite code. Note that a farmer created over direct IP isn't tied to your Steam account (see [Farmhand Ownership](/admins/configuration/server-settings#farmhand-ownership)).
 :::
 
 This is the most common cause when:
@@ -109,11 +115,36 @@ If "Hairpinning: Not supported":
 - Use a VPN service
 - Enable direct IP connections (if acceptable for your use case)
 
+### A player's farmer is missing from their selection list
+
+Farmers are scoped to the connection's platform identity (see
+[Farmhand Ownership](/admins/configuration/server-settings#farmhand-ownership)): a farmer created
+via a Steam/GOG invite code is offered only to that account, and a farmer created over direct IP is
+offered only to direct-IP players.
+
+1. Ask how they connected — the usual cause is joining via direct IP after creating the farmer via
+   an invite code (or the other way around). Reconnecting the original way restores the farmer.
+2. Steam-specific: the same Steam account presents **two different identities depending on the
+   join door**. The friends list and the S-prefixed invite code both connect through Steam and
+   present the account's Steam id; the G-prefixed (GOG) code connects through Galaxy and presents
+   a different id for the same account. A farmer created through one door is hidden behind the
+   other, and the two identities cannot be linked automatically — have the player rejoin through
+   the door they created the farmer with, or rebind (below).
+3. To move a farmer to another account or connection method, use
+   [`farmhand rebind <name> <id>`](/admins/operations/commands#farmhand) with the id from the
+   `Client connected via ...` log line, or `farmhand release <name>` to unlock the slot so the
+   next player to select it (on any connection method) becomes its owner.
+
+Every rejected selection attempt is logged at Info level with the reason (and, where applicable, a
+ready-to-run fix command) — check the server log when a player reports a locked or missing farmer.
+
 ### Intermittent disconnections
 
 - Check server resources: `docker stats`
 - Review logs for errors: `docker compose logs -f`
 - Consider increasing server RAM if low on memory
+- Players drop about 30 seconds after joining via a GOG invite code: the host clock is wrong. See
+  [System Clock](/admins/quick-start/prerequisites#system-clock).
 
 ### Steam clients specifically failing
 
@@ -123,13 +154,55 @@ Check for these log messages:
 |---------|---------|-----|
 | `GameServer.Init() failed` | Steamworks SDK issue | Restart, check game files |
 | `Failed to connect to Steam servers` | Network issue | Check firewall, outbound UDP |
-| `SDR relay status: Unknown` | SDR initializing | Wait a few seconds, retry |
+| `SDR relay status: Unknown` | Steam relay initializing | Wait a few seconds, retry |
 
 ### GOG clients specifically failing
 
-- Verify invite code starts with "G"
+- Verify the invite code is current (`info` in the CLI)
 - Run `netdebug nat` to check NAT type
 - GOG has ~50% success rate vs Steam's ~99%
+
+### Capturing Galaxy SDK logs
+
+Invite-code joins go through the GOG Galaxy SDK, a native library the game loads. When a join fails
+before it reaches the server (nothing in the server log, or a client shows `Galaxy auth failure` /
+`RequestLobbyData: not logged on`), the SDK's own log is the only place the reason appears.
+
+The SDK writes it when it finds a `GalaxyPeer.ini` at startup, the same mechanism GOG describes in
+its [developer FAQ](https://docs.gog.com/faq/#dev-support-logs). On the standard server image, put
+the file in the game volume and restart:
+
+```sh
+docker compose exec server sh -c 'cat > /data/game/GalaxyPeer.ini <<EOF
+[DEFAULT]
+Logging.appenders = File
+
+Logging.Appender.File.level = DEBUG
+Logging.Appender.File.type = file
+Logging.Appender.File.filename = /data/game/GalaxyPeer-{pid}.log
+Logging.Appender.File.truncate = false
+EOF'
+docker compose restart server
+```
+
+From the next start the SDK writes `/data/game/GalaxyPeer-<pid>.log`, one file per start. Both
+files live in the game volume, so they survive `docker compose down`. Once the problem has
+happened, run [`diagnostics`](/admins/operations/commands#collecting-server-diagnostics) — the zip
+picks the log up — and remove the files so they stop growing:
+
+```sh
+docker compose exec server sh -c 'rm -f /data/game/GalaxyPeer.ini /data/game/GalaxyPeer-*.log'
+docker compose restart server
+```
+
+- The log is DEBUG level and never rotates. Leave it enabled only while capturing a problem.
+- GOG's stock `GalaxyPeer.ini` also streams the log to a GOG syslog server. The version above keeps
+  only the file appender; do not add the `Syslog` lines back.
+- The log contains account ids and IP addresses. Check it before posting it publicly.
+- The same file works on a player's PC next to `Stardew Valley.exe` (with a relative `filename`
+  such as `GalaxyPeer-{pid}.log`) and captures the client side of a failed join, which is usually
+  the more useful half when the server logs nothing.
+- The [modern (Alpine) image](/admins/operations/modern-docker) does not pick the file up.
 
 ## VNC Issues
 
@@ -197,6 +270,10 @@ docker compose exec server ls -al /data/game/save-backups
 # Restore (replace BACKUP_FILENAME)
 docker compose exec server unzip "/data/game/save-backups/BACKUP_FILENAME.zip" -d /config/xdg/config/StardewValley/Saves/
 ```
+
+### A day was lost / need to go back one day
+
+The game keeps the previous save as `_old` files in the save folder. See [Rolling back one day](/features/backup#rolling-back-one-day) to swap it in — it backs up the folder and prints both dates first.
 
 ## Mod Issues
 
@@ -300,7 +377,9 @@ docker system prune
 
 If none of these solutions work:
 
-1. **Collect logs:** `docker compose logs > logs.txt`
+1. **Collect logs:** `docker compose exec -it server diagnostics` (see
+   [Collecting server diagnostics](/admins/operations/commands#collecting-server-diagnostics)); for
+   invite-code join failures, [enable Galaxy SDK logging](#capturing-galaxy-sdk-logs) first
 2. **Check GitHub Issues:** [stardew-valley-dedicated-server/server/issues](https://github.com/stardew-valley-dedicated-server/server/issues)
 3. **Join Discord:** [discord.gg/w23GVXdSF7](https://discord.gg/w23GVXdSF7)
 4. **Create an issue:** Include logs, configuration (without passwords), and steps to reproduce

@@ -20,17 +20,16 @@ public static class CabinCommand
     {
         chatCommandsService.RegisterCommand(
             "cabin",
-            "Moves your cabin to the right of your player.\nThis will clear basic debris to make space.\nUse '!cabin reset' to send your cabin back to the shared stack.",
+            "Moves or resets your cabin (!cabin reset).",
             (args, msg) =>
             {
-                if (cabinService.options.IsFarmHouseStack)
+                if (!cabinService.options.AllowCabinRelocation)
                 {
-                    // FarmhouseStack rejects both move and reset before any subcommand
-                    // parsing: cabins stay in the farmhouse, so there is nothing to move
-                    // or to send back to a stack.
+                    // The relocation switch rejects both move and reset before any
+                    // subcommand parsing, uniformly across all cabin strategies.
                     helper.SendPrivateMessage(
                         msg.SourceFarmer,
-                        "Can't move cabin. The host has chosen to keep all cabins in the farmhouse."
+                        "Cabin relocation is disabled on this server."
                     );
                     return;
                 }
@@ -43,7 +42,10 @@ public static class CabinCommand
 
                 var farmer = Game1.GetPlayer(msg.SourceFarmer);
 
-                if (farmer.currentLocation.Name != "Farm")
+                // Null-conditional: Game1.GetPlayer returns null for a farmer who dropped
+                // between sending the command and this handler running — treat that as
+                // off-Farm rather than throwing an NRE inside the handler.
+                if (farmer?.currentLocation?.Name != "Farm")
                 {
                     helper.SendPrivateMessage(
                         msg.SourceFarmer,
@@ -72,6 +74,33 @@ public static class CabinCommand
                 // Place cabin on the right-hand side of the farmer
                 var topLeft = new Point((int)farmer.Tile.X + 1, (int)farmer.Tile.Y);
 
+                // Under CabinStack the stack spot is empty on the master but every client
+                // renders a cabin there. Player moves only: migration may still use the spot.
+                if (cabinService.options.IsCabinStack)
+                {
+                    var stack = StackLocation.Create(cabinService.Data).ToPoint();
+                    var stackRect = new Rectangle(
+                        stack.X,
+                        stack.Y,
+                        cabin.tilesWide.Value,
+                        cabin.tilesHigh.Value
+                    );
+                    var targetRect = new Rectangle(
+                        topLeft.X,
+                        topLeft.Y,
+                        cabin.tilesWide.Value,
+                        cabin.tilesHigh.Value
+                    );
+                    if (stackRect.Intersects(targetRect))
+                    {
+                        helper.SendPrivateMessage(
+                            msg.SourceFarmer,
+                            "Can't move cabin: that spot is reserved for the shared cabin location."
+                        );
+                        return;
+                    }
+                }
+
                 if (
                     !CabinPlacementValidator.TryValidate(
                         Game1.getFarm(),
@@ -95,6 +124,18 @@ public static class CabinCommand
                 cabinService.Data.Write();
 
                 cabin.Relocate(topLeft);
+
+                // The move itself replicates as deltas; the re-send fills the now-empty stack
+                // spot in the sender's copy with the phantom (CabinStack only, see the
+                // interceptor). The gate can still refuse a sender who stepped into a building
+                // between the on-Farm check above and here.
+                if (
+                    cabinService.options.IsCabinStack
+                    && !cabinService.TryReintroduceFarmNow(msg.SourceFarmer)
+                )
+                {
+                    cabinService.QueueFarmReintroduction(msg.SourceFarmer);
+                }
             }
         );
     }
@@ -104,8 +145,8 @@ public static class CabinCommand
     /// intent, undoing a prior !cabin placement. Keyed on the cabin's visibility, not on
     /// whether an intent entry exists: a half-applied reset (intent cleared but cabin still
     /// visible) is recoverable by re-running the command, with no dependence on a later
-    /// sweep (which only runs under ExistingCabinBehavior=MoveToStack). The FarmhouseStack
-    /// gate is handled by the caller before this runs.
+    /// sweep (which only runs under ExistingCabinBehavior=MoveToStack). The
+    /// AllowCabinRelocation gate is handled by the caller before this runs.
     /// </summary>
     private static void ResetCabin(
         IModHelper helper,
@@ -154,9 +195,48 @@ public static class CabinCommand
         }
 
         // SetPosition (not Relocate): same call the bulk movers use to send a cabin to the
-        // hidden stack. OnLocationDeltaMessage re-points the cabin's door on the next
-        // location introduction, so warps follow the established path.
+        // hidden stack. The exit warps are re-pointed here explicitly — they are global,
+        // net-synced state, so the still-connected owner's client picks the change up as a
+        // delta; leaving them at the old door tile would drop the owner onto the empty
+        // ground where the cabin used to stand until they reconnect.
         cabin.SetPosition(CabinManagerService.HiddenCabinLocation);
-        helper.SendPrivateMessage(msg.SourceFarmer, "Cabin reset — it's back in the shared stack.");
+        if (cabinService.options.IsFarmHouseStack)
+        {
+            cabin.SetWarpsToFarmFarmhouseDoor();
+        }
+        else
+        {
+            // CabinStack: exit at the shared stack spot's door — the same target the
+            // owner's next location introduction derives (Relocate at the stack spot →
+            // door at position + humanDoor offset, see Building.getPointForHumanDoor).
+            var stackSpot = StackLocation.Create(cabinService.Data).ToPoint();
+            cabin.SetWarpsToFarm(
+                new Point(
+                    stackSpot.X + cabin.humanDoor.Value.X,
+                    stackSpot.Y + cabin.humanDoor.Value.Y
+                )
+            );
+        }
+        string reply;
+        if (cabinService.options.IsFarmHouseStack)
+        {
+            // No fiction to repair: the peer's copy shows every cabin hidden, and the position
+            // delta hides this one too.
+            reply = "Cabin reset — you'll exit at the farmhouse again.";
+        }
+        else if (cabinService.TryReintroduceFarmNow(msg.SourceFarmer))
+        {
+            reply = "Cabin reset — it's back in the shared stack.";
+        }
+        else
+        {
+            // Sender is inside a Farm building (their cabin, usually): the re-send waits for
+            // their next warp off the farm.
+            cabinService.QueueFarmReintroduction(msg.SourceFarmer);
+            reply =
+                "Cabin reset — it's back in the shared stack. You'll see it there after you "
+                + "next leave the farm (or reconnect).";
+        }
+        helper.SendPrivateMessage(msg.SourceFarmer, reply);
     }
 }

@@ -143,6 +143,11 @@ public class FarmhandSlot
 
     [JsonPropertyName("isEmpty")]
     public bool IsEmpty { get; set; }
+
+    /// <summary>The slot farmhand's UniqueMultiplayerID — matches server-side uids so
+    /// visibility tests can assert a specific slot's presence/absence in the client list.</summary>
+    [JsonPropertyName("uniqueMultiplayerId")]
+    public long UniqueMultiplayerId { get; set; }
 }
 
 public class FarmhandsResponse
@@ -226,6 +231,32 @@ public class LeaveFestivalResult
     public string? Error { get; set; }
 }
 
+/// <summary>
+/// Result of /actions/walk_onto_tile (mirrors the test-client's WalkOntoTileResult).
+/// </summary>
+public class WalkOntoTileResult
+{
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+
+    /// <summary>How the transition triggered: "warp" (touch warp) or "door" (action press).</summary>
+    [JsonPropertyName("via")]
+    public string? Via { get; set; }
+
+    [JsonPropertyName("targetLocation")]
+    public string? TargetLocation { get; set; }
+
+    /// <summary>Warp landing tile ("warp" only).</summary>
+    [JsonPropertyName("targetX")]
+    public int? TargetX { get; set; }
+
+    [JsonPropertyName("targetY")]
+    public int? TargetY { get; set; }
+}
+
 public class EngageToNpcResult
 {
     [JsonPropertyName("success")]
@@ -282,6 +313,13 @@ public class FarmBuildingInfo
     [JsonPropertyName("tileY")]
     public int TileY { get; set; }
 
+    /// <summary>Tile of the human door: the walk-onto target.</summary>
+    [JsonPropertyName("doorX")]
+    public int DoorX { get; set; }
+
+    [JsonPropertyName("doorY")]
+    public int DoorY { get; set; }
+
     /// <summary>True if this building has an interior the player can enter (door is live).</summary>
     [JsonPropertyName("hasInterior")]
     public bool HasInterior { get; set; }
@@ -297,6 +335,63 @@ public class FarmBuildingsResult
 
     [JsonPropertyName("cabins")]
     public List<FarmBuildingInfo> Cabins { get; set; } = new();
+
+    /// <summary>
+    /// True when the client's farm view is the Farm in Game1.locations; false when the player
+    /// stands inside an interior of a Farm that a re-sent introduction replaced.
+    /// </summary>
+    [JsonPropertyName("isLiveFarm")]
+    public bool IsLiveFarm { get; set; }
+}
+
+public class LocationWarpInfo
+{
+    /// <summary>Trigger tile in the current location.</summary>
+    [JsonPropertyName("x")]
+    public int X { get; set; }
+
+    [JsonPropertyName("y")]
+    public int Y { get; set; }
+
+    [JsonPropertyName("targetName")]
+    public string TargetName { get; set; } = "";
+
+    /// <summary>Landing tile in the target location, as currently visible to the client.</summary>
+    [JsonPropertyName("targetX")]
+    public int TargetX { get; set; }
+
+    [JsonPropertyName("targetY")]
+    public int TargetY { get; set; }
+}
+
+/// <summary>
+/// Result of /actions/location_warps: the current location's warps as the client resolves
+/// them. Warp targets ride replication deltas whose values stay invisible until the netcode
+/// interpolation window elapses (15 client ticks), so tests poll this before walking onto a
+/// warp — the values here are exactly what a walk would use.
+/// </summary>
+public class LocationWarpsResult
+{
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+
+    [JsonPropertyName("locationName")]
+    public string? LocationName { get; set; }
+
+    [JsonPropertyName("warps")]
+    public List<LocationWarpInfo> Warps { get; set; } = new();
+}
+
+public class TillTileResult
+{
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
 }
 
 public class PlantCropResult
@@ -754,6 +849,21 @@ public class ActionsClient
         );
 
     /// <summary>
+    /// Till a tile into a terrain HoeDirt via the vanilla hoe path
+    /// (GameLocation.makeHoeDirt). POST /actions/till_tile
+    /// </summary>
+    public Task<TillTileResult?> TillTile(string locationName, int tileX, int tileY) =>
+        _client.PostAsync<TillTileResult>(
+            "/actions/till_tile",
+            new
+            {
+                locationName,
+                tileX,
+                tileY,
+            }
+        );
+
+    /// <summary>
     /// Plant a seed in a HoeDirt or IndoorPot at the given tile.
     /// POST /actions/plant_crop
     /// </summary>
@@ -782,6 +892,37 @@ public class ActionsClient
     /// </summary>
     public Task<FarmBuildingsResult?> GetFarmBuildings(CancellationToken ct = default) =>
         _client.GetAsync<FarmBuildingsResult>("/actions/farm_buildings", ct);
+
+    /// <summary>
+    /// List the current location's warps as this client resolves them — the values a
+    /// <see cref="WalkOntoTile"/> would use. Poll this to wait out warp-target replication
+    /// (see <see cref="LocationWarpsResult"/>) before walking.
+    /// GET /actions/location_warps
+    /// </summary>
+    public Task<LocationWarpsResult?> GetLocationWarps(CancellationToken ct = default) =>
+        _client.GetAsync<LocationWarpsResult>("/actions/location_warps", ct);
+
+    /// <summary>
+    /// Walk onto a warp/door tile the way real movement does (touch warp, else the
+    /// action-press door path). Pass null tile coordinates to auto-target the current
+    /// location's first warp — a cabin interior's only warps are its exit mat. Async —
+    /// confirm arrival via <see cref="GameTestClient.WaitForLocationAsync"/>.
+    /// POST /actions/walk_onto_tile
+    /// </summary>
+    public Task<WalkOntoTileResult?> WalkOntoTile(
+        int? tileX = null,
+        int? tileY = null,
+        int direction = 2
+    ) =>
+        _client.PostAsync<WalkOntoTileResult>(
+            "/actions/walk_onto_tile",
+            new
+            {
+                tileX,
+                tileY,
+                direction,
+            }
+        );
 }
 
 public class ChatClient
@@ -866,18 +1007,16 @@ public class ChatClient
     /// <param name="responseKeywords">Keywords to look for in the response</param>
     /// <param name="matchAll">If true, ALL keywords must match a single message. If false, ANY keyword suffices.</param>
     /// <param name="timeout">Maximum time to wait for the response</param>
-    /// <param name="historySize">Number of recent messages to check</param>
     /// <param name="ct">Cancellation token</param>
     public async Task<bool> SendAndWaitForResponseAsync(
         string message,
         string[] responseKeywords,
         bool matchAll = false,
         TimeSpan? timeout = null,
-        int historySize = 20,
         CancellationToken ct = default
     )
     {
-        var chatBefore = await GetHistory(historySize);
+        var chatBefore = await GetHistory();
         var seqBefore = chatBefore?.TotalReceived ?? 0;
 
         await Send(message);
@@ -886,7 +1025,7 @@ public class ChatClient
             Helpers.WaitName.Polling_GameTestClient_SendAndExpectChatResponse,
             async () =>
             {
-                var chat = await GetHistory(historySize);
+                var chat = await GetHistory();
                 if (chat?.Messages == null)
                 {
                     return false;
@@ -1042,18 +1181,24 @@ public class GameTestClient : IDisposable
     /// keepalive blip instead of failing the test. <paramref name="liveBaseUrl"/> returns
     /// the client container's CURRENT base URL; <paramref name="healAsync"/> re-opens the
     /// client's forward. Both null ⇒ a plain client (unchanged behavior).
+    /// <paramref name="hostId"/> scopes the healing handler's owned-action window to the
+    /// client's Docker host.
     /// </summary>
     public GameTestClient(
         string baseUrl,
         TimeSpan? defaultWaitTimeout,
         Func<string>? liveBaseUrl,
-        Func<CancellationToken, Task<bool>>? healAsync
+        Func<CancellationToken, Task<bool>>? healAsync,
+        string? hostId = null
     )
     {
         HttpMessageHandler inner = new HttpClientHandler();
         if (liveBaseUrl != null && healAsync != null)
         {
-            inner = new ForwardHealingHandler(liveBaseUrl, healAsync) { InnerHandler = inner };
+            inner = new ForwardHealingHandler(liveBaseUrl, healAsync, hostId)
+            {
+                InnerHandler = inner,
+            };
         }
         var handler = new TracingHandler("test-client") { InnerHandler = inner };
         _httpClient = new HttpClient(handler)
@@ -1279,11 +1424,18 @@ public class GameTestClient : IDisposable
 
     #region HTTP Helpers
 
+    /// <summary>
+    /// Every test-client GET (including the long-polling <c>/wait/*</c> endpoints) is read-only,
+    /// so it is marked safe for a transport re-send after a forward drop; POST/DELETE are not.
+    /// </summary>
     public async Task<T?> GetAsync<T>(string path, CancellationToken ct = default)
         where T : class
     {
         var effective = ct == default ? CancellationToken : ct;
-        var response = await _httpClient.GetAsync(path, effective);
+        var response = await _httpClient.SendAsync(
+            new HttpRequestMessage(HttpMethod.Get, path).Mark(),
+            effective
+        );
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<T>(effective);
     }

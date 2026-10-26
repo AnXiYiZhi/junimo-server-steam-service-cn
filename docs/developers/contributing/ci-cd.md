@@ -9,9 +9,9 @@ We use GitHub Actions for automated building, testing, and deployment.
 | [Build Release](#build-release-pipeline) | Merge release candidate PR to `master` | Creates releases and publishes stable Docker images |
 | [Build Preview](#build-preview-pipeline) | Manual `workflow_dispatch`, or push to `master` when `AUTO_BUILD_PREVIEW=true` | Builds and publishes preview Docker images |
 | [Validate PR](#validate-pr-pipeline) | Pull requests to `master` | Validates commits, builds, formatting, and line endings |
-| [Validate Merge Group](#merge-queue) | Merge queue (`merge_group`) | Re-validates each PR against the latest `master` before it merges |
 | [CodeQL](#codeql-pipeline) | Pull requests / push to `master` / weekly | Static security analysis (advisory) |
-| [E2E Tests](#e2e-tests-pipeline) | Manual: `workflow_dispatch`, or a maintainer's `/run-tests-e2e` PR comment / re-run checkbox | Runs the Docker E2E suite on a remote VPS (never a required check) |
+| [E2E Tests](#e2e-tests-pipeline) | Manual (`workflow_dispatch`, a maintainer's `!run-tests-e2e` PR comment / re-run checkbox) or nightly schedule | Runs the Docker E2E suite on a remote VPS (never a required check) |
+| [Approve PR](#approve-pr-pipeline) | A maintainer's `!approve` PR comment | Records an approving review from `github-actions[bot]` so the required-approval rule is satisfiable on the maintainer's own PRs |
 | [Deploy Server](#deploy-server-pipeline) | After preview build / manual | Deploys server instances to VPS |
 | [Deploy Docs](#deploy-docs-pipeline) | After build / manual | Deploys documentation to GitHub Pages |
 | [Cleanup Preview Tags](#cleanup-preview-tags) | Weekly schedule / manual | Deletes old preview tags from DockerHub |
@@ -128,10 +128,8 @@ Preview images are tagged with:
 # Pull latest preview
 docker pull sdvd/server:preview
 
-# Use preview in docker-compose.yml
-services:
-  server:
-    image: sdvd/server:preview
+# Use preview: set IMAGE_VERSION=preview in .env, then
+docker compose pull && docker compose up -d --remove-orphans
 ```
 
 ### Batching Features
@@ -150,6 +148,19 @@ Day 4: Merge Release PR → v1.2.0 released
 ```
 
 The Release PR automatically updates as you merge more commits; the preview counter `N` increments on each preview build for the same target version, whether that build was dispatched manually or auto-triggered on push.
+
+## Issue Version Stamping
+
+Both build pipelines end with a **Stamp Issue Versions** job ([composite action](https://github.com/stardew-valley-dedicated-server/server/tree/master/.github/actions/stamp-issue-versions), [script](https://github.com/stardew-valley-dedicated-server/server/tree/master/.github/scripts/stamp-issue-versions.ts)). It resolves every issue closed by the PRs in the build's commit range (from GitHub's own PR↔issue linkage, not commit-subject parsing), then records on each issue which built image first shipped its fix:
+
+- **Two org Issue Fields** — `Preview version` and `Release version`. Each field independently records the **first** version of its channel that contained the fix; later builds never overwrite an existing value. A release without a prior preview simply leaves the preview field empty.
+- **One comment per channel** — a human-readable note telling the reporter the exact `IMAGE_VERSION` to set (and the rolling `preview` / `latest` alternative), linking the upgrade docs. Deduped by a hidden marker, so re-runs never post twice.
+
+The commit range is `previous build's tag → this build's head`: a release covers everything since the previous release; a preview covers only what's new since the last build of either channel. The job is idempotent — re-running a failed build changes nothing already stamped — and a stamping failure never affects the pushed image or deploy.
+
+::: warning Field ids are hardcoded
+The workflows reference the org issue fields by **numeric id**. Deleting and recreating a field gives it a new id — the `field-id` inputs in `build-release.yml` / `build-preview.yml` must then be updated. The script asserts the field's name and type on its first write, so a stale id fails loudly instead of stamping the wrong field.
+:::
 
 ## Cleanup Preview Tags
 
@@ -179,9 +190,9 @@ The validation pipeline runs on every pull request targeting `master`. It ensure
 
 ### What It Validates
 
-- **PR title** - Must follow [Conventional Commits](https://www.conventionalcommits.org/) format. The repo squash-merges, so the title becomes the commit subject the merge queue lints — checking it here fails a bad title on the PR rather than cryptically in the queue.
+- **PR title** - Must follow [Conventional Commits](https://www.conventionalcommits.org/) format. The repo squash-merges, so the title becomes the commit subject — checking it here fails a bad title on the PR before it merges.
 - **Commit messages** - Must follow [Conventional Commits](https://www.conventionalcommits.org/) format
-- **Docker build** - Ensures the image builds successfully (without pushing)
+- **Docker build** - Ensures the image builds successfully (without pushing). The build clones the pinned SMAPI release and applies the `patches/smapi/` series, so a patch that no longer applies fails here
 - **Formatting** - Runs `dotnet csharpier check .` over the whole tree, plus the analyzer style rules for the test projects (the only C# that compiles game-free on the runner — the mod's analyzers gate via the Docker build); fails on formatting drift or style violations (fix locally with `make lint-fix`)
 - **JS/TS** - Runs `biome ci` over the projects scoped in the root `biome.jsonc`; fails on formatting drift or lint errors (fix locally with `make lint-fix`)
 - **Line endings** - Fails if a file with CRLF line endings reached the index, bypassing the LF normalization `.gitattributes` enforces
@@ -211,28 +222,21 @@ The pipeline uses a single GitHub Environment, `fork-pr`, purely as an authoriza
 
 Same-repo and Renovate PRs resolve the `authorize` job's `environment:` expression to an empty string, which GitHub treats as **no environment** — so no gate, no approval, and nothing extra in the repo's environment list.
 
-## Merge Queue
+## Merging
 
-Merges to `master` go through a [GitHub merge queue](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue). You do not merge a PR directly — once it is approved and its checks pass, enabling auto-merge adds it to the queue, and GitHub merges it for you.
+Merges to `master` are guarded before merge. The `master` ruleset requires the [Validate PR](#validate-pr-pipeline) checks and one approval, with **strict "up to date before merge"** (`strict_required_status_checks_policy`): a PR whose branch is behind `master` cannot merge until it is updated to the current tip and its checks re-run against it. Once a PR is up to date, approved, and green, a maintainer merges it (one click, squash) or Renovate automerges its own PRs.
 
 ### How a PR merges
 
 1. The PR passes its [Validate PR](#validate-pr-pipeline) checks and receives the required approval.
-2. Enabling auto-merge (or, for Renovate PRs, Renovate arming it automatically) hands the PR to the queue.
-3. The queue builds a temporary `gh-readonly-queue/master/...` branch containing the latest `master` plus the PR's changes, and runs the required checks against it. This is what the **Validate Merge Group** workflow ([`validate-merge-group.yml`](https://github.com/stardew-valley-dedicated-server/server/tree/master/.github/workflows/validate-merge-group.yml)) validates — the PR is re-tested against the current tip of `master`, not the stale base it was branched from.
-4. If those checks pass, the queue fast-forwards `master`. PRs are merged one at a time, each squashed into a single commit.
+2. If `master` moved ahead in the meantime, the PR's branch must be updated (**Update branch**, or Renovate's auto-rebase for its own PRs) so the required checks re-run against the current tip.
+3. Once the branch is up to date and every required check is green, the PR merges — squashed into a single commit. A maintainer clicks merge, or Renovate merges its own PR via platform automerge.
 
-A PR sitting in the queue shows **`AWAITING_CHECKS`** while its merge-group build runs, and **`UNMERGEABLE`** if its changes no longer apply cleanly on top of the current `master` (typically because an overlapping PR merged ahead of it). An unmergeable PR is dropped from the queue; rebasing it onto `master` and re-queuing resolves it.
+### Guard before merge
 
-### Why Validate Merge Group is a separate workflow
+Strict up-to-date catches a bad interaction before it reaches `master`: if a PR breaks once a predecessor lands, updating its branch re-runs the full required-check set against the current tip, and the PR goes red **on its own check list** — visible and debuggable on the PR — before it can merge. PRs are validated and merged serially: each rebases and re-runs CI one at a time. Because the required checks are all cheap and independent, and PR volume is low, that costs CI time, not maintainer time.
 
-The merge queue fires the `merge_group` event, which [Validate PR](#validate-pr-pipeline) does not respond to (it triggers on `pull_request_target`). The merge queue requires the same `Validate Build`, `Validate Commits`, `Validate Formatting`, `Validate JS/TS`, `Validate Line Endings`, and `Validate PR Title` checks to report **on the merge-group ref**, so `validate-merge-group.yml` reproduces all six under the same names. All but the title check run the same commitlint, Docker build, CSharpier, Biome, and line-ending scans, but without the `authorize` gate — merge-group code is already approved and runs from the base repository, so there is no fork-secret exposure to gate.
-
-`Validate PR Title` is the exception: there is nothing to re-lint in the queue. The `merge_group` payload carries no `pull_request.title`, the title is immutable once a PR is queued (it was already linted at PR time), and the queue branch holds the PR's original commits — not the squash subject — so `Validate Commits` doesn't cover it either. Its merge-group job is therefore a no-op that exists only to report the required status; without it the queue would wait on the title check forever.
-
-::: warning
-All six required checks (`Validate Build`, `Validate Commits`, `Validate Formatting`, `Validate JS/TS`, `Validate Line Endings`, `Validate PR Title`) must have a `merge_group` producer. A required check with no merge-group workflow leaves every queued PR stuck in `AWAITING_CHECKS` until the queue's timeout. If you add a required check, make sure it reports on `merge_group` too — even if, like the title check, the merge-group job is only a stub that satisfies the contract.
-:::
+Renovate is configured (`renovate.json`) to fit this model: continuous scheduling opens PRs as releases are detected, `rebaseWhen: behind-base-branch` auto-rebases a behind PR so it re-validates against the tip, and `platformAutomerge` merges each PR once a maintainer approves it and its checks pass — one at a time, unattended.
 
 ## CodeQL Pipeline
 
@@ -242,12 +246,12 @@ All six required checks (`Validate Build`, `Validate Commits`, `Validate Formatt
 
 ### Advisory, Not Required
 
-CodeQL is **not** a required status check — a PR merges on `Validate Build` + `Validate Commits` + `Validate Line Endings` alone, and CodeQL findings surface under **Security → Code scanning** without blocking the merge.
+CodeQL is **not** a required status check — a PR merges on its required [Validate PR](#validate-pr-pipeline) checks alone, and CodeQL findings surface under **Security → Code scanning** without blocking the merge.
 
 This is deliberate. The pipeline uses per-language path scoping (below), so a PR that touches no analyzable source runs **zero** analyze jobs. A *required* check that never reports leaves a PR stuck on "Expected — Waiting for status", so the path-scoping optimization is only safe while CodeQL stays advisory.
 
 ::: warning
-If CodeQL is ever promoted to a required check, this pipeline must be revisited: a required check needs a `merge_group` producer (like `validate-merge-group.yml`) and a way to report even when path-scoped out. The current advisory design has neither, on purpose.
+If CodeQL is ever promoted to a required check, this pipeline must be revisited: under strict "up to date before merge" a required check must report on every PR, but the per-language path scoping creates **zero** analyze jobs for a PR that touches no analyzable source, leaving the check stuck on "Expected — Waiting for status". The current advisory design sidesteps that, on purpose.
 :::
 
 ### Languages Analyzed
@@ -275,21 +279,22 @@ On push to `master` and on the weekly schedule there is no PR diff base, so the 
 
 ### Trigger & Fork Safety
 
-CodeQL triggers on `pull_request`, **not** `pull_request_target` (the opposite choice from [Validate PR](#validate-pr-pipeline)). It analyzes the PR head read-only with the default `GITHUB_TOKEN` and needs no secrets, so it is safe to run on fork PRs — fork code must be read to be scanned, but no secret is ever exposed to it. It is not run on `merge_group`: that event is only for required checks, and running an advisory scan there would be pure waste.
+CodeQL triggers on `pull_request`, **not** `pull_request_target` (the opposite choice from [Validate PR](#validate-pr-pipeline)). It analyzes the PR head read-only with the default `GITHUB_TOKEN` and needs no secrets, so it is safe to run on fork PRs — fork code must be read to be scanned, but no secret is ever exposed to it.
 
 ## E2E Tests Pipeline
 
 [Open in Github](https://github.com/stardew-valley-dedicated-server/server/tree/master/.github/workflows/e2e-tests.yml)
 
-Runs the heavy Docker E2E suite. The coordinator (`JunimoServer.TestRunner`) runs on the GitHub runner; the actual Stardew game containers run on a **remote VPS over SSH**. It is **manual and maintainer-gated** — never an automatic merge gate, and **never a required check** (an external VPS being down must not block the queue). For how to *use* it (triggers, results, the re-run checkbox), see [E2E Testing → CI Usage](../testing/e2e-testing.md#ci-usage); this section covers the pipeline's safety model and one-time setup.
+Runs the heavy Docker E2E suite. The coordinator (`JunimoServer.TestRunner`) runs on the GitHub runner; the actual Stardew game containers run on a **remote VPS over SSH**. It is **manual and maintainer-gated** — never an automatic merge gate, and **never a required check** (an external VPS being down must not block merges). For how to *use* it (triggers, results, the re-run checkbox), see [E2E Testing → CI Usage](../testing/e2e-testing.md#ci-usage); this section covers the pipeline's safety model and one-time setup.
 
-### Three entry points
+### Entry points
 
 | Trigger | How |
 |---------|-----|
 | `workflow_dispatch` | Actions tab → **Run workflow** (full suite from a trusted branch; optional `filter`). |
-| `/run-tests-e2e [filter]` | A PR comment (the `issue_comment: created` event). Runs against the PR's HEAD. |
+| `!run-tests-e2e [filter]` | A PR comment (the `issue_comment: created` event). Runs against the PR's HEAD. |
 | **Re-run checkbox** | Ticking "🔁 Re-run E2E tests" in the bot's results comment (`issue_comment: edited`). |
+| **Nightly schedule** | Full-suite run on `master` (08:00 UTC) so the README E2E badge shows a recent real result. Never gates a merge. |
 
 ### Trigger & Fork Safety
 
@@ -316,11 +321,53 @@ To lint the workflow YAML itself, run [actionlint](https://github.com/rhysd/acti
 docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest -color .github/workflows/e2e-tests.yml
 ```
 
+## Approve PR Pipeline
+
+[Open in Github](https://github.com/stardew-valley-dedicated-server/server/tree/master/.github/workflows/approve-pr.yml)
+
+GitHub forbids approving your own pull request, which with a single maintainer makes the `master` ruleset's required-approval rule unsatisfiable — and the admin-bypass merge that would take its place also skips the required checks, the up-to-date policy, and thread resolution. Commenting `!approve` on a PR records the maintainer's decision as an approving review from `github-actions[bot]`, so a normal non-admin merge proceeds with every other rule enforced. The maintainer still reads the diff; the command only records that decision.
+
+| Behaviour | Detail |
+|-----------|--------|
+| Command | `!approve` alone on the comment's first line. A 👍 reaction confirms the review was submitted. |
+| Authorization | Same fail-closed chain as the E2E comment path: default-branch workflow copy, `isMaintainer` repo-permission check (write/admin required), 👎 + reply on deny. |
+| Same-repo PRs only | Fork heads are refused: a fork author could push the moment the command comment appears and have unseen code approved. Fork PRs take a normal UI review — only self-approval is forbidden. |
+| Stale on push | `dismiss_stale_reviews_on_push` drops the approval on every later push, and the workflow dismisses its own review if the head moved while the command was processing; re-issue `!approve` as the last action before merging. |
+| Fallback | If the bot review stops satisfying `required_approving_review_count`, swap `GITHUB_TOKEN` for a GitHub App installation token (`actions/create-github-app-token`); nothing else changes. |
+
 ## Deploy Docs Pipeline
 
 [Open in Github](https://github.com/stardew-valley-dedicated-server/server/tree/master/.github/workflows/deploy-docs.yml)
 
 Deploys the documentation site to GitHub Pages. Runs automatically after builds or can be triggered manually to rebuild from existing Docker images.
+
+The site has two halves — `latest` (site root) and `preview` (`/preview/`) — and `deploy-pages` replaces the whole site each run. A run that rebuilds only one half restores the other from a durable snapshot of the currently-live site kept in Cloudflare R2, so recovery never depends on an expiring artifact. After every successful deploy the merged site is mirrored back to R2 (`aws s3 sync … --delete`).
+
+R2 has exactly two acceptable states, and anything else fails the deploy loudly rather than silently deploying against a bad snapshot:
+
+- **Deliberately off** — all four R2 settings empty. Restore and persist skip; a full rebuild deploys fine, and a single-half run refuses (the half it doesn't rebuild can't be confirmed).
+- **Fully configured and reachable** — the snapshot restores and re-mirrors normally.
+
+A configured-but-broken R2 — partial configuration, an unreachable endpoint, an `AccessDenied` token, or a snapshot missing its `.snapshot-complete` marker — **reds the run** (the restore step fails before publishing, or the persist step fails after). This is deliberate: catching a misconfiguration immediately is worth more than tolerating a rare outage, since a silently stale snapshot would surface only later, as a hard-to-trace refusal. The error messages name the failed operation and the likely fix (token scope, `R2_ACCOUNT_ID`, missing settings).
+
+A single-half run still refuses rather than wipe a live half when the half it doesn't rebuild can't be confirmed present: the missing half is `latest` and absent from the snapshot (re-run with `rebuild_latest=true` to seed), or `preview` isn't rebuilt and R2 is off so its absence can't be confirmed (re-run with `rebuild_preview=true`, or configure R2). LATEST-ONLY deploys only against a readable snapshot that confirms no live preview exists.
+
+The snapshot's integrity is self-certifying: the persist step clears a `.snapshot-complete` marker before mirroring and rewrites it last, so an interrupted persist leaves no marker and the next restore treats that partial snapshot as unusable rather than deploying truncated content.
+
+### Setup Requirements
+
+Add to the **`github-pages`** GitHub Environment (Settings → Environments):
+
+| Name | Kind | Description |
+|------|------|-------------|
+| `R2_ACCOUNT_ID` | Secret | Cloudflare account ID (S3 endpoint host) |
+| `R2_ACCESS_KEY_ID` | Secret | R2 token key with object read/write on the docs bucket |
+| `R2_SECRET_ACCESS_KEY` | Secret | R2 token secret |
+| `R2_BUCKET_DOCS` | Variable | Name of a **dedicated** R2 bucket with **no lifecycle rule** (a per-age expiry would sweep the snapshot). Kept as a variable, not a secret — the name's hyphen would trip the secret masker. |
+
+The R2 token must have **Object Read & Write** on this bucket (both restore and persist run), and `R2_ACCOUNT_ID` must be the account that owns it. The deploy mirrors with `aws s3 sync … --delete`, so this bucket must be dedicated to the docs snapshot — pointing it at a shared bucket (e.g. the E2E report bucket) would delete everything else in it, and a shared retention rule could sweep the snapshot. Leave all four settings empty to disable R2 (full-rebuild deploys still work; single-half deploys refuse); set some but not all and the deploy fails, so it's all-or-nothing.
+
+The **repository variable** `DOCS_TEST_SERVER_API_URL` holds the public test server's API base URL (for example `https://203.0.113.10/preview`). The docs build bakes it into the [Public Test Server](/community/test-server) page; when it is unset, the page shows no status widget.
 
 ## Deploy Server Pipeline
 
@@ -340,20 +387,11 @@ The deploy server pipeline deploys server instances to a VPS. It supports multip
 2. **Add the environment to the workflow matrix** in `.github/workflows/deploy-server.yml`
 3. **Update the workflow dispatch options** to include the new environment
 
-Example matrix entry:
+Example `TARGETS` entries:
 
-```yaml
-matrix:
-    include:
-        - environment: public-test
-          image_tag: preview
-          on_preview: true
-          on_release: false
-
-        - environment: production
-          image_tag: latest
-          on_preview: false
-          on_release: true
+```json
+{"environment": "public-test-preview", "image_tag": "preview", "url_name": "preview", "on_preview": true, "on_release": false}
+{"environment": "public-test-latest", "image_tag": "latest", "url_name": "latest", "on_preview": false, "on_release": true}
 ```
 
 ### Setup Requirements
@@ -364,8 +402,8 @@ Each deployment target needs a **GitHub Environment** with its configuration.
 
 1. Go to **Settings** → **Environments** in your repository
 2. Click **New environment**
-3. Name it to match the workflow matrix (e.g., `public-test`, `production`)
-4. Add the secrets listed below
+3. Name it to match the workflow matrix (e.g., `public-test-preview`, `public-test-latest`)
+4. Add the secrets and variables listed below
 
 #### Environment Secrets
 
@@ -375,7 +413,6 @@ All secrets use the `DEPLOY_` prefix.
 |--------|----------|-------------|
 | `DEPLOY_API_KEY` | No | API key for authenticating API/WebSocket requests |
 | `DEPLOY_DISCORD_BOT_TOKEN` | No | Discord bot token for status display |
-| `DEPLOY_DISCORD_CHAT_CHANNEL_ID` | No | Discord channel ID for chat relay |
 | `DEPLOY_GAME_PORT` | Yes | UDP port for game connections |
 | `DEPLOY_SSH_HOST` | Yes | Server IP address or hostname |
 | `DEPLOY_SSH_KEY` | Yes | SSH private key (Ed25519 recommended) |
@@ -386,7 +423,7 @@ All secrets use the `DEPLOY_` prefix.
 | `DEPLOY_STEAM_REFRESH_TOKEN` | No¹ | Steam OAuth refresh token |
 | `DEPLOY_STEAM_USERNAME` | Yes | Steam account username |
 | `DEPLOY_VNC_PASSWORD` | Yes | VNC access password |
-| `DEPLOY_VNC_PORT` | Yes | TCP port for VNC web interface |
+| `DEPLOY_VNC_PORT` | Yes | TCP port for VNC web UI |
 
 _¹ Steam authentication: Provide `DEPLOY_STEAM_PASSWORD` OR `DEPLOY_STEAM_REFRESH_TOKEN` (or both; if both are set, refresh token is used)._
 
@@ -395,8 +432,20 @@ Generate a secure API key with: `openssl rand -base64 32`
 :::
 
 ::: tip
-If multiple servers share the same VPS and credentials, **repository-level** secrets can be used as fallbacks. Environment-level secrets override repository-level secrets with the same name.
+If multiple servers share the same VPS and credentials, **repository-level** secrets and variables can be used as fallbacks. Environment-level values override repository-level ones with the same name.
 :::
+
+#### Environment Variables
+
+Add these under **Settings → Environments → Variables**, not as secrets.
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DEPLOY_SERVER_NAME` | No | Display name shown as the Discord bot nickname and on status widgets (defaults to the farm name) |
+| `DEPLOY_DISCORD_CHAT_CHANNEL` | No | Discord channel for the two-way [chat relay](/admins/configuration/discord#chat-relay), by name or ID |
+| `DEPLOY_STATUS_DASHBOARD_CHANNEL` | No | Discord channel for the [status dashboard](/admins/configuration/discord#status-dashboard) embed, by name or ID |
+| `DEPLOY_PUBLIC_HOST` | No | Public IP or domain of the [HTTPS proxy](/admins/operations/reverse-proxy); setting it enables the proxy. `SERVER_URL_NAME` comes from the matrix entry's `url_name` |
+| `DEPLOY_PROXY_ROUTING` | No | `path` (default) or `subdomain`, see the proxy docs |
 
 ### VPS Preparation
 
@@ -427,9 +476,9 @@ The script outputs the private key to add as `DEPLOY_SSH_KEY` in GitHub.
 **3. Configure Firewall**
 
 ```sh
-# Example for public-test environment
+# Example for the public-test-preview environment
 ufw allow 24642/udp  # Game port
-ufw allow 5800/tcp   # VNC web interface
+ufw allow 5800/tcp   # VNC web UI
 ```
 
 ### Manual Deployment
@@ -438,7 +487,7 @@ To manually trigger a deployment:
 
 1. Go to **Actions** → **Deploy Server**
 2. Click **Run workflow**
-3. Select which environment to deploy (e.g., `public-test`)
+3. Select which environment to deploy (e.g., `public-test-preview`)
 4. Optionally check "Skip graceful shutdown" for emergency deploys
 5. Click **Run workflow**
 
@@ -447,20 +496,20 @@ To manually trigger a deployment:
 The pipeline:
 
 1. Creates/updates `.env` file with secrets and correct `IMAGE_VERSION`
-2. Copies `docker-compose.yml` to VPS
+2. Copies `docker-compose.yml` and `docker/proxy` (at the image's commit) to the VPS
 3. Pulls the appropriate Docker images
 4. Restarts containers
 5. Verifies deployment health
 
 ::: tip
-The pipeline uses the same `docker-compose.yml` from the repository, ensuring consistency between local development and deployed environments. The `IMAGE_VERSION` environment variable controls which image tag is used.
+The `IMAGE_VERSION` environment variable controls which image tag is used.
 :::
 
 ## Cleanup Caches
 
 [Open in Github](https://github.com/stardew-valley-dedicated-server/server/tree/master/.github/workflows/cleanup-caches.yml)
 
-GitHub Actions caches can accumulate over time. This pipeline removes caches that haven't been accessed in 14 days.
+GitHub Actions caches can accumulate over time. This pipeline removes every cache created more than 14 days ago. Age is measured by creation rather than last access on purpose: GitHub evicts by last access, and a `restore-keys` prefix fallback keeps re-reading a stale cache — bumping its last-accessed time indefinitely — so a stale entry could otherwise outlive its usefulness forever.
 
 ### When It Runs
 
@@ -469,9 +518,9 @@ GitHub Actions caches can accumulate over time. This pipeline removes caches tha
 
 ## Discord Notifications
 
-Most pipelines try to send notifications to Discord when builds complete or deployments finish.
+CI posts to Discord in two clearly separated streams, all through the shared composite action `.github/actions/discord-notify`:
 
-To enable notifications, the `DISCORD_WEBHOOK_URL` repository secret needs to be set with a [Discord webhook URL](https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks).
+The fork's optional Panel compatibility notification is independent of the upstream Discord feeds below.
 
 ## Panel compatibility-matrix notification
 
@@ -492,3 +541,39 @@ The payload is public metadata only: `upstreamRef`, `imageTag`, `digest`, and
 steam-session, refresh tokens, or app tickets. The Panel receiver creates or
 updates an idempotent `discovered` PR; it cannot modify main, recommend a stack,
 tag, or publish an image.
+## Discord release and internal feeds
+- **Public release feeds**: `#releases` (stable releases, logo green) and `#releases-preview` (preview builds, amber). Each post leads with a `Release <version>` / `Build <version>` headline linking the image tag, then a `## Changes` changelog — for `#releases` everything since the previous stable release, for `#releases-preview` everything since the previous build of either channel — first-parent commits grouped into `###` sections by type in release-please order (with a `### ⚠️ Breaking changes` callout when any commit is breaking; hidden types omitted), built by `.github/actions/build-changelog` on top of `.github/scripts/build-changelog.js` — then an `## Install or update` block with the one-line install/update commands, and `Upgrade guide` + `See all changes` buttons.
+- **Internal CI feed** for maintainers: `#internal-ci` gets docs deploys (with the versions per half), server deploys (with the resolved image version and commit), and deploy failures.
+
+### Secrets
+
+One repository secret per channel, each holding a [Discord webhook URL](https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks):
+
+| Secret | Channel | Posted by |
+|--------|---------|-----------|
+| `DISCORD_WEBHOOK_PREVIEW` | `#releases-preview` | Build Preview (`build-preview.yml`) |
+| `DISCORD_WEBHOOK_RELEASES` | `#releases` | Build Release (`build-release.yml`) |
+| `DISCORD_WEBHOOK_INTERNAL_CI` | `#internal-ci` | Deploy Documentation (`deploy-docs.yml`), Deploy Server (`deploy-server.yml`, success and failure) |
+
+A missing secret is not an error: the notify action logs "no webhook configured" and skips, so notifications silently stop while everything else runs unaffected. A malformed or over-limit payload fails the notify step loudly instead of truncating; success-path notify steps run with `continue-on-error`, so a Discord outage never reds a build or deploy that succeeded.
+
+### Bot identity (release feeds)
+
+The release and preview posts set the webhook's display name and avatar per message. Both are optional repository **variables** — unset means the defaults below apply, so it works out of the box:
+
+| Variable | Applies to | Default |
+|----------|-----------|---------|
+| `DISCORD_BOT_USERNAME` | both release feeds | `Release Bot` / `Preview Bot` (per channel) |
+| `DISCORD_BOT_USERNAME_RELEASES` | `#releases` only | falls back to `DISCORD_BOT_USERNAME` |
+| `DISCORD_BOT_USERNAME_PREVIEW` | `#releases-preview` only | falls back to `DISCORD_BOT_USERNAME` |
+| `DISCORD_BOT_AVATAR_URL` | both release feeds | the project logo |
+| `DISCORD_BOT_AVATAR_URL_RELEASES` | `#releases` only | falls back to `DISCORD_BOT_AVATAR_URL` |
+| `DISCORD_BOT_AVATAR_URL_PREVIEW` | `#releases-preview` only | falls back to `DISCORD_BOT_AVATAR_URL` |
+
+Resolution is per-channel var → shared var → default. The internal CI feed posts no identity, so `#internal-ci` keeps whatever name/avatar its webhook is configured with in Discord.
+
+### Discord server setup
+
+`#releases` and `#releases-preview` are public **Announcement** channels (so other servers can Follow them; requires Community to be enabled); `#internal-ci` is a private text channel for the maintainer role. Each has one webhook (Channel Settings → Integrations → Webhooks) whose URL is stored in the matching secret above.
+
+Webhook posts are not auto-published to Follower servers (that would need a bot with `crosspost`); accepted until someone actually follows the channels.

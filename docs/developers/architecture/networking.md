@@ -29,7 +29,7 @@ Connections:
 
 ## Connection Methods
 
-### Steam SDR (Steam Datagram Relay)
+### Steam relay (Steam Datagram Relay, SDR)
 
 Steam clients connect through Valve's relay network:
 
@@ -47,9 +47,9 @@ Benefits:
 
 GOG clients connect using Galaxy's P2P networking:
 
-- Invite codes prefixed with "G"
+- Joins with the same invite code as Steam; a GOG client reads either prefix as the Galaxy lobby id
 - Works through most NATs without port forwarding
-- Lower success rate (~50%) than Steam SDR
+- Lower success rate (~50%) than the Steam relay
 
 ### Direct IP (Lidgren)
 
@@ -57,7 +57,12 @@ Direct IP connections for specific use cases:
 
 - Disabled by default
 - Requires port forwarding (UDP 24642)
-- No user ID tracking (farmhand ownership issues)
+- Carries no platform identity: farmhands created over direct IP form a shared pool among
+  direct-IP players, while Steam/GOG-owned farmhands are hidden from and unclaimable over
+  direct IP (enforced server-side by `FarmhandOwnershipService`, keyed on the connection's
+  transport identity; gate and visibility narrowing are active only while
+  `EnforceFarmhandOwnership` is enabled — the default — though ownership keeps being
+  recorded regardless)
 
 ## Key Implementation Files
 
@@ -92,21 +97,21 @@ Steam lobbies require an authenticated Steam client. Since the GameServer API ru
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
-| 24642 | UDP | Steam SDR game port |
-| 27015 | UDP | Steam SDR query port |
-| 5800 | TCP | VNC web interface |
+| 24642 | UDP | Steam relay (SDR) game port |
+| 27015 | UDP | Steam relay (SDR) query port |
+| 5800 | TCP | VNC web UI |
 | 8080 | TCP | HTTP REST API |
 | 3001 | TCP | Steam auth internal API |
 
 ## NAT Traversal
 
-### Steam SDR
+### Steam relay (SDR)
 
 Traffic routes through Valve's global relay network, handling NAT automatically.
 
 ### GOG Galaxy
 
-Uses STUN/TURN-like mechanisms for P2P connections. Less reliable than Steam SDR.
+Uses STUN/TURN-like mechanisms for P2P connections. Less reliable than the Steam relay.
 
 ### Direct IP
 

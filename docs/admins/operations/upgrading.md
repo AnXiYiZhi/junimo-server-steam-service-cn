@@ -2,27 +2,53 @@
 
 ## Quick Upgrade
 
-For most users with Docker images:
+Run this from your server directory:
 
-```sh
-docker compose pull
-docker compose down
-docker compose up -d
+<InstallCommand update />
+
+It pulls the image for your configured `IMAGE_VERSION` (`latest`, `preview`, or a pinned version), installs the `docker-compose.yml` that matches it, and restarts. `.env`, saves, and settings are untouched.
+
+On an interactive run it asks two things: which channel to use (press Enter to keep your current one, or type `preview` or `latest` to switch, see [Using Preview Builds](#using-preview-builds)), then whether to restart to apply the update. Answer no and the update is staged (image pulled, `docker-compose.yml` updated) but not applied until you run `docker compose up -d`. A run with no terminal (CI, cron) or with `NO_TTY=1` set skips both questions: it keeps your current channel and restarts automatically.
+
+To upgrade by hand, run `docker compose pull && docker compose up -d --remove-orphans` after replacing `docker-compose.yml` with the version matching your image. The script above fetches that file automatically; to get it yourself, use the one linked by the startup warning below.
+
+A **docker-compose.yml does not match this image** warning at startup links the matching file.
+
+## Customizing docker-compose
+
+Updates replace `docker-compose.yml`, so put your own changes in a `docker-compose.override.yml` next to it (Compose merges it automatically). Extra mods, for example:
+
+```yaml
+services:
+  server:
+    volumes:
+      - ./mods:/data/Mods/extra
 ```
 
-Your save files and configuration are stored in Docker volumes and will be preserved.
+Settings such as ports and passwords go in `.env`; see [Environment Variables](/admins/configuration/environment).
 
 ## Upgrade Notes
 
-### Empty `VNC_PASSWORD` no longer aborts startup unconditionally
+### Updates replace `docker-compose.yml`
 
-Earlier versions exited at startup whenever `VNC_PASSWORD` was empty. The current release surfaces it as a warning and aborts only when an insecure setup is detected (empty `VNC_PASSWORD`, or empty `API_KEY` with the API enabled). Set `ALLOW_INSECURE_SETUP=true` on closed networks to keep the warnings but skip the abort. See [`ALLOW_INSECURE_SETUP`](/admins/configuration/environment#allow-insecure-setup).
+The update command replaces `docker-compose.yml` with the version matching the new image, saving the previous file as a timestamped `.bak` first. It's a generated file, so keep your own changes (extra mod mounts, port changes) in a `docker-compose.override.yml` instead; Compose merges both and your changes survive every update. See [Customizing docker-compose](#customizing-docker-compose).
+
+### Empty `VNC_PASSWORD` disables VNC instead of aborting startup
+
+Earlier versions exited at startup whenever `VNC_PASSWORD` was empty. Now an empty password keeps the VNC web UI and VNC port unreachable from outside the container, and the server starts normally; set a password to enable them. Startup still aborts when `API_KEY` is empty with the API enabled. Set `ALLOW_INSECURE_SETUP=true` on closed networks to start anyway and to leave VNC reachable without a password. See [`ALLOW_INSECURE_SETUP`](/admins/configuration/environment#allow-insecure-setup).
+
+### The game runs as a non-root user
+
+The game runs as UID/GID `1000` inside the container unless `USER_ID`/`GROUP_ID` are set in `.env`.
+The first start after upgrading updates the ownership of existing files to match. On Linux, set the
+values to your own user, or `0` on rootless Docker, before that start (see
+[Host / Permissions](/admins/configuration/environment#host-permissions)).
 
 ## Using Preview Builds
 
 Preview builds contain the latest changes from the `master` branch. Use these when:
 
-- The latest stable release has known issues
+- The `latest` release has known issues
 - You want to test new features before official release
 
 ### Enable Preview Builds
@@ -33,19 +59,13 @@ Set the image version in your `.env` file:
 IMAGE_VERSION=preview
 ```
 
-Then pull and restart:
-
-```sh
-docker compose pull
-docker compose down
-docker compose up -d
-```
+Then run the [Quick Upgrade](#quick-upgrade) command. It pulls the preview image and installs the matching `docker-compose.yml` automatically.
 
 ::: warning
 Preview builds may contain experimental features or bugs. Back up your saves before switching.
 :::
 
-### Return to Stable
+### Return to Latest
 
 Remove or comment out the `IMAGE_VERSION` line in `.env` (defaults to `latest`):
 
@@ -53,11 +73,13 @@ Remove or comment out the `IMAGE_VERSION` line in `.env` (defaults to `latest`):
 # IMAGE_VERSION=preview
 ```
 
-Then pull and restart as above.
+Then run the [Quick Upgrade](#quick-upgrade) command again.
 
 ## Updating Game Files
 
-To download the latest Stardew Valley game files or SMAPI updates:
+SMAPI ships inside the server image and is installed into the game volume on startup, so a
+[Quick Upgrade](#quick-upgrade) also updates SMAPI. To download the latest Stardew Valley game
+files:
 
 **1. Stop the server**
 
@@ -117,7 +139,7 @@ If you need to revert to a previous version:
 IMAGE_VERSION=1.0.0
 ```
 
-Replace `1.0.0` with your desired version from [GitHub Releases](https://github.com/stardew-valley-dedicated-server/server/releases).
+Replace `1.0.0` with your desired version from [Docker Hub tags](https://hub.docker.com/r/sdvd/server/tags).
 
 **2. Pull and restart**
 

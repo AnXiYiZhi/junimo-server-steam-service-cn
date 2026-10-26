@@ -79,28 +79,49 @@ public enum WaitName
     Polling_GameTestClient_WaitForLocation,
     Polling_GameTestClient_WaitForAuthWarp,
 
-    // ServerApiClient.cs (7)
+    // ServerApiClient.cs (9)
     Polling_ServerApi_WaitForPlayerByName,
     Polling_ServerApi_WaitForPlayerById,
     Polling_ServerApi_WaitForPlayersRemovedByName,
     Polling_ServerApi_WaitForPlayersRemovedById,
+    Polling_ServerApi_WaitForAllPlayersRemoved,
     Polling_ServerApi_WaitForFarmhandByName,
     Polling_ServerApi_WaitForFarmhandDeletedByName,
     Polling_ServerApi_WaitForFarmerServerTile,
+    Polling_ServerApi_WaitForObjectAtServerTile,
 
-    // SharedSteamAuth.cs (1)
+    // SharedSteamAuth.cs (2)
     Polling_SharedSteamAuth_AccountsReady,
+    Polling_SharedSteamAuth_BootValidationTerminal,
 
     // CabinStrategyTests.cs (3)
     Polling_CabinStrategy_OurCabinAssigned,
     Polling_CabinStrategy_FarmerSyncedCabinAndFarmhand,
     Polling_CabinStrategy_FarmerDeletionReflected,
 
-    // CabinPositionPersistenceTests.cs — !cabin reset (1)
+    // CabinStrategyFarmhouseStackTests.cs — client-local exit-warp convergence (2)
+    Polling_CabinExitWarp_FarmhouseDoorOnClient,
+    Polling_CabinExitWarp_OwnDoorOnClient,
+
+    // CabinPositionPersistenceTests.cs — !cabin reset (5)
     Polling_CabinReset_CabinHidden,
 
-    // CabinPositionPersistenceTests.cs — dummy cabin at shared stack (1)
+    /// <summary>The !cabin move reached the client's farm view as a position delta.</summary>
+    Polling_CabinReset_MovedCabinOnClient,
+
+    /// <summary>/players reports the player inside its cabin (replicated location caught up).</summary>
+    Polling_CabinReset_ServerSeesPlayerInsideCabin,
+
+    /// <summary>The owner's client shows its cabin at the shared stack spot again after a
+    /// live Farm re-introduction (no reconnect).</summary>
+    Polling_CabinReset_OwnCabinAtStackSpotOnClient,
+
+    /// <summary>The queued Farm re-introduction landed after the owner's warp off the farm.</summary>
+    Polling_CabinReset_ReintroducedAfterWarpOffFarm,
+
+    // CabinPositionPersistenceTests.cs — dummy cabin at shared stack (2)
     Polling_DummyCabin_VisibleInClientFarm,
+    Polling_DummyCabin_OtherHomeResolvableOnClient,
 
     // CabinPositionPersistenceTests.cs — same-pass sweep reflected in snapshot (1)
     Polling_CabinSweep_PostReloadSettled,
@@ -110,7 +131,23 @@ public enum WaitName
     Polling_AbandonedClaim_DisconnectHealConfirmed,
     Polling_AbandonedClaim_SweptOnReload,
 
-    // SaveImportTests.cs (10)
+    // FarmhandVisibilityTests.cs (8)
+    Polling_FarmhandVisibility_OwnershipRecorded,
+    Polling_FarmhandVisibility_SteamFarmhandMapped,
+    Polling_FarmhandVisibility_ReleaseMapped,
+    Polling_FarmhandVisibility_Released,
+    Polling_FarmhandVisibility_Reowned,
+    Polling_FarmhandVisibility_IpOffOwnership,
+    Polling_FarmhandVisibility_IpOffReleased,
+    Polling_FarmhandVisibility_IpOffReowned,
+
+    // HostFarmhouseUpgradeGuardTests.cs (4)
+    Polling_HostFarmhouse_HostWarpedHome,
+    Polling_HostFarmhouse_BedRemoved,
+    Polling_HostFarmhouse_BedReplaced,
+    Polling_HostFarmhouse_BedHealed,
+
+    // SaveImportTests.cs (14)
     Polling_SaveImport_SwapFinalized,
     Polling_SaveImport_ContentsMoved,
     Polling_SaveImport_ContentsMovedUpgraded,
@@ -121,31 +158,43 @@ public enum WaitName
     Polling_SaveImport_SecondReloadNoop,
     Polling_SaveImport_MasterGatedState,
     Polling_SaveImport_ForceReloadKicksAndFinalizes,
+    Polling_SaveImport_MultiOwnershipBound,
+    Polling_SaveImport_MultiOwnershipRebound,
+    Polling_SaveImport_ReleasedState,
+    Polling_SaveImport_OwnershipStateReloaded,
 
-    // FarmhandManagementTests.cs (1)
+    // FarmhandManagementTests.cs (2)
     Polling_FarmhandManagement_FarmhandGone,
+    Polling_FarmhandManagement_SingleCabinFull,
 
-    // HostAutomationTests.cs (5)
+    // HostAutomationTests.cs (11)
     Polling_HostAutomation_NoPlayers,
     Polling_HostAutomation_PauseConfirmed,
     Polling_HostAutomation_TimeAdvanced,
     Polling_HostAutomation_UnpauseConfirmed,
     Polling_HostAutomation_TimeAdvancedSecond,
+    Polling_HostAutomation_FestivalDayPauseConfirmed,
+    Polling_HostAutomation_GracePauseConfirmed,
+    Polling_HostAutomation_NextDayPauseConfirmed,
+    Polling_HostAutomation_FarmEventDayPauseConfirmed,
+    Polling_HostAutomation_FarmEventCompleted,
+    Polling_HostAutomation_PassOutDayPauseConfirmed,
 
     // LobbyCommandsTestBase.cs (1)
     Polling_LobbyCommands_AdminGranted,
 
     // NavigationTests.cs (3)
     Polling_Navigation_HasInviteCode,
-    Polling_Navigation_HasGalaxyInviteCode,
+    Polling_Navigation_StatusHasInviteCode,
     Polling_Navigation_HealthyOk,
 
     // NoPasswordTests.cs (2)
     Polling_NoPassword_AuthMessageAppeared,
     Polling_NoPassword_HelloWorldAppeared,
 
-    // PasswordProtectionTests.cs (1)
+    // PasswordProtectionTests.cs (2)
     Polling_PasswordProtection_KickedDisconnect,
+    Polling_PasswordProtection_AuthCountsSettled,
 
     // PasswordProtectionDisruptiveTests.cs (1)
     Polling_PasswordProtectionDisruptive_KickedDisconnect,
@@ -155,9 +204,10 @@ public enum WaitName
     Polling_Rendering_OverlayVisible,
     Polling_Rendering_OverlayWentDarkAgain,
 
-    // ServerApiTests.cs (2)
+    // ServerApiTests.cs (3)
     Polling_ServerApi_NoPlayersConnected,
     Polling_ServerApi_ChatMessageDelivered,
+    Polling_ServerApi_ConnectionStatusReady,
 
     // SteamAppIdTests.cs (1)
     Polling_SteamAppId_SdrStatusLine,
@@ -165,11 +215,10 @@ public enum WaitName
     // CropSaverTests.cs (1)
     Polling_CropSaver_AwaitWatcher,
 
-    // CabinPlacementValidationTests.cs (2)
+    // CabinPlacementValidationTests.cs (1)
     Polling_CabinPlacement_Moved,
-    Polling_CabinPlacement_Rejected,
 
-    // FestivalTests.cs (8)
+    // FestivalTests.cs (15)
     Polling_Festival_DayConfirmed,
     Polling_Festival_ClientWindowSynced,
     Polling_Festival_BecameActive,
@@ -178,13 +227,20 @@ public enum WaitName
     Polling_Festival_EndedNoPlayers,
     Polling_Festival_NextFestivalEndedOnLeave,
     Polling_Festival_MainEventStillActive,
+    Polling_Festival_FairNoAutoEnd,
+    Polling_Festival_FairEndedOnLeave,
+    Polling_Festival_LuauStarfruitAdded,
+    Polling_Festival_LuauStarfruitStaysOne,
+    Polling_Festival_FairLeaveVoteSynced,
+    Polling_Festival_FairDeferredHold,
+    Polling_Festival_FairEndedAfterMenuCleared,
 
     // WeddingTests.cs (5)
     Polling_Wedding_EngagementReplicated,
     Polling_Wedding_BothCeremoniesRan,
     Polling_Wedding_BothClientsRenderedBoth,
     Polling_Wedding_HostRecoveredAfterCeremonies,
-    Polling_Wedding_HostReturnedHomeAfterCeremonies,
+    Polling_Wedding_HostAtFarmParkSpotAfterCeremonies,
 
     // LobbyHomedSpouseTests.cs (4)
     Polling_LobbyHome_EngagementReplicated,
@@ -195,4 +251,41 @@ public enum WaitName
     // NpcSpriteIntegrityTests.cs (1)
     /// <summary>Game clock crossed the daytime schedule-departure boundaries after the heal.</summary>
     Polling_NpcSprite_DaytimeBoundariesCrossed,
+
+    // CabinMigrationTests.cs (8)
+    /// <summary>/cabins Migration became non-null after 'cabins migrate start'.</summary>
+    Polling_CabinMigration_Staged,
+
+    /// <summary>Live RemainingCount grew after a join during staging.</summary>
+    Polling_CabinMigration_RemainingGrew,
+
+    /// <summary>'!migrate place' (admin chat) staged a cabin at the expected tile.</summary>
+    Polling_CabinMigration_ChatPlaced,
+
+    /// <summary>All remaining placements done (RemainingCount == 0).</summary>
+    Polling_CabinMigration_PlacedAll,
+
+    /// <summary>Commit landed: strategy flipped and Migration cleared.</summary>
+    Polling_CabinMigration_Committed,
+
+    /// <summary>Abort landed: Migration cleared and staged cabins re-hidden.</summary>
+    Polling_CabinMigration_Aborted,
+
+    /// <summary>'cabins stackspot x y' landed: /cabins StackSpot shows the override.</summary>
+    Polling_CabinStackSpot_Set,
+
+    /// <summary>Every master cabin is enterable at its placed tile on a connected peer after a
+    /// →None commit.</summary>
+    Polling_CabinMigration_PlacedCabinsVisibleOnPeer,
+
+    /// <summary>The peer's door-less phantom is gone after the commit's Farm re-introduction,
+    /// without a reconnect.</summary>
+    Polling_CabinMigration_PhantomGoneLive,
+
+    // CabinStrategyFarmhouseStackTests.cs + CabinStrategyTests.cs — cabin-link repair (2)
+    /// <summary>Cabin gone from /cabins after /test/break_cabin_link nulled its back-link.</summary>
+    Polling_CabinLink_Broken,
+
+    /// <summary>Cabin owned by the rejoining farmhand reappeared after the join-time link repair.</summary>
+    Polling_CabinLink_Repaired,
 }

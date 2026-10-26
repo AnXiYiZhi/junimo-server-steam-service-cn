@@ -26,7 +26,7 @@ public class ServerSettingsTests : TestBase
     [Fact]
     public async Task Settings_ReturnsValidResponse()
     {
-        var settings = await ServerApi.GetSettings(TestContext.Current.CancellationToken);
+        var settings = await ServerApi.GetSettings(TestCt);
 
         Assert.NotNull(settings);
         Assert.NotNull(settings.Game);
@@ -46,7 +46,7 @@ public class ServerSettingsTests : TestBase
         new List<object[]>
         {
             // Game settings
-            new object[] { "Game.FarmName", "Junimo" },
+            new object[] { "Game.FarmName", "Server" },
             new object[] { "Game.FarmType", "0" },
             new object[] { "Game.ProfitMargin", 1.0f },
             new object[]
@@ -67,6 +67,7 @@ public class ServerSettingsTests : TestBase
             new object[] { "Server.CabinStrategy", "CabinStack" },
             new object[] { "Server.SeparateWallets", false },
             new object[] { "Server.ExistingCabinBehavior", "KeepExisting" },
+            new object[] { "Server.AllowCabinRelocation", true },
         };
 
     /// <summary>
@@ -76,7 +77,7 @@ public class ServerSettingsTests : TestBase
     [MemberData(nameof(DefaultSettingsData))]
     public async Task DefaultSettings_HaveExpectedValues(string settingPath, object expectedValue)
     {
-        var settings = await ServerApi.GetSettings(TestContext.Current.CancellationToken);
+        var settings = await ServerApi.GetSettings(TestCt);
         Assert.NotNull(settings);
 
         var actualValue = GetSettingValue(settings, settingPath);
@@ -98,6 +99,7 @@ public class ServerSettingsTests : TestBase
             "Server.CabinStrategy" => settings.Server.CabinStrategy,
             "Server.SeparateWallets" => settings.Server.SeparateWallets,
             "Server.ExistingCabinBehavior" => settings.Server.ExistingCabinBehavior,
+            "Server.AllowCabinRelocation" => settings.Server.AllowCabinRelocation,
             _ => throw new ArgumentException($"Unknown setting path: {path}"),
         };
     }
@@ -114,8 +116,8 @@ public class ServerSettingsTests : TestBase
     [Fact]
     public async Task Settings_FarmNameMatchesStatus()
     {
-        var settings = await ServerApi.GetSettings(TestContext.Current.CancellationToken);
-        var status = await ServerApi.GetStatus(TestContext.Current.CancellationToken);
+        var settings = await ServerApi.GetSettings(TestCt);
+        var status = await ServerApi.GetStatus(TestCt);
 
         Assert.NotNull(settings);
         Assert.NotNull(status);
@@ -130,8 +132,8 @@ public class ServerSettingsTests : TestBase
     [Fact]
     public async Task Settings_MaxPlayersMatchesStatus()
     {
-        var settings = await ServerApi.GetSettings(TestContext.Current.CancellationToken);
-        var status = await ServerApi.GetStatus(TestContext.Current.CancellationToken);
+        var settings = await ServerApi.GetSettings(TestCt);
+        var status = await ServerApi.GetStatus(TestCt);
 
         Assert.NotNull(settings);
         Assert.NotNull(status);

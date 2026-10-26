@@ -24,6 +24,9 @@ BUILD_CONFIGURATION ?= Debug
 # Docker build progress output (plain, tty, auto, quiet)
 DOCKER_PROGRESS ?= plain
 
+# Dev overlay adds the sidecar build contexts; explicit -f drops the automatic override merge, so re-add it.
+COMPOSE := docker compose -f docker-compose.yml -f docker-compose.dev.yml $(if $(wildcard docker-compose.override.yml),-f docker-compose.override.yml)
+
 # Export IMAGE_VERSION for usage in docker compose commands
 export IMAGE_VERSION
 
@@ -43,6 +46,13 @@ else
     TIMESTAMP := $(shell date -u '+%Y-%m-%dT%H-%M-%S')Z
 endif
 
+# Short git commit ("-dirty" when the tree is modified), baked in as SDVD_GIT_SHA so the diagnostics
+# tool can identify a local build. `--match=` matches no tag, leaving --always to yield the bare
+# commit; unquoted because cmd.exe would pass the quotes through to git. Empty outside a git checkout,
+# where build-server omits the --build-arg so the Dockerfile default applies (passing it empty would
+# set the ARG to ""). CI builds via docker/build-push-action and passes its own github.sha.
+GIT_SHA := $(shell git describe --always --dirty --match=)
+
 # Install development dependencies
 install:
 	@echo Installing development dependencies...
@@ -59,6 +69,7 @@ build-server:
 	@docker buildx build \
 		--platform=linux/amd64 \
 		--build-arg BUILD_CONFIGURATION=$(BUILD_CONFIGURATION) \
+		$(if $(GIT_SHA),--build-arg SDVD_GIT_SHA=$(GIT_SHA)) \
 		-t $(IMAGE_NAME):$(IMAGE_VERSION) \
 		$(if $(filter-out local,$(IMAGE_VERSION)),-t $(IMAGE_NAME):latest) \
 		--secret id=steam_username,env=STEAM_USERNAME \
@@ -73,7 +84,7 @@ build-server:
 # Build steam-service docker image
 build-steam-service:
 	@echo Building steam-service image...
-	@docker compose build steam-auth
+	@$(COMPOSE) build steam-auth
 	@echo Steam-service build complete.
 
 # Build test client docker image (for containerized E2E tests)
@@ -94,7 +105,7 @@ build-test-client:
 # Build and run everything
 up: build
 	@echo Starting server `$(IMAGE_NAME):$(IMAGE_VERSION)`...
-	@docker compose up -d --build
+	@$(COMPOSE) up -d --build
 	@echo Server is now running. Use `make cli` or `make logs` to view output.
 
 # Authenticate Steam accounts and download game files (interactive).
@@ -103,33 +114,37 @@ up: build
 # accounts (STEAM_ACCOUNTS JSON from .env.test). Accounts with saved
 # sessions are skipped; only new accounts prompt for Steam Guard.
 setup: build-steam-service
-	@docker compose run --rm -it \
+	@$(COMPOSE) run --rm -it \
 		$(if $(wildcard .env.test),--env-from-file .env.test) \
 		steam-auth setup
 	@echo Setup complete. Saved sessions are stored in the steam-session volume.
 
 restart:
 	@echo Restarting server `$(IMAGE_NAME):$(IMAGE_VERSION)`...
-	@docker compose restart
+	@$(COMPOSE) restart
 	@echo Server restarted. Use `make cli` or `make logs` to view output.
 
 # Stop the server
 down:
 	@echo Stopping server...
-	@docker compose down --remove-orphans
+	@$(COMPOSE) down --remove-orphans
 
 # Attach to interactive split-pane server CLI
 cli:
-	@docker compose exec server attach-cli
+	@$(COMPOSE) exec server attach-cli
+
+# Collect a server-state diagnostics bundle (wizard + zip on the host under ./diagnostics)
+diagnostics:
+	@$(COMPOSE) exec -it server diagnostics
 
 # View server logs (escape sequence to reset colors)
 logs:
-	@docker compose logs -f
+	@$(COMPOSE) logs -f
 	-@bun -e "process.stdout.write('\x1b[0m')"
 
 dumplogs:
 	@echo "Writing logs to logs_$(TIMESTAMP).txt"
-	@docker compose logs > "logs_$(TIMESTAMP).txt"
+	@$(COMPOSE) logs > "logs_$(TIMESTAMP).txt"
 
 # Start docs dev server (extracts OpenAPI spec from Docker image first)
 docs:
@@ -142,10 +157,15 @@ docs:
 	@echo OpenAPI spec ready.
 	@bun --cwd=./docs run dev
 
+# Regenerate the documentation page-relationship graph (docs/.output/page-graph.html)
+docs-graph:
+	@bun --cwd=./docs run graph
+	@echo "Open docs/.output/page-graph.html in a browser."
+
 # Clean up everything, including all volumes
 clean:
 	@echo Cleaning up...
-	@IMAGE_VERSION=$(IMAGE_VERSION) docker compose down -v
+	@IMAGE_VERSION=$(IMAGE_VERSION) $(COMPOSE) down -v
 	-@docker rmi $(IMAGE_NAME):$(IMAGE_VERSION) $(IMAGE_NAME):latest
 
 # Test project paths
@@ -158,7 +178,7 @@ RUNNER_PROJECT := ./tests/JunimoServer.TestRunner
 #   make test FILTER="Login_WithCorrectPassword"
 #   make test FILTER="CabinStrategyNoneTests|CabinPositionPersistenceTests"
 #   make test (runs all tests)
-# Note: '|' works only for direct `make test`. The /run-tests-e2e PR-comment trigger
+# Note: '|' works only for direct `make test`. The !run-tests-e2e PR-comment trigger
 # rejects '|' (it would break the sticky-comment markdown table); use one pattern there.
 FILTER ?=
 
@@ -172,14 +192,19 @@ export COLUMNS=160
 test:
 	@dotnet run --project $(RUNNER_PROJECT) -- $(if $(VERBOSE),--verbose) $(if $(FILTER),--filter "$(FILTER)")
 
+# Run unit tests (no Docker, no Steam)
+test-unit:
+	@dotnet test tests/SteamService.Tests/SteamService.Tests.csproj
+	@dotnet test tests/JunimoServer.UnitTests/JunimoServer.UnitTests.csproj
+
 # Run tests with verbose output (detailed setup steps, diagnostics inline)
 test-verbose:
 	@dotnet run --project $(RUNNER_PROJECT) -- --verbose $(if $(FILTER),--filter "$(FILTER)")
 
 # Run tests with structured JSONL output (for LLM/AI agents)
-# Forces SDVD_TEST_TRACING=full so the AI-debug context captures every
-# cross-process correlation (respBytes, X-Request-Id on reads, wait_started,
-# per-test http_wait mirror). The default `make test` runs at SDVD_TEST_TRACING=none.
+# Sets SDVD_TEST_TRACING=full for the AI-debug context (respBody capture,
+# X-Request-Id on reads, wait_started). An SDVD_TEST_TRACING line in .env.test
+# overrides it: TestEnvLoader clobbers process env.
 test-llm: export SDVD_TEST_TRACING=full
 test-llm:
 	@dotnet run --project $(RUNNER_PROJECT) -- --llm $(if $(FILTER),--filter "$(FILTER)")
@@ -279,9 +304,11 @@ help:
 	@echo "  make logs     - View server logs"
 	@echo "  make dumplogs - Dump server logs to file on host"
 	@echo "  make cli      - Attach to interactive server console (tmux-based)"
+	@echo "  make diagnostics - Collect a server-state diagnostics zip (host ./diagnostics/)"
 	@echo "  make down     - Stop the server"
 	@echo "  make restart  - Restart the server (preserves volumes)"
 	@echo "  make docs     - Start docs dev server (requires built image)"
+	@echo "  make docs-graph - Regenerate the docs page-relationship graph (HTML)"
 	@echo "  make clean    - Remove ALL containers, volumes and images"
 	@echo ""
 	@echo Testing:
@@ -290,6 +317,7 @@ help:
 	@echo "  make test-llm     - Run tests with structured JSONL output (for AI agents)"
 	@echo "  make test-web     - Run tests with web UI (opens browser with live results)"
 	@echo "  make test-web-report - Run tests with web UI + static report generation"
+	@echo "  make test-unit    - Run unit tests (no Docker, no Steam)"
 	@echo "  make og-preview   - Render OG link-preview card mockups for design review"
 	@echo "  FILTER=X          - Filter tests, e.g. FILTER=PasswordProtection"
 	@echo "  VERBOSE=1         - Show detailed setup steps, e.g. make test VERBOSE=1"

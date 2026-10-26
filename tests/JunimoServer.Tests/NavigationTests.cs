@@ -27,29 +27,15 @@ public class NavigationTests : TestBase
         Assert.NotNull(ServerStatus);
         Assert.True(ServerStatus.IsOnline, "Server should be online");
 
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         // InviteCode is read from a file, not from the snapshot — long-poll for
         // any newer snapshot via `since`, then check IsOnline + InviteCode in
         // the response body.
-        var hasCode = await PollingHelper.LongPollAsync(
+        var hasCode = await ServerApi.WaitForStatusMatchAsync(
             WaitName.Polling_Navigation_HasInviteCode,
-            async (since, remaining) =>
-            {
-                var status = await ServerApi.WaitForStatusAsync(
-                    since: since,
-                    timeout: remaining,
-                    ct: ct
-                );
-                if (status == null)
-                {
-                    return new PollingHelper.LongPollResult(false, since);
-                }
-
-                var matched = status.IsOnline && !string.IsNullOrEmpty(status.InviteCode);
-                return new PollingHelper.LongPollResult(matched, status.Version);
-            },
             TimeSpan.FromSeconds(10),
-            cancellationToken: ct
+            matches: status => status.IsOnline && !string.IsNullOrEmpty(status.InviteCode),
+            ct: ct
         );
         Assert.True(hasCode, "Server should have an invite code");
 
@@ -65,7 +51,7 @@ public class NavigationTests : TestBase
     [TestServer(Clients = 0)]
     public async Task ServerApi_GetStatus_ShouldReturnValidResponse()
     {
-        var status = await ServerApi.GetStatus(TestContext.Current.CancellationToken);
+        var status = await ServerApi.GetStatus(TestCt);
 
         Assert.NotNull(status);
         Assert.NotNull(status.ServerVersion);
@@ -81,16 +67,16 @@ public class NavigationTests : TestBase
     /// </summary>
     [Fact]
     [TestServer(Clients = 0, WithSteam = true)]
-    public async Task ServerApi_GetInviteCode_ShouldReturnValidCode()
+    public async Task ServerApi_GetStatus_ShouldReturnInviteCode()
     {
         // Galaxy invite code may arrive asynchronously; poll briefly
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         var hasCode = await PollingHelper.WaitUntilAsync(
-            WaitName.Polling_Navigation_HasGalaxyInviteCode,
+            WaitName.Polling_Navigation_StatusHasInviteCode,
             async () =>
             {
-                var r = await ServerApi.GetInviteCode(ct);
-                return r != null && !string.IsNullOrEmpty(r.InviteCode);
+                var r = await ServerApi.GetStatus(ct);
+                return !string.IsNullOrEmpty(r?.InviteCode);
             },
             TimeSpan.FromSeconds(10),
             cancellationToken: ct
@@ -98,13 +84,13 @@ public class NavigationTests : TestBase
 
         Assert.True(hasCode, "Server must have a valid invite code (WithSteam=true)");
 
-        var response = await ServerApi.GetInviteCode(ct);
-        Assert.NotNull(response);
+        var status = await ServerApi.GetStatus(ct);
+        Assert.NotNull(status);
         Assert.False(
-            string.IsNullOrEmpty(response.InviteCode),
+            string.IsNullOrEmpty(status.InviteCode),
             "Should return a non-empty invite code"
         );
-        Log($"Invite code: {response.InviteCode}");
+        Log($"Invite code: {status.InviteCode}");
     }
 
     [Fact]
@@ -115,7 +101,7 @@ public class NavigationTests : TestBase
         // (no `since` cursor — the server's health bit is "is the game thread
         // ticking now"), so each iteration returns immediately on a healthy
         // server or after up to WaitMaxTimeout (10s) on a stalled one.
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         HealthResponse? health = null;
         var healthy = await PollingHelper.LongPollAsync(
             WaitName.Polling_Navigation_HealthyOk,

@@ -24,7 +24,7 @@ public class NoPasswordTests : TestBase
     [Fact]
     public async Task NewPlayer_JoinsDirectly_WhenNoPasswordConfigured()
     {
-        await EnsureConnectedAsync("NoPwd", ct: TestContext.Current.CancellationToken);
+        await EnsureConnectedAsync("NoPwd", ct: TestCt);
 
         // Get current location
         var state = await GameClient.GetState();
@@ -48,10 +48,7 @@ public class NoPasswordTests : TestBase
     {
         // This test needs a fresh connection; we're asserting about messages
         // received on join, so we can't reuse an existing session.
-        await Farmers.ConnectNewAsync(
-            breakSession: true,
-            ct: TestContext.Current.CancellationToken
-        );
+        await Farmers.ConnectNewAsync(breakSession: true, ct: TestCt);
 
         // Poll for the delivery window. If auth messages appear at any point,
         // the test fails immediately instead of waiting the full duration.
@@ -63,7 +60,7 @@ public class NoPasswordTests : TestBase
             WaitName.Polling_NoPassword_AuthMessageAppeared,
             async () =>
             {
-                var chat = await GameClient.GetChatHistory(20);
+                var chat = await GameClient.GetChatHistory();
                 return chat?.Messages?.Any(m =>
                         authKeywords.Any(k =>
                             m.Message.Contains(k, StringComparison.OrdinalIgnoreCase)
@@ -71,7 +68,7 @@ public class NoPasswordTests : TestBase
                     ) == true;
             },
             TestTimings.ChatDeliveryDelay,
-            cancellationToken: TestContext.Current.CancellationToken
+            cancellationToken: TestCt
         );
 
         // Should NOT have received any auth messages
@@ -81,7 +78,7 @@ public class NoPasswordTests : TestBase
         );
 
         // Log what was received for diagnostics
-        var chatHistory = await GameClient.GetChatHistory(20);
+        var chatHistory = await GameClient.GetChatHistory();
         Assert.NotNull(chatHistory);
         Log($"Chat messages received: {chatHistory.Messages.Count}");
         foreach (var msg in chatHistory.Messages)
@@ -98,7 +95,7 @@ public class NoPasswordTests : TestBase
     [Fact]
     public async Task Player_CanInteract_WithoutAuthentication()
     {
-        await EnsureConnectedAsync("NoPwd", ct: TestContext.Current.CancellationToken);
+        await EnsureConnectedAsync("NoPwd", ct: TestCt);
 
         // Verify we're connected and in-game
         var state = await GameClient.GetState();
@@ -108,7 +105,7 @@ public class NoPasswordTests : TestBase
 
         // Player should be able to send regular chat messages.
         // Snapshot before sending so we only match the NEW message, not stale history.
-        var chatBefore = await GameClient.GetChatHistory(10);
+        var chatBefore = await GameClient.GetChatHistory();
         var countBefore =
             chatBefore?.Messages?.Count(m =>
                 m.Message.Contains("Hello world", StringComparison.OrdinalIgnoreCase)
@@ -123,7 +120,7 @@ public class NoPasswordTests : TestBase
             WaitName.Polling_NoPassword_HelloWorldAppeared,
             async () =>
             {
-                chatHistory = await GameClient.GetChatHistory(10);
+                chatHistory = await GameClient.GetChatHistory();
                 var countAfter =
                     chatHistory?.Messages?.Count(m =>
                         m.Message.Contains("Hello world", StringComparison.OrdinalIgnoreCase)
@@ -132,7 +129,7 @@ public class NoPasswordTests : TestBase
                 return countAfter > countBefore;
             },
             TestTimings.ChatCommandTimeout,
-            cancellationToken: TestContext.Current.CancellationToken
+            cancellationToken: TestCt
         );
 
         // Should see the message in chat history (not blocked)

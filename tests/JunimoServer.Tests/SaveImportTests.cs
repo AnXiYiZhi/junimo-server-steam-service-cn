@@ -20,8 +20,10 @@ namespace JunimoServer.Tests;
 /// runs the Layer B finalizer.
 ///
 /// The bind on a swap comes from the import ARG, not the source save: the LAN-generated source owner
-/// is customized but has <c>userID==""</c> (LAN never stamps — <c>abandoned-claim-is-steam-only.md</c>),
-/// so <c>HasUserId==true</c> after reload proves Layer B re-stamped the bind, not a carried value.
+/// is customized with no ownership record (LAN carries no platform identity), so
+/// <c>HasOwner==true</c> after reload proves Layer B wrote the ownership-map bind, not a carried
+/// value. The owner's <c>userID</c> stays empty by design (a stamp would gray the slot client-side
+/// for the bound owner), so <c>HasUserId</c> is asserted FALSE on the bound owner.
 ///
 /// The two reload-guard tests drive the real console command via <c>POST /test/console</c> (the
 /// <c>SavesCommand</c> guard/kick has no HTTP endpoint), still asserting via the snapshot.
@@ -93,9 +95,9 @@ public class SaveImportTests : TestBase
     /// <summary>Test 1 — swap+bind: the demoted owner becomes a bound customized cabin farmhand and a
     /// fresh "Server" master is installed.</summary>
     [Fact]
-    public async Task Import_SwapHost_DemotesOwnerAndBindsUserId()
+    public async Task Import_SwapHost_DemotesOwnerAndBindsOwnership()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         var seed = await GenerateSourceSaveAsync(
             new TestSeedImportSourceRequest { OwnerName = "Alice" },
             ct
@@ -122,18 +124,25 @@ public class SaveImportTests : TestBase
                     return false;
                 }
 
-                // Former owner is a customized + bound farmhand, present (not swept).
+                // Former owner is a customized + ownership-bound farmhand, present (not swept).
+                // HasUserId must stay FALSE: the bind is the map record, and a stamp would gray
+                // the slot client-side for the bound owner.
                 var ownerEntry = state.FarmhandData.FirstOrDefault(f =>
                     f.UniqueMultiplayerId == ownerUid
                 );
-                if (ownerEntry == null || !ownerEntry.IsCustomized || !ownerEntry.HasUserId)
+                if (
+                    ownerEntry == null
+                    || !ownerEntry.IsCustomized
+                    || !ownerEntry.HasOwner
+                    || ownerEntry.HasUserId
+                )
                 {
                     return false;
                 }
 
                 // A cabin is owned by the former owner with the bind visible.
                 var cabin = state.Cabins.FirstOrDefault(c => c.OwnerId == ownerUid);
-                if (cabin == null || !cabin.OwnerHasUserId)
+                if (cabin == null || !cabin.OwnerHasOwner)
                 {
                     return false;
                 }
@@ -161,7 +170,7 @@ public class SaveImportTests : TestBase
     [Fact]
     public async Task Import_SwapHost_MovesFarmhouseContentsToCabin()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         var seed = await GenerateSourceSaveAsync(
             new TestSeedImportSourceRequest
             {
@@ -200,12 +209,14 @@ public class SaveImportTests : TestBase
                 }
 
                 // The owner's cabin holds the chest and the fridge item; the host FarmHouse is empty
-                // (objects, fridge AND furniture — the starter furniture must have moved too).
+                // (objects, fridge AND furniture — the starter furniture must have moved too) except
+                // for the host's default bed.
                 var cabinHasContents = cabin.ObjectCount >= 1 && cabin.FridgeItemCount >= 1;
                 var farmHouseEmpty =
                     state.FarmHouseObjectCount == 0
                     && state.FarmHouseFridgeItemCount == 0
-                    && state.FarmHouseFurnitureCount == 0;
+                    && state.FarmHouseFurnitureCount == 1
+                    && state.FarmHouseHasPlayerBed;
                 return cabinHasContents && farmHouseEmpty;
             },
             TestTimings.CabinAssignmentTimeout,
@@ -214,7 +225,7 @@ public class SaveImportTests : TestBase
         Assert.True(
             ok,
             $"After swap import, owner uid={ownerUid} cabin must hold the moved chest + fridge item "
-                + "and the Server FarmHouse must be empty (objects, fridge, furniture)"
+                + "and the Server FarmHouse must hold nothing but the host's default bed"
         );
         Log("Contents move confirmed (reuse path)");
     }
@@ -226,7 +237,7 @@ public class SaveImportTests : TestBase
     [Fact]
     public async Task Import_SwapHost_UpgradedHouse_BuildPath_MovesContents()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         // startingCabins:1 → no spare assignable cabin → TryAssignFarmhandHome fails → build path.
         var seed = await GenerateSourceSaveAsync(
             new TestSeedImportSourceRequest
@@ -266,12 +277,13 @@ public class SaveImportTests : TestBase
                 }
 
                 // Chest + fridge item survived the level-0→level-N realization; FarmHouse empty
-                // (objects, fridge AND furniture).
+                // (objects, fridge AND furniture) except for the host's default bed.
                 var cabinHasContents = cabin.ObjectCount >= 1 && cabin.FridgeItemCount >= 1;
                 var farmHouseEmpty =
                     state.FarmHouseObjectCount == 0
                     && state.FarmHouseFridgeItemCount == 0
-                    && state.FarmHouseFurnitureCount == 0;
+                    && state.FarmHouseFurnitureCount == 1
+                    && state.FarmHouseHasPlayerBed;
                 return cabinHasContents && farmHouseEmpty;
             },
             TestTimings.CabinAssignmentTimeout,
@@ -280,7 +292,7 @@ public class SaveImportTests : TestBase
         Assert.True(
             ok,
             $"After build-path swap import of an upgraded house, owner uid={ownerUid} cabin must hold "
-                + "the moved contents and the FarmHouse must be empty"
+                + "the moved contents and the FarmHouse must hold nothing but the host's default bed"
         );
         Log("Contents move confirmed (build path, upgraded house)");
     }
@@ -291,7 +303,7 @@ public class SaveImportTests : TestBase
     [Fact]
     public async Task Import_SwapHost_RelocatesPetToCabin()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         var seed = await GenerateSourceSaveAsync(
             new TestSeedImportSourceRequest { OwnerName = "Dave", SpawnPet = true },
             ct
@@ -348,7 +360,7 @@ public class SaveImportTests : TestBase
     [Fact]
     public async Task Import_SwapHost_MovesCellarContentsToOwnerCellar()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         var seed = await GenerateSourceSaveAsync(
             new TestSeedImportSourceRequest { OwnerName = "Liam", PlaceCellarItem = true },
             ct
@@ -399,7 +411,7 @@ public class SaveImportTests : TestBase
     [Fact]
     public async Task Import_AsIs_PreservesOwnerAsHost()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         // Seed the master as a real owner so the source isn't a clone-blank Server master; as-is
         // keeps that owner AS the host (the headline trap, which this test pins as intended for a
         // single-player-style import).
@@ -435,7 +447,7 @@ public class SaveImportTests : TestBase
                 }
                 // And the owner must NOT have been demoted into a bound farmhand (belt-and-suspenders).
                 var boundFarmhand = state.FarmhandData.FirstOrDefault(f =>
-                    f.UniqueMultiplayerId == ownerUid && f.HasUserId
+                    f.UniqueMultiplayerId == ownerUid && (f.HasUserId || f.HasOwner)
                 );
                 return boundFarmhand == null;
             },
@@ -455,7 +467,7 @@ public class SaveImportTests : TestBase
     [Fact]
     public async Task Import_SwapHost_MalformedSave_LeavesFileByteUnchanged()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         await GenerateSourceSaveAsync(new TestSeedImportSourceRequest { OwnerName = "Frank" }, ct);
 
         // Clone the valid active save to a fresh folder, then corrupt the clone's <player> — one
@@ -526,7 +538,7 @@ public class SaveImportTests : TestBase
     [Fact]
     public async Task Import_SwapHost_CarriesMasterGatedState()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         const string mailFlag = "ccDoorUnlock";
         const string eventSeen = "191393";
         var seed = await GenerateSourceSaveAsync(
@@ -625,7 +637,7 @@ public class SaveImportTests : TestBase
     [Fact]
     public async Task Import_SwapHost_FinalizeIsSingleShot_AcrossReloads()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         var seed = await GenerateSourceSaveAsync(
             new TestSeedImportSourceRequest { OwnerName = "Judy", PlaceChest = true },
             ct
@@ -660,7 +672,7 @@ public class SaveImportTests : TestBase
                 var ownerEntry = state.FarmhandData.FirstOrDefault(f =>
                     f.UniqueMultiplayerId == ownerUid
                 );
-                return ownerEntry is { IsCustomized: true, HasUserId: true }
+                return ownerEntry is { IsCustomized: true, HasOwner: true }
                     && state.FarmHouseObjectCount == 0
                     && state.SaveImportFinalizeCount == baseFinalizeCount + 1;
             },
@@ -690,7 +702,7 @@ public class SaveImportTests : TestBase
                 var ownerEntry = state.FarmhandData.FirstOrDefault(f =>
                     f.UniqueMultiplayerId == ownerUid
                 );
-                return ownerEntry is { IsCustomized: true, HasUserId: true }
+                return ownerEntry is { IsCustomized: true, HasOwner: true }
                     && state.SaveImportFinalizeCount == baseFinalizeCount + 1;
             },
             TestTimings.CabinAssignmentTimeout,
@@ -703,15 +715,21 @@ public class SaveImportTests : TestBase
         Log("Finalizer single-shot across reloads confirmed");
     }
 
-    /// <summary>Test 10 — userID-collision guard (risk #12): a swap whose bind id collides with an
-    /// existing farmhand's userID is rejected (byte-unchanged), while a non-colliding id succeeds.</summary>
+    /// <summary>Test 10 — multiple ownership + ownership persistence: the same bind id may be
+    /// associated with several farmhands (per-farmhand ownership records make bind-id
+    /// uniqueness a non-constraint). The input the former userID-collision guard rejected — a
+    /// spare farmhand already stamped with the bind id — now imports cleanly (with a warn-only
+    /// typo tripwire) and binds the owner; a post-finalize <c>farmhand rebind</c> with that
+    /// same already-owning id is accepted for a second farmhand. The tail then proves the
+    /// state machine across a restart: a released customized slot stays released (the store
+    /// file travels with the save folder) and the operator-origin rebind on an uncustomized
+    /// slot survives the load-time abandoned-claim sweep.</summary>
     [Fact]
-    public async Task Import_SwapHost_RejectsUserIdCollision()
+    public async Task Import_SwapHost_AllowsSameBindIdOnMultipleFarmhands()
     {
-        var ct = TestContext.Current.CancellationToken;
-        // Seed a spare uncustomized farmhand slot with SyntheticBindId (before the save, so the clone
-        // carries it). A swap binding the SAME id must then be rejected by the cross-farmhand
-        // userID-collision walk (LAN won't stamp a userID on its own).
+        var ct = TestCt;
+        // Seed a spare uncustomized farmhand slot stamped with SyntheticBindId (before the save,
+        // so the clone carries it) — the exact shape the removed collision guard used to reject.
         var seed = await GenerateSourceSaveAsync(
             new TestSeedImportSourceRequest
             {
@@ -720,39 +738,147 @@ public class SaveImportTests : TestBase
             },
             ct
         );
-        Assert.True(seed.FarmhandUserIdInjected, "Collision userID should have been injected");
+        Assert.True(seed.FarmhandUserIdInjected, "Spare-slot userID should have been injected");
+        var ownerUid = seed.OwnerUid;
 
-        var importBad = await ServerApi.ImportSave(
-            new TestImportSaveRequest
-            {
-                TargetSaveName = "import-collision",
-                SwapHostTo = SyntheticBindId,
-            },
-            ct
-        );
-        Assert.NotNull(importBad);
-        Assert.False(importBad!.Swapped, "A colliding-id import must not swap");
-        Assert.False(
-            string.IsNullOrEmpty(importBad.ImportError),
-            "A colliding-id import must report an error naming the conflict"
-        );
-        Assert.Equal(importBad.PreImportMainFileHash, importBad.PostImportMainFileHash);
-        Log("userID-collision rejected, save byte-unchanged");
-
-        // A non-colliding id succeeds.
-        var importGood = await ServerApi.ImportSave(
-            new TestImportSaveRequest
-            {
-                TargetSaveName = "import-collision-ok",
-                SwapHostTo = "76561190000000002",
-            },
+        var import = await ServerApi.ImportSave(
+            new TestImportSaveRequest { SwapHostTo = SyntheticBindId },
             ct
         );
         Assert.True(
-            importGood?.Success == true && importGood.Swapped,
-            $"A non-colliding id should succeed: {importGood?.ImportError ?? importGood?.Error}"
+            import?.Success == true && import.Swapped,
+            $"Import with an id already stamped on another farmhand must succeed: "
+                + $"{import?.ImportError ?? import?.Error}"
         );
-        Log("Non-colliding id accepted");
+
+        await ReloadServerAsync();
+
+        // Owner bound via the map after finalize.
+        long rebindTargetUid = 0;
+        var ok = await PollingHelper.WaitUntilAsync(
+            WaitName.Polling_SaveImport_MultiOwnershipBound,
+            async () =>
+            {
+                var state = await ServerApi.GetDiagnosticsState(ct);
+                if (state == null || state.MasterName != "Server")
+                {
+                    return false;
+                }
+                var ownerEntry = state.FarmhandData.FirstOrDefault(f =>
+                    f.UniqueMultiplayerId == ownerUid
+                );
+                if (ownerEntry is not { IsCustomized: true, HasOwner: true })
+                {
+                    return false;
+                }
+                // Pick any other unowned slot as the rebind target (the injected stamp was
+                // released by the load-time abandoned-claim sweep, so spare slots are fresh).
+                // Must be UNcustomized: the tail assertion proves an operator-origin record
+                // survives the load-time sweep, and the sweep only inspects uncustomized slots.
+                var spare = state.FarmhandData.FirstOrDefault(f =>
+                    f.UniqueMultiplayerId != ownerUid && !f.HasOwner && !f.IsCustomized
+                );
+                rebindTargetUid = spare?.UniqueMultiplayerId ?? 0;
+                return rebindTargetUid != 0;
+            },
+            TestTimings.CabinAssignmentTimeout,
+            cancellationToken: ct
+        );
+        Assert.True(
+            ok,
+            "After the swap import + reload, the owner must be ownership-bound and a spare slot available"
+        );
+
+        // Rebind a SECOND farmhand to the same id — must be accepted (no uniqueness rejection).
+        var cmd = await ServerApi.RunConsoleCommand(
+            "farmhand",
+            new[] { "rebind", rebindTargetUid.ToString(), SyntheticBindId },
+            ct
+        );
+        Assert.True(cmd?.Success == true, $"Console command dispatch failed: {cmd?.Error}");
+
+        var bothBound = await PollingHelper.WaitUntilAsync(
+            WaitName.Polling_SaveImport_MultiOwnershipRebound,
+            async () =>
+            {
+                var state = await ServerApi.GetDiagnosticsState(ct);
+                if (state == null)
+                {
+                    return false;
+                }
+                var owner = state.FarmhandData.FirstOrDefault(f =>
+                    f.UniqueMultiplayerId == ownerUid
+                );
+                var second = state.FarmhandData.FirstOrDefault(f =>
+                    f.UniqueMultiplayerId == rebindTargetUid
+                );
+                return owner is { HasOwner: true } && second is { HasOwner: true };
+            },
+            TestTimings.CabinAssignmentTimeout,
+            cancellationToken: ct
+        );
+        Assert.True(
+            bothBound,
+            $"Both owner uid={ownerUid} and rebound uid={rebindTargetUid} must carry ownership "
+                + "records for the same bind id (multiple ownership is the supported case)"
+        );
+        Log("Same bind id accepted on two farmhands (import + rebind)");
+
+        // Persistence across a restart: release the customized owner (marker written to the
+        // save-folder store), then reload. The released state must survive (the store travels
+        // with the save folder), and the operator-origin rebind on the UNcustomized spare must
+        // survive the load-time abandoned-claim sweep (claim-origin records get swept there;
+        // operator pre-assignments must not).
+        var release = await ServerApi.RunConsoleCommand(
+            "farmhand",
+            new[] { "release", ownerUid.ToString() },
+            ct
+        );
+        Assert.True(release?.Success == true, $"Release dispatch failed: {release?.Error}");
+        var releasedNow = await PollingHelper.WaitUntilAsync(
+            WaitName.Polling_SaveImport_ReleasedState,
+            async () =>
+            {
+                var state = await ServerApi.GetDiagnosticsState(ct);
+                var owner = state?.FarmhandData.FirstOrDefault(f =>
+                    f.UniqueMultiplayerId == ownerUid
+                );
+                return owner is { Released: true, HasOwner: false, IsCustomized: true };
+            },
+            TestTimings.CabinAssignmentTimeout,
+            cancellationToken: ct
+        );
+        Assert.True(releasedNow, $"Owner uid={ownerUid} should be released before the reload");
+
+        await ReloadServerAsync();
+
+        var survivedReload = await PollingHelper.WaitUntilAsync(
+            WaitName.Polling_SaveImport_OwnershipStateReloaded,
+            async () =>
+            {
+                var state = await ServerApi.GetDiagnosticsState(ct);
+                if (state == null || state.MasterName != "Server")
+                {
+                    return false;
+                }
+                var owner = state.FarmhandData.FirstOrDefault(f =>
+                    f.UniqueMultiplayerId == ownerUid
+                );
+                var second = state.FarmhandData.FirstOrDefault(f =>
+                    f.UniqueMultiplayerId == rebindTargetUid
+                );
+                return owner is { Released: true, HasOwner: false, IsCustomized: true }
+                    && second is { HasOwner: true };
+            },
+            TestTimings.CabinAssignmentTimeout,
+            cancellationToken: ct
+        );
+        Assert.True(
+            survivedReload,
+            $"After reload: owner uid={ownerUid} must still be released and the operator-origin "
+                + $"rebind on uncustomized uid={rebindTargetUid} must survive the abandoned-claim sweep"
+        );
+        Log("Released state + operator-origin rebind survived the restart");
     }
 
     /// <summary>Test 12 — a plain <c>--reload</c> with a player connected must refuse: the swap import
@@ -760,7 +886,7 @@ public class SaveImportTests : TestBase
     [Fact]
     public async Task Import_Reload_RefusesWhenClientConnected()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         // Master is "Nina"; a finalized swap would flip it to "Server", so "Nina" persisting proves no reload.
         await GenerateSourceSaveAsync(new TestSeedImportSourceRequest { OwnerName = "Nina" }, ct);
 
@@ -807,7 +933,7 @@ public class SaveImportTests : TestBase
     [Fact]
     public async Task Import_ForceReload_KicksThenFinalizes()
     {
-        var ct = TestContext.Current.CancellationToken;
+        var ct = TestCt;
         var seed = await GenerateSourceSaveAsync(
             new TestSeedImportSourceRequest { OwnerName = "Omar" },
             ct
@@ -842,7 +968,7 @@ public class SaveImportTests : TestBase
                 var ownerEntry = state.FarmhandData.FirstOrDefault(f =>
                     f.UniqueMultiplayerId == ownerUid
                 );
-                if (ownerEntry is not { IsCustomized: true, HasUserId: true })
+                if (ownerEntry is not { IsCustomized: true, HasOwner: true })
                 {
                     return false;
                 }

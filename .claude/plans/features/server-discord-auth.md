@@ -12,7 +12,7 @@ Implement Discord-based authentication where players link their Steam/GOG accoun
 - `password` — password only (existing behavior).
 - `discord` — Discord whitelist; players not registered in Discord are rejected.
 
-**`both` mode is intentionally not supported.** A "try Discord first, fall back to password" mode is order-dependent fallback masking unclear authority semantics — per `.claude/rules/universal/retry-is-evidence-of-root-cause.md`, the right answer to "which method authoritatively admits this player?" is to pick one, not chain them. Operators who want a mixed roster register some players via Discord and configure others with the existing per-server password — but at the *server* level, `AUTH_MODE` is single-valued.
+**`both` mode is intentionally not supported.** A "try Discord first, fall back to password" mode is order-dependent fallback masking unclear authority semantics — per `.claude/rules/universal/dont-paper-over-root-cause.md`, the right answer to "which method authoritatively admits this player?" is to pick one, not chain them. Operators who want a mixed roster register some players via Discord and configure others with the existing per-server password — but at the *server* level, `AUTH_MODE` is single-valued.
 
 ## Authentication Flow
 
@@ -162,7 +162,7 @@ The internal listener is reachable from the `server` container via the docker-co
 
 ### New Environment Variables (Env.cs)
 
-`mod/JunimoServer/Env.cs` currently has only `ServerPassword`, `MaxLoginAttempts`, `AuthTimeoutSeconds` (verified). All env vars below are introduced by this plan and exempt from `verify-documented-config-is-consumed.md` provided the consumer (`DiscordAuthService`) lands in the same change.
+`mod/JunimoServer/Env.cs` currently has only `ServerPassword`, `MaxLoginAttempts`, `AuthTimeoutSeconds` (verified). All env vars below are introduced by this plan and exempt from `verify-claims.md`'s consumer grep provided the consumer (`DiscordAuthService`) lands in the same change.
 
 ```csharp
 /// <summary>

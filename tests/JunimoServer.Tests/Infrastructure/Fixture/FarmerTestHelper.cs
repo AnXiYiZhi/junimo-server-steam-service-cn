@@ -95,6 +95,40 @@ internal sealed class FarmerTestHelper
     }
 
     /// <summary>
+    /// Fast setup-join: pre-customizes a farmhand slot server-side, then joins it by name so the
+    /// client takes the already-customized fast path — no character menu, no creation sync. Use
+    /// when the test needs "a connected in-world farmer" as mere setup; tests whose scenario IS
+    /// the join, customization, auth/lobby, or a customization-state transition stay on
+    /// <see cref="ConnectNewAsync"/>. The farmer is tracked for cleanup like any other.
+    /// </summary>
+    public async Task<ClientConnection> ConnectFastAsync(
+        string namePrefix = "Farmer",
+        CancellationToken ct = default
+    )
+    {
+        await _testBase.Connect.EnsureDisconnectedAsync();
+
+        var name = GenerateName(namePrefix);
+
+        var precustomize = await _testBase.ServerApi.PrecustomizeFarmhands(new[] { name }, ct);
+        Assert.True(
+            precustomize?.Success == true,
+            $"Precustomize of farmhand '{name}' failed: {precustomize?.Error ?? "no response"}"
+        );
+
+        var result = await _testBase.Connect.JoinWithRetryAsync(
+            name,
+            preferExistingFarmer: true,
+            ct: ct
+        );
+        _testBase.Connect.AssertJoinSuccess(result);
+
+        TrackFarmer(name, result.UniqueMultiplayerId);
+
+        return new ClientConnection(name, result);
+    }
+
+    /// <summary>
     /// Connects a second concurrent farmer over its own client lease and joins it via LAN.
     /// The primary farmer keeps using the shared connection helpers; this is the one missing
     /// primitive for multi-player E2E tests. LAN-only is sufficient — none of the planned
@@ -131,15 +165,10 @@ internal sealed class FarmerTestHelper
     /// start), then both join sequences run together via <see cref="Task.WhenAll(Task[])"/>.
     ///
     /// <para>
-    /// The server's game loop processes one farmhand join at a time, so the two joins can't
-    /// land at the literal same instant — both go through the per-server join gate
-    /// (<c>ManagedServer.AcquireJoinGateAsync</c>), which serializes the game-thread join and
-    /// is what stops a concurrent join bouncing back to farmhand selection
-    /// (<c>isGameAvailable() == false</c>). What overlaps is everything else: the second
-    /// client's lease/cold-start and both clients' menu navigation and character creation. So
-    /// instead of farmhand B's whole sequence starting only after A's fully completes, the two
-    /// are present together within seconds of each other — the scenario weddings/multiplayer
-    /// tests want.
+    /// The join gate serializes only each join's pre-approval phase and releases at approval (see
+    /// <c>ConnectionHelper.AcquireJoinGate</c>), so each join's creation/world-ready/auth tail overlaps
+    /// the other's pre-approval — plus the second client's cold-start and both clients' menu navigation.
+    /// So B is present within seconds of A, not only after A's whole sequence completes.
     /// </para>
     ///
     /// <para>
@@ -205,10 +234,9 @@ internal sealed class FarmerTestHelper
 
     /// <summary>
     /// Joins a second farmer over an already-leased client and wraps it as a
-    /// <see cref="SecondFarmer"/>. The join goes through the server's join gate so it
-    /// serializes correctly against the primary join (the game loop processes one farmhand
-    /// join at a time). Disposes the supplied lease if the join throws; on success the
-    /// returned <see cref="SecondFarmer"/> owns disposal.
+    /// <see cref="SecondFarmer"/>, gated (via its own <see cref="ConnectionHelper"/>) against the primary
+    /// join's pre-approval phase. Disposes the supplied lease if the join throws; on success the returned
+    /// <see cref="SecondFarmer"/> owns disposal.
     /// </summary>
     private async Task<SecondFarmer> JoinSecondFarmerAsync(
         ResourceLease lease,
@@ -225,22 +253,19 @@ internal sealed class FarmerTestHelper
                 clientLease.Client,
                 new ConnectionOptions { ServerPassword = lease.Password },
                 serverApi: _testBase.ServerApi
+            )
+            {
+                // Same gate as the primary path, so two concurrent joins serialize their pre-approval
+                // phase against each other (see ConnectionHelper.AcquireJoinGate).
+                AcquireJoinGate = lease.Managed.AcquireJoinGateAsync,
+                ReleaseJoinGate = lease.Managed.ReleaseJoinGate,
+            };
+            var join = await conn.JoinWorldViaLanAsync(
+                lease.ServerLanAddress,
+                lease.ServerLanPort,
+                name,
+                cancellationToken: ct
             );
-            await lease.Managed.AcquireJoinGateAsync(ct);
-            JoinWorldResult join;
-            try
-            {
-                join = await conn.JoinWorldViaLanAsync(
-                    lease.ServerLanAddress,
-                    lease.ServerLanPort,
-                    name,
-                    cancellationToken: ct
-                );
-            }
-            finally
-            {
-                lease.Managed.ReleaseJoinGate();
-            }
             Assert.True(
                 join.Success,
                 $"Second farmer '{name}' failed to join via LAN: {join.Error}"

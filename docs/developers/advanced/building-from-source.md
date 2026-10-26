@@ -87,6 +87,20 @@ The Makefile provides several useful commands:
 | `make cli` | Attach to interactive server console |
 | `make clean` | Remove ALL containers, volumes, and images |
 
+## Using git worktrees
+
+Each worktree is a separate folder, so its Compose project name defaults to that folder's name and it gets its own empty volumes. `make setup` then makes you log into Steam and download the game again (and too many logins can get you rate-limited).
+
+To share your main checkout's volumes across worktrees, pin an explicit project name in the **main checkout's** `.env`:
+
+```sh
+COMPOSE_PROJECT_NAME=sdvd-server
+```
+
+Use your main checkout's folder name — `sdvd-server` if you followed the clone step above. Claude-created worktrees copy the main `.env`, so they inherit the same project name and share its volumes automatically; a worktree you add by hand with `git worktree add` does not get the copy, so set the line in its `.env` yourself.
+
+Both checkouts then form one Compose project, and because the services use fixed `container_name`s only one can run at a time. `make down` and `make clean` from a worktree stop or remove the shared containers and volumes — run them from whichever checkout you actually mean to affect.
+
 ## Project Structure
 
 ```
@@ -105,3 +119,13 @@ server/
     └── discord-bot/        # Discord bot integration
 ```
 
+
+## SMAPI Build
+
+The images do not download a SMAPI release. The `smapi-builder` stage in `docker/Dockerfile` and
+`docker/Dockerfile.test-client` clones the upstream tag pinned by `ARG SMAPI_VERSION`, applies the
+patch series in `patches/smapi/`, and packages the Linux installer with
+`docker/smapi/build-installer.sh`. The runtime image ships that package at `/opt/smapi` and
+installs it into the game volume on startup, reinstalling whenever the volume holds a different
+build (`smapi-internal/.sdvd-smapi-build`). See `patches/smapi/README.md` for what the patches
+change and how to re-derive them for a new SMAPI release.

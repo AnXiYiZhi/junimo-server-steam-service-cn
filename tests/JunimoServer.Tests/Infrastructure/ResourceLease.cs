@@ -73,7 +73,16 @@ public sealed class ResourceLease : IAsyncDisposable
     }
 
     /// <summary>Lease a client on demand. NOT called automatically.</summary>
-    public async Task<ClientLease> LeaseClientAsync(CancellationToken ct = default)
+    /// <param name="ct">Cancellation token.</param>
+    /// <param name="requireSteam">Override for the lease's Steam requirement. Defaults to the
+    /// server's <c>WithSteam</c> (the primary client must match the server's transport). Pass
+    /// <c>false</c> for a lease that will only ever connect via LAN (the second-farmer helper):
+    /// on a Steam server the pool holds a single Steam-bearing client, so a second
+    /// Steam-required lease in one test deadlocks against the test's own primary.</param>
+    public async Task<ClientLease> LeaseClientAsync(
+        CancellationToken ct = default,
+        bool? requireSteam = null
+    )
     {
         if (_managed.IsPoisoned)
         {
@@ -85,8 +94,13 @@ public sealed class ResourceLease : IAsyncDisposable
         var lease = await _clientPool.LeaseClientAsync(
             _managed.Key,
             ct,
-            requireSteam: _requirements.WithSteam
+            requireSteam: requireSteam ?? _requirements.WithSteam
         );
+
+        // Give the client the server's error token so its HTTP calls give up quickly if the
+        // server dies mid-test. Every client lease comes through here, so extra clients get
+        // this too. ClientLease.DisposeAsync clears it again when the client is returned.
+        lease.Client.CancellationToken = ErrorToken;
         lease.EmitLeased(_testName, _managed.InstanceId);
         if (_managed.InstanceId != null)
         {
@@ -107,13 +121,25 @@ public sealed class ResourceLease : IAsyncDisposable
     /// </summary>
     public async Task CreateNewGameAsync(
         FarmTypeSetting farmType,
-        string farmName = "Junimo",
+        string farmName = "Server",
         int startingCabins = 1,
         string cabinStrategy = "CabinStack",
+        int? maxPlayers = null,
+        bool? allowCabinRelocation = null,
+        bool? allowIpConnections = null,
         CancellationToken ct = default
     )
     {
-        await _managed.CreateNewGameAsync(farmType, farmName, startingCabins, cabinStrategy, ct);
+        await _managed.CreateNewGameAsync(
+            farmType,
+            farmName,
+            startingCabins,
+            cabinStrategy,
+            maxPlayers,
+            allowCabinRelocation,
+            allowIpConnections,
+            ct
+        );
     }
 
     /// <summary>
@@ -136,6 +162,14 @@ public sealed class ResourceLease : IAsyncDisposable
     /// so TestBase needs direct access to coordinate exclusive gates on the server.
     /// </summary>
     internal ManagedServer Managed => _managed;
+
+    /// <summary>
+    /// Ownership token of the exclusive-gate acquisition this lease's disposal releases.
+    /// Written by the broker on a fresh exclusive acquire, and overwritten per-test by the
+    /// KeepConnected coordinator's gate-only acquire — the current acquisition is the one a
+    /// release must name. 0 (never acquired) is release-inert.
+    /// </summary>
+    internal long ExclusiveToken { get; set; }
 
     public async ValueTask DisposeAsync()
     {
@@ -165,7 +199,7 @@ public sealed class ResourceLease : IAsyncDisposable
         // can proceed as soon as our ref is gone.
         if (_exclusive)
         {
-            _managed.ReleaseExclusive();
+            _managed.ReleaseExclusive(ExclusiveToken, _testName);
         }
 
         try

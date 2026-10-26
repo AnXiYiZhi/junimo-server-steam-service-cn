@@ -103,8 +103,8 @@ The CLI should:
 |---------|--------------|-------|
 | Docker Engine (Linux) | Full | Primary target, all features |
 | Docker Desktop (Win/Mac) | Full | Same API, different socket paths |
-| Podman | Unsupported | `SYS_TIME` cap may fail in rootless; `stdin_open`+`tty` may behave differently; not tested |
-| Rootless Docker | Unknown | Not tested, `SYS_TIME` may require `--privileged` |
+| Podman | Unsupported | `stdin_open`+`tty` may behave differently; not tested |
+| Rootless Docker | Unknown | Not tested |
 
 The CLI should:
 - Detect the runtime via `docker info --format json` and report it in `sdvd check`
@@ -133,7 +133,7 @@ The CLI should:
 The TUI connects via HTTP polling (status) + WebSocket (real-time events). On disconnect:
 - Status bar should show "Disconnected" with elapsed time.
 - Log view freezes (last known state).
-- Command input rejects with clear feedback — surface the failure to the operator immediately rather than retrying silently. Per `.claude/rules/universal/retry-is-evidence-of-root-cause.md`, the dashboard is an admin tool typically run on LAN or over an SSH tunnel; an exponential reconnect-backoff loop would be retry-as-feature for a connection that, when broken, the operator wants to know about.
+- Command input rejects with clear feedback — surface the failure to the operator immediately rather than retrying silently. Per `.claude/rules/universal/dont-paper-over-root-cause.md`, the dashboard is an admin tool typically run on LAN or over an SSH tunnel; an exponential reconnect-backoff loop would be retry-as-feature for a connection that, when broken, the operator wants to know about.
 - Manual reconnect: a single keybind (`r`) attempts one immediate reconnection, with no automatic backoff.
 - After reconnection: re-fetch full status, resume WebSocket stream.
 
@@ -331,7 +331,7 @@ Works in both local and remote mode. Connects via HTTP API + WebSocket.
 ```
 
 **Features:**
-- Real-time log streaming. **Pick one source.** Per `.claude/rules/universal/prefer-live-stream-over-disk-artifact.md`, two pipelines (local `docker compose logs -f` vs remote WebSocket) hidden behind one UI fragment the implementation. Resolve when un-deferring Phase 3: either (a) wait for `GET /logs` SSE so both modes use the same WebSocket source, or (b) drop remote-mode log streaming until the endpoint exists. Do not ship the dual-source design.
+- Real-time log streaming. **Pick one source.** Per `.claude/rules/prefer-live-stream-over-disk-artifact.md`, two pipelines (local `docker compose logs -f` vs remote WebSocket) hidden behind one UI fragment the implementation. Resolve when un-deferring Phase 3: either (a) wait for `GET /logs` SSE so both modes use the same WebSocket source, or (b) drop remote-mode log streaming until the endpoint exists. Do not ship the dual-source design.
 - Log filtering: cycle through All / Errors / Warnings+ / Search pattern (Ctrl+F)
 - Command input → sent via WebSocket (preferred) or HTTP API fallback
 - Status bar with live player count, season/day, invite code
