@@ -1,0 +1,11 @@
+{
+  "indexDigest": "sha256:99420ab30c09da019c425defd4d01796403ac03898ed261b9ee2a976f4bc6518",
+  "platformDigest": "sha256:34737f8b28e630a1d2994032bb158e577eb26bb5ba91683eae80770168db6da7",
+  "configDigest": "sha256:5a9f895f6e8cc2a5e8d9d03d34cb69ca94ffbc04ad149578e89c82c911ca500a",
+  "tagCommit": "a6cee498f91b318cfcacf035b05b0644bd16829a",
+  "labels": {
+    "org.opencontainers.image.version": "1.5.0-anxi.2",
+    "org.opencontainers.image.revision": "a6cee498f91b",
+    "org.opencontainers.image.created": "2026-07-05T18:48:08Z"
+  }
+}

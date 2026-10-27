@@ -1,0 +1,43 @@
+name: Restore fixed legacy Auth ACR tag
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: restore-fixed-legacy-auth-acr-tag
+  cancel-in-progress: false
+
+jobs:
+  restore:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout controlled restoration helper
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Verify the fixed original source tag
+        run: test "$(git rev-parse 'refs/tags/v1.5.0-anxi.2^{}')" = 'a6cee498f91b318cfcacf035b05b0644bd16829a'
+
+      - name: Verify restoration safety contracts
+        run: python3 -m unittest discover -s tests/workflows -p test_restore_legacy_auth_tag.py
+
+      - name: Restore the existing exact index to its original missing tag
+        env:
+          ALIYUN_REGISTRY_USERNAME: ${{ secrets.ALIYUN_REGISTRY_USERNAME }}
+          ALIYUN_REGISTRY_PASSWORD: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
+        run: python3 tools/restore_legacy_auth_tag.py --output "$RUNNER_TEMP/legacy-auth-restoration.json"
+
+      - name: Save safe restoration proof
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: legacy-auth-acr-tag-restoration-${{ github.run_id }}
+          path: ${{ runner.temp }}/legacy-auth-restoration.json
+          if-no-files-found: error
+          retention-days: 90
